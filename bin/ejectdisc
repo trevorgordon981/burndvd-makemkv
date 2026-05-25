@@ -1,0 +1,8 @@
+#!/bin/bash
+# Open the tray on the external DVD/BD drive (LG BU40N).
+# Usage: ejectdisc [close]
+case "${1:-eject}" in
+  close) exec drutil tray close ;;
+  eject|open|"") exec drutil tray eject ;;
+  *) echo "usage: ejectdisc [eject|close]" >&2; exit 2 ;;
+esac

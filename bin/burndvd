@@ -1,0 +1,338 @@
+#!/bin/bash
+# burndvd, single-disc smart wrapper around ripqueue.py.
+#
+# Usage:
+#   burndvd                       # detect inserted disc + 1-3 prompts (Enter to accept defaults)
+#   burndvd --queue queue.csv ... # pass-through to ripqueue.py for multi-disc CSV mode
+#
+# Single-disc mode runs the rip detached (nohup) and tails the log in the
+# foreground, so closing the terminal Ctrl-C's only the tail; the rip keeps
+# running. Reattach later with: tail -f <log path printed at launch>.
+#
+# Status check on a detached rip: `checkrip` (ongoing / hung / not running).
+#
+# Rollback: ln -sf ~/scripts/ripqueue.py ~/.local/bin/burndvd
+
+set -euo pipefail
+
+RIPQUEUE_PY="$HOME/scripts/ripqueue.py"
+LOG_DIR="$HOME/logs"
+mkdir -p "$LOG_DIR"
+
+# Auto-flip Alfred to the lighter 122B model during rips so the 397B's
+# ~200 GB RSS doesn't fight makemkvcon + ffmpeg for unified memory. The
+# rip-mode-on script is idempotent (no-op if 122B is already loaded).
+# Failure here is non-fatal; the rip still runs against whatever model
+# happens to be loaded.
+flip_to_rip_mode() {
+    if [ -x "$HOME/scripts/rip-mode-on" ]; then
+        echo "Flipping Alfred to 122B for rip duration (may take ~4min on cold swap)..."
+        "$HOME/scripts/rip-mode-on" 2>&1 | tee -a "$LOG_DIR/rip-mode-hook.log" || \
+            echo "WARN: rip-mode-on failed (rc=$?); rip proceeds with current model loaded" >&2
+    fi
+}
+
+# Note: no auto-flip-back hook. A multi-disc session would otherwise
+# reload weights every ~hour as discs swap, which costs more than the
+# memory headroom is worth. Flip back manually when the whole session
+# is done (if you wired up a rip-mode-on script in the first place).
+
+# Sweep orphan wrapper chains from previous runs. Each detached burndvd
+# launches `sh -c "sleep 999999 | script -q ... ripqueue.py --state STATE"`
+# which can't exit on its own (the sleep 999999 keeps the pipeline open).
+# When the rip finishes, the sh/sleep/script chain leaks. We identify
+# orphans by --state value: any process group whose ripqueue.py has exited
+# is dead-weight and gets killed.
+sweep_burndvd_orphans() {
+    local state pid args ppid
+    local states
+    states=$(ps -Ao args= 2>/dev/null \
+        | grep -oE -- "--state [^ ]+" \
+        | awk '{print $2}' | tr -d "'\"" | sort -u \
+        | grep -E "burndvd-state" || true)
+    for state in $states; do
+        # Skip if any python ripqueue.py is still serving this state.
+        pgrep -f "python.*ripqueue.py.*$state" >/dev/null 2>&1 && continue
+        # Orphan: kill every remaining process that references this state.
+        for pid in $(pgrep -f "$state" 2>/dev/null || true); do
+            kill "$pid" 2>/dev/null || true
+        done
+    done
+    # Mop up any sleep 999999 reparented to launchd (parent=1) after its
+    # sh died above. Bare sleep, no state in args, so the loop above misses it.
+    for pid in $(pgrep -x sleep 2>/dev/null || true); do
+        args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        [ "$args" = "sleep 999999" ] || continue
+        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+        [ "$ppid" = "1" ] && kill "$pid" 2>/dev/null || true
+    done
+}
+sweep_burndvd_orphans
+
+# Per-invocation state. Single-disc mode is one rip; cross-invocation resume
+# isn't useful here and the shared file caused stale "queue complete" exits.
+STATE=$(mktemp -t burndvd-state.XXXX.json)
+rm -f "$STATE"
+
+# Pass-through when caller provides their own queue.
+for arg in "$@"; do
+    if [ "$arg" = "--queue" ]; then
+        flip_to_rip_mode
+        exec caffeinate -dimsu "$RIPQUEUE_PY" "$@"
+    fi
+done
+
+# --- Smart single-disc mode ---
+# Multi-drive auto-pick: enumerate all optical drives via `drutil list`, pick
+# the first one that (a) has media and (b) isn't already being ripped by
+# another makemkvcon. drutil's 1-based index maps to makemkvcon's 0-based
+# disc:N. Behaves identically with one drive; supports N drives without a flag.
+DEVICE=""
+DISC_INDEX=""
+DISC_TYPE=""
+while read -r line; do
+    idx=$(printf '%s\n' "$line" | awk '/^[[:space:]]*[0-9]+/ {print $1}')
+    [ -z "$idx" ] && continue
+    info=$(drutil status -drive "$idx" 2>/dev/null)
+    printf '%s' "$info" | grep -q "No Media Inserted" && continue
+    dev=$(printf '%s' "$info" | sed -n 's|.*Name: */dev/\(disk[0-9]*\).*|\1|p' | head -1)
+    [ -z "$dev" ] && continue
+    discN=$((idx - 1))
+    if pgrep -f "makemkvcon.*disc:$discN([^0-9]|$)" >/dev/null 2>&1; then
+        continue
+    fi
+    DEVICE="$dev"
+    DISC_INDEX="$discN"
+    DISC_TYPE=$(printf '%s' "$info" | awk '/Type:/ {print $2; exit}')
+    break
+done < <(drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]')
+
+if [ -z "$DEVICE" ]; then
+    n_drives=$(drutil list 2>/dev/null | grep -cE '^[[:space:]]*[0-9]+[[:space:]]')
+    if [ "$n_drives" -eq 0 ]; then
+        echo "burndvd: no optical drive detected." >&2
+    else
+        echo "burndvd: no available drive — all $n_drives drive(s) either empty or busy ripping." >&2
+        drutil list 2>/dev/null | head >&2
+    fi
+    exit 1
+fi
+
+VOLUME=$(diskutil info "/dev/$DEVICE" 2>/dev/null \
+    | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')
+if [ -z "${VOLUME:-}" ] || [ ! -d "/Volumes/$VOLUME" ]; then
+    echo "burndvd: no disc mounted in /dev/$DEVICE (disc:$DISC_INDEX). Insert and wait for spin-up." >&2
+    exit 1
+fi
+
+SIZE_KB=$(df -k "/Volumes/$VOLUME" 2>/dev/null | awk 'NR==2 {print $3}')
+if ! [[ "${SIZE_KB:-0}" =~ ^[0-9]+$ ]]; then
+    echo "burndvd: could not read disc size for /Volumes/$VOLUME." >&2
+    exit 1
+fi
+SIZE_GB=$(( SIZE_KB / 1024 / 1024 ))
+
+# Format auto-detect: drutil knows DVD vs BD, size tells BD apart from 4K UHD.
+# DISC_TYPE was set in the drive-pick loop above using the per-drive query.
+case "$DISC_TYPE" in
+    DVD-ROM*|DVD-R*|DVD+R*|DVD-RW*|DVD+RW*) DEFAULT_FORMAT="DVD" ;;
+    *)
+        if [ "$SIZE_GB" -gt 70 ]; then
+            DEFAULT_FORMAT="4K"
+        else
+            DEFAULT_FORMAT="BD"
+        fi
+        ;;
+esac
+
+# Type + season + title auto-detect from the volume label. Patterns we look
+# for: "BREAKING_BAD_S03_D01", "VEEP_S05D01", "GAME_OF_THRONES_SEASON_3_DISC_1",
+# "ONE_PIECE_VOL_12", "BLACK_LAGOON_DISC_2". When the pattern matches we set
+# DEFAULT_TYPE=tv-season, capture the season number, and strip the marker tail
+# off the title so we don't end up with "Breaking Bad S03 D01" as the title.
+IFS=$'\t' read -r DEFAULT_TYPE DEFAULT_SEASON DEFAULT_TITLE \
+    < <(python3 - "$VOLUME" <<'PY'
+import re, sys
+spaced = sys.argv[1].replace('_', ' ').strip()
+tv_pat = r'(?i)(S\d+\s*D\d+|Season[\s-]+\d+|Disc[\s-]+\d+|Vol(?:ume)?[\s-]+\d+)'
+m = re.search(tv_pat, spaced)
+if m:
+    typ = "tv-season"
+    sm = re.search(r'(?i)(?<![A-Za-z])S0*(\d+)|Season[\s-]+0*(\d+)', spaced)
+    season = (sm.group(1) or sm.group(2)) if sm else ""
+    title = re.sub(tv_pat + r'.*$', '', spaced).strip().rstrip('-').strip().title()
+else:
+    typ, season = "movie", ""
+    title = spaced.title()
+print(typ, season, title, sep="\t")
+PY
+)
+
+cat <<EOF
+Detected disc:
+  device:  /dev/$DEVICE
+  volume:  $VOLUME
+  size:    ~${SIZE_GB} GiB
+  format:  $DEFAULT_FORMAT (auto)
+
+EOF
+
+read -r -p "Title (add year): [$DEFAULT_TITLE (YYYY)] " TITLE
+TITLE="${TITLE:-$DEFAULT_TITLE}"
+
+read -r -p "Type [$DEFAULT_TYPE]: " TYPE
+TYPE="${TYPE:-$DEFAULT_TYPE}"
+
+read -r -p "Format [$DEFAULT_FORMAT]: " FORMAT
+FORMAT="${FORMAT:-$DEFAULT_FORMAT}"
+
+SEASON=""
+EP_START=""
+case "$TYPE" in
+    tv-season)
+        read -r -p "Season number${DEFAULT_SEASON:+ [$DEFAULT_SEASON]}: " SEASON
+        SEASON="${SEASON:-$DEFAULT_SEASON}"
+        if ! [[ "$SEASON" =~ ^[0-9]+$ ]]; then
+            echo "burndvd: season must be a number." >&2; exit 1
+        fi
+        case "$FORMAT" in
+            4K)     ROOT="/Volumes/Media/TV Shows 4K/$TITLE" ;;
+            BD|DVD) ROOT="/Volumes/Media/TV Shows/$TITLE" ;;
+            *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
+        esac
+        # Auto-suggest next episode: scan the season dir for the highest existing
+        # SxxEyy.mkv and default to that+1. Press Enter to accept; type a number
+        # to override. Falls back to 1 if the dir is empty/missing.
+        SEASON_DIR="$ROOT/Season $(printf '%02d' "$SEASON")"
+        DEFAULT_EP=1
+        if [ -d "$SEASON_DIR" ]; then
+            HIGHEST_EP=$(ls "$SEASON_DIR" 2>/dev/null \
+                | grep -oE "S0*${SEASON}E[0-9]+" \
+                | grep -oE 'E[0-9]+' | tr -d 'E' \
+                | sort -n | tail -1)
+            if [ -n "$HIGHEST_EP" ]; then
+                DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
+            fi
+        fi
+        read -r -p "Episode start [$DEFAULT_EP]: " EP_START
+        EP_START="${EP_START:-$DEFAULT_EP}"
+        ;;
+    movie)
+        case "$FORMAT" in
+            4K)     ROOT="/Volumes/Media/Movies 4K/$TITLE" ;;
+            BD|DVD) ROOT="/Volumes/Media/Movies/$TITLE" ;;
+            *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
+        esac
+        ;;
+    *)
+        echo "burndvd: unknown type '$TYPE' (expected 'movie' or 'tv-season')." >&2
+        exit 1
+        ;;
+esac
+
+QUEUE=$(mktemp -t burndvd-queue.XXXX.csv)
+{
+    echo "title,type,season,episode_start,discs,target_root,format,notes"
+    # CSV-quote everything that can contain commas/spaces.
+    python3 -c '
+import csv, sys
+w = csv.writer(sys.stdout, quoting=csv.QUOTE_MINIMAL)
+w.writerow([sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], "1",
+            sys.argv[5], sys.argv[6], sys.argv[7]])
+' "$TITLE" "$TYPE" "$SEASON" "$EP_START" "$ROOT" "$FORMAT" "auto-built from $VOLUME"
+} > "$QUEUE"
+
+VOLUME_SLUG=$(printf '%s' "$VOLUME" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')
+LOG="$LOG_DIR/burndvd-${VOLUME_SLUG:-disc}-$(date +%Y%m%dT%H%M%S).log"
+
+# DVDs get auto-mounted by macOS at /Volumes/$VOLUME, which holds the optical
+# drive exclusively and blocks MakeMKV from raw block access. The symptom is
+# ripqueue's wait_for_disc loop printing "No disc detected for >2min" forever
+# while drutil + diskutil happily show the disc. BD/UHD discs aren't affected
+# (macOS can't mount their filesystems natively). Unmount-without-eject keeps
+# the disc in the tray and frees the drive for makemkvcon.
+if [ -d "/Volumes/$VOLUME" ] && drutil status 2>/dev/null | grep -q "Type: DVD"; then
+    echo "Unmounting DVD volume /Volumes/$VOLUME so MakeMKV can read it (disc stays in tray)."
+    diskutil unmount "/Volumes/$VOLUME" >/dev/null 2>&1 \
+        || echo "burndvd: unmount returned non-zero; MakeMKV may still be locked out." >&2
+fi
+
+echo
+echo "Queue: $QUEUE"
+echo "Target: $ROOT"
+echo "Log:    $LOG"
+echo
+
+# Flip Alfred to the lighter 122B model before launching the rip.
+# No auto-flip-back — 122B stays loaded across the whole session.
+flip_to_rip_mode
+
+# Launch detached so closing the terminal can't SIGHUP the rip mid-write
+# (root cause of the 2026-05-23 Mean Streets stall: terminal close killed
+# the whole process group, leaving a half-written 52GB staging file).
+#
+# - nohup: child ignores SIGHUP, inherited by the whole chain
+# - sleep 999999 |: keeps script(1)'s stdin from EOFing into the child pty,
+#   which would otherwise trip ripqueue.py's "press Enter for menu" path
+# - script -q: gives ripqueue.py a real pty (its isatty() check requires one)
+#   and captures everything to LOG
+# - </dev/null + redirects: detach from this shell's stdio
+nohup sh -c "sleep 999999 | script -q '$LOG' caffeinate -dimsu '$RIPQUEUE_PY' --queue '$QUEUE' --state '$STATE' --device disc:$DISC_INDEX --non-interactive --on-fail=skip" </dev/null >/dev/null 2>&1 &
+disown
+RIP_LAUNCHER=$!
+
+echo "Rip launched detached (pid $RIP_LAUNCHER). Tailing log;"
+echo "When the rip finishes, the disc auto-ejects and the tail exits."
+echo "Ctrl-C anytime to detach early; the rip keeps running either way."
+echo "Reattach later with: tail -f '$LOG'"
+echo "Status check:        checkrip"
+
+# Session-long lock prevention. caffeinate -du holds a user-active +
+# prevent-display-sleep assertion, which defers the macOS lock-screen
+# inactivity timer regardless of which specific setting triggers it
+# (works whether the lock is from screen saver, Touch ID re-auth, or
+# the Lock Screen policy). We launch a fresh 6h assertion on every
+# burndvd run and kill the previous one first, so back-to-back rips
+# keep the screen unlockable throughout disc-swap windows.
+SESSION_PID_FILE="$HOME/.cache/burndvd/session-caffeinate.pid"
+mkdir -p "$(dirname "$SESSION_PID_FILE")"
+if [ -f "$SESSION_PID_FILE" ]; then
+    OLD_CAFF=$(cat "$SESSION_PID_FILE" 2>/dev/null || true)
+    if [ -n "$OLD_CAFF" ] && kill -0 "$OLD_CAFF" 2>/dev/null; then
+        kill "$OLD_CAFF" 2>/dev/null && \
+            echo "Killed previous session-caffeinate (pid $OLD_CAFF)."
+    fi
+fi
+caffeinate -du -t 21600 </dev/null >/dev/null 2>&1 &
+disown
+CAFF_PID=$!
+echo "$CAFF_PID" > "$SESSION_PID_FILE"
+echo "Lock prevention: caffeinate -du for 6h (pid $CAFF_PID). Refreshed on every burndvd run."
+
+echo
+# Brief settle so the first lines are in the log before we tail.
+sleep 1
+
+# Tail the log in the foreground, but instead of blocking forever, poll for
+# this rip session's ripqueue.py and exit cleanly when it does — then eject
+# the disc so the next swap can go in. Ctrl-C still works as a manual detach
+# (rip continues, no eject in that case).
+tail -f "$LOG" &
+TAIL_PID=$!
+trap 'kill "$TAIL_PID" 2>/dev/null; exit 130' INT TERM
+
+while pgrep -f "python.*ripqueue.py.*$STATE" >/dev/null 2>&1; do
+    sleep 10
+done
+
+# Brief grace so the "Queue complete." line lands in the tail before we kill it.
+sleep 3
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+trap - INT TERM
+
+if [ -x "$HOME/.local/bin/ejectdisc" ]; then
+    echo
+    echo "Rip complete. Ejecting disc."
+    "$HOME/.local/bin/ejectdisc" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+fi

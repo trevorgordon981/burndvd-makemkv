@@ -1,0 +1,16 @@
+#!/bin/bash
+# subocr — OCR HDMV PGS subs from .mkv to external .srt via Apple Vision.
+# Thin wrapper that execs subocr.py from a pyobjc venv. See README for setup.
+#
+# Override venv location: SUBOCR_VENV=/path/to/venv subocr ...
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="${SUBOCR_VENV:-$HOME/.local/share/subocr/venv}"
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "subocr: pyobjc venv not found at $VENV" >&2
+  echo "  Create it (macOS only):" >&2
+  echo "    python3 -m venv \"$VENV\" && \"$VENV/bin/pip\" install pyobjc" >&2
+  echo "  Or set SUBOCR_VENV to an existing pyobjc-enabled venv." >&2
+  exit 1
+fi
+exec "$VENV/bin/python" "$SCRIPT_DIR/subocr.py" "$@"

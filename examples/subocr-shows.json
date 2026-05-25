@@ -1,0 +1,12 @@
+{
+  "_default": {
+    "audio": "eng",
+    "sub_track": "full",
+    "sub_langs": ["eng", "spa", "zho"]
+  },
+  "Dragon Ball Z": {
+    "audio": "eng",
+    "sub_track": "forced",
+    "sub_langs": ["eng"]
+  }
+}
