@@ -19,16 +19,16 @@ RIPQUEUE_PY="$HOME/scripts/ripqueue.py"
 LOG_DIR="$HOME/logs"
 mkdir -p "$LOG_DIR"
 
-# Auto-flip Alfred to the lighter 122B model during rips so the 397B's
-# ~200 GB RSS doesn't fight makemkvcon + ffmpeg for unified memory. The
-# rip-mode-on script is idempotent (no-op if 122B is already loaded).
-# Failure here is non-fatal; the rip still runs against whatever model
-# happens to be loaded.
+# Optional pre-rip hook. If you have a heavy local process (large local LLM,
+# render job, etc.) competing with makemkvcon + ffmpeg for memory, drop a
+# script at ~/scripts/rip-mode-on that quiesces it; we run it here. Failure
+# is non-fatal; the rip continues either way. Remove the hook script to
+# disable.
 flip_to_rip_mode() {
     if [ -x "$HOME/scripts/rip-mode-on" ]; then
-        echo "Flipping Alfred to 122B for rip duration (may take ~4min on cold swap)..."
+        echo "Running rip-mode-on hook..."
         "$HOME/scripts/rip-mode-on" 2>&1 | tee -a "$LOG_DIR/rip-mode-hook.log" || \
-            echo "WARN: rip-mode-on failed (rc=$?); rip proceeds with current model loaded" >&2
+            echo "WARN: rip-mode-on failed (rc=$?); rip proceeds anyway" >&2
     fi
 }
 
@@ -263,8 +263,10 @@ echo "Target: $ROOT"
 echo "Log:    $LOG"
 echo
 
-# Flip Alfred to the lighter 122B model before launching the rip.
-# No auto-flip-back — 122B stays loaded across the whole session.
+# Run the optional rip-mode-on hook before launching. No auto-undo hook;
+# whatever state rip-mode-on leaves the system in persists across the
+# whole session. Provide a rip-mode-off script of your own if you want
+# to invert it manually at the end.
 flip_to_rip_mode
 
 # Launch detached so closing the terminal can't SIGHUP the rip mid-write
