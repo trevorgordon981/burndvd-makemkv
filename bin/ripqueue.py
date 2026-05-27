@@ -15,7 +15,7 @@ Companion to ~/scripts/rip-disc.sh (manual interactive ripper). This driver
 reads a pre-loaded queue.csv and auto-names per Plex/Jellyfin convention.
 """
 from __future__ import annotations
-import argparse, csv, json, os, queue, re, shutil, subprocess, sys, threading, time
+import argparse, csv, json, os, queue, re, shutil, signal, subprocess, sys, threading, time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -314,6 +314,17 @@ def movie_filename(item: QueueItem, disc_n: int) -> str:
 PROBE_STALL_S = 60      # kill makemkvcon if no output for this long (it's hung)
 PROBE_HARD_S = 300      # absolute cap on a single probe attempt
 
+# Module-level last-line timestamp from probe_disc. wait_for_disc reads it
+# to decide whether to print the misleading "drive dropped off bus" warning:
+# if makemkvcon is actively producing output the drive is fine — the probe
+# is just slow (corrupt-IFO VOB scan, many titles, etc.).
+_LAST_PROBE_ACTIVITY = 0.0
+
+# Set true by the SIGUSR1 handler. The main loop checks this between queue
+# items and advances current_index when set, letting batch sessions move
+# past a stuck disc without killing the whole queue.
+_SKIP_REQUESTED = False
+
 
 def probe_disc(args) -> dict | None:
     def _run_once():
@@ -339,17 +350,36 @@ def probe_disc(args) -> dict | None:
         lines: list[str] = []
         last_line_t = time.time()
         start = time.time()
+        last_status_t = 0.0
+        titles_added = 0
         killed = False
+        # Patience modes: a "normal" disc enumerates titles in seconds and
+        # any 60s gap is a true hang. A disc with a corrupt IFO file
+        # (MSG:3042) triggers makemkvcon's VOB-scan fallback, which has
+        # legitimate silent stretches of several minutes while it walks
+        # corrupted sectors. Once we see 3042, extend the per-stall and
+        # hard timeouts so we don't kill makemkvcon mid-scan.
+        stall_s = PROBE_STALL_S
+        hard_s = PROBE_HARD_S
+        slow_mode = False
         while True:
             now = time.time()
-            if now - start > PROBE_HARD_S:
+            if now - start > hard_s:
                 proc.kill()
                 killed = True
                 break
-            if now - last_line_t > PROBE_STALL_S:
+            if now - last_line_t > stall_s:
                 proc.kill()
                 killed = True
                 break
+            # Live progress every 10s — quiet probes look hung otherwise.
+            # Shows elapsed time + titles enumerated so far + slow-mode flag.
+            if now - last_status_t >= 10:
+                tag = " (slow-mode VOB scan)" if slow_mode else ""
+                print(f"  {C.D}probing... {int(now - start)}s elapsed, "
+                      f"{titles_added} title(s) found{tag}{C.R}",
+                      flush=True)
+                last_status_t = now
             try:
                 kind, payload = q.get(timeout=2)
             except queue.Empty:
@@ -357,8 +387,20 @@ def probe_disc(args) -> dict | None:
             if kind == "eof":
                 break
             if kind == "line":
-                lines.append(payload.rstrip())
+                line = payload.rstrip()
+                lines.append(line)
                 last_line_t = now
+                global _LAST_PROBE_ACTIVITY
+                _LAST_PROBE_ACTIVITY = now
+                if "MSG:3028" in line:
+                    titles_added += 1
+                if not slow_mode and "MSG:3042" in line:
+                    slow_mode = True
+                    stall_s = 300        # 5 min of silence allowed mid-scan
+                    hard_s = max(hard_s, 1800)  # 30 min total cap
+                    print(f"  {C.YLW}disc has corrupt IFO — falling back to "
+                          f"VOB scan, this is slow but should finish{C.R}",
+                          flush=True)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -457,7 +499,29 @@ def ep_key(item: QueueItem) -> str:
 def starting_ep(item: QueueItem, disc_n: int, state: dict) -> int:
     counts = state.get("disc_episode_counts", {}).get(ep_key(item), {})
     prior = sum(int(v) for k, v in counts.items() if int(k) < disc_n)
-    return item.episode_start + prior
+    state_based = item.episode_start + prior
+    # Filesystem-aware fallback: if state.json has no record for this
+    # season (fresh state, multi-session resume, burndvd reinvocation
+    # after a stoprip), scan the target season dir for existing SxxEyy.mkv
+    # files and start at highest+1. Prevents re-numbering over episodes
+    # that already landed from a previous run that lost state.
+    if not counts:
+        season_dir = compute_target_dir(item)
+        try:
+            highest = 0
+            pat = re.compile(rf"S0*{item.season}E(\d+)")
+            if season_dir.exists():
+                for entry in season_dir.iterdir():
+                    if entry.suffix.lower() != ".mkv":
+                        continue
+                    m = pat.search(entry.name)
+                    if m:
+                        highest = max(highest, int(m.group(1)))
+            if highest >= state_based:
+                return highest + 1
+        except OSError:
+            pass
+    return state_based
 
 def record_episode_count(item: QueueItem, disc_n: int, count: int, state: dict):
     state.setdefault("disc_episode_counts", {}).setdefault(ep_key(item), {})[str(disc_n)] = int(count)
@@ -967,15 +1031,46 @@ def loose_match(label: str, expected: str) -> bool:
 # -------- key expiry --------
 def check_key_expiry(args):
     """Run a quick `info` and scan for evaluation-key expiry. Prints a banner
-    if <14 days remaining. Skips silently for permanent keys or parse failures."""
+    if <14 days remaining. Skips silently for permanent keys or parse failures.
+
+    Defensive: makemkvcon can hang on certain optical-media states (the same
+    failure mode probe_disc handles via a stall watchdog). We don't want a
+    startup banner check to block ripqueue. Use Popen + a short stall window
+    so a hung makemkvcon doesn't burn a full 20s wait at every invocation.
+    """
     try:
-        p = subprocess.run(
-            [args.makemkvcon, "-r", "--cache=1", "info", args.device],
-            capture_output=True, text=True, timeout=20)
-    except subprocess.TimeoutExpired:
+        proc = subprocess.Popen(
+            [args.makemkvcon, "-r", "--cache=128", "info", args.device],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except OSError:
         return
+
+    qq: queue.Queue = queue.Queue()
+    threading.Thread(target=_reader, args=(proc.stdout, qq), daemon=True).start()
+    lines: list[str] = []
+    last_t = time.time()
+    start = time.time()
+    while True:
+        now = time.time()
+        if now - start > 20 or now - last_t > 5:
+            proc.kill()
+            try: proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: pass
+            break
+        try:
+            kind, payload = qq.get(timeout=1)
+        except queue.Empty:
+            continue
+        if kind == "eof":
+            try: proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: proc.kill()
+            break
+        if kind == "line":
+            lines.append(payload.rstrip())
+            last_t = now
+
     msgs = []
-    for line in p.stdout.splitlines():
+    for line in lines:
         tag, f = parse_line(line)
         if tag == "MSG" and len(f) >= 4:
             msgs.append(f[3])
@@ -1043,10 +1138,14 @@ def wait_for_disc(args, state: dict):
                   flush=True)
             last_poll_print = now
         if now - started > 120 and now - last_dropoff_hint > 60:
-            print(f"  {C.YLW}No disc detected for >2min. If the drive dropped off bus:{C.R}")
-            print(f"  {C.YLW}    system_profiler SPUSBDataType | grep -B2 -A4 'BU40N\\|UHD'{C.R}")
-            print(f"  {C.YLW}    Reseat USB cable, try a powered hub, or run under{C.R}")
-            print(f"  {C.YLW}    `caffeinate -dimsu burndvd ...` to defeat power management.{C.R}")
+            # Only warn about drive-dropped-off if makemkvcon truly isn't
+            # producing output — otherwise the probe is just slow (corrupt
+            # IFO, lots of titles, etc.) and the warning misleads.
+            if _LAST_PROBE_ACTIVITY < now - 30:
+                print(f"  {C.YLW}No disc activity for >2min. If the drive dropped off bus:{C.R}")
+                print(f"  {C.YLW}    system_profiler SPUSBDataType | grep -B2 -A4 'BU40N\\|UHD'{C.R}")
+                print(f"  {C.YLW}    Reseat USB cable, try a powered hub, or run under{C.R}")
+                print(f"  {C.YLW}    `caffeinate -dimsu burndvd ...` to defeat power management.{C.R}")
             last_dropoff_hint = now
 
 def main():
@@ -1072,6 +1171,16 @@ def main():
                          "abort exits non-zero.")
     args = ap.parse_args()
 
+    # SIGUSR1 → "skip current queue item". A companion `stoprip` tool (or
+    # any operator) can `kill -USR1 <ripqueue_pid>` to advance the queue
+    # past a stuck disc without killing the whole batch session. The
+    # handler just sets a flag; the main loop checks between items so the
+    # in-progress rip can finish/abort via its normal teardown path.
+    def _skip_current_signal(signum, frame):
+        global _SKIP_REQUESTED
+        _SKIP_REQUESTED = True
+    signal.signal(signal.SIGUSR1, _skip_current_signal)
+
     if not sys.stdin.isatty() and not args.non_interactive:
         print(f"{C.RED}burndvd requires an interactive TTY (stdin not a terminal).{C.R}",
               file=sys.stderr)
@@ -1093,6 +1202,25 @@ def main():
     save_state(state, args.state)
 
     while state["current_index"] < len(state["queue"]):
+        # SIGUSR1 sets this flag. Advance past the current queue item
+        # without trying to rip it, log the skip, then continue with
+        # whatever's next.
+        global _SKIP_REQUESTED
+        if _SKIP_REQUESTED:
+            _SKIP_REQUESTED = False
+            try:
+                cur_item = QueueItem(**state["queue"][state["current_index"]])
+                disc_n = state["disc_index_in_item"] + 1
+                append_log(args, f"SKIP_SIGUSR1  {cur_item.title} disc{disc_n}")
+                print(f"{C.YLW}SIGUSR1: advancing past {cur_item.title} "
+                      f"disc {disc_n}{C.R}", flush=True)
+            except Exception:
+                pass
+            state["current_index"] += 1
+            state["disc_index_in_item"] = 0
+            save_state(state, args.state)
+            continue
+
         item = QueueItem(**state["queue"][state["current_index"]])
         disc_n = state["disc_index_in_item"] + 1
         header(state, item, disc_n)
