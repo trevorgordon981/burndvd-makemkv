@@ -406,6 +406,21 @@ def probe_disc(args) -> dict | None:
         return {"cinfo": cinfo, "titles": titles, "msgs": msgs}
     if msgs_indicate_aacs_lock(msgs):
         return {"error": "AACS_LOCKED", "msgs": msgs}
+    # No titles + no AACS lock — surface the specific failure mode if the
+    # MSG codes show physical-disc trouble. Stops users from sitting through
+    # a "polling drive..." retry loop without knowing the disc itself is the
+    # problem, and prevents the silent-skip pattern where --non-interactive
+    # treats a zero-title probe as "done with this disc".
+    # 3042 = IFO file corrupt (DVD authoring damage or scratched disc)
+    # 2003 = SCSI error (tray-open / medium-not-present mid-read)
+    # 5010 = Failed to open disc (umbrella final-fail)
+    diag_codes = codes & {3042, 2003, 5010}
+    if diag_codes:
+        return {
+            "error": "PHYSICAL_DISC_TROUBLE",
+            "codes": sorted(diag_codes),
+            "msgs": msgs,
+        }
     return None
 
 def disc_label(info: dict) -> str:
@@ -1105,6 +1120,41 @@ def main():
                 state["disc_index_in_item"] = 0
                 save_state(state, args.state)
                 append_log(args, f"AACS  {item.title} disc{disc_n}  skipped")
+            beep(args, ok=False)
+            eject(args)
+            continue
+
+        # Physical disc trouble: corrupt IFO, SCSI errors, drive reporting
+        # tray-open mid-read, etc. No amount of retry fixes a scratched or
+        # mis-pressed disc. Surface what makemkvcon actually said instead
+        # of looping with "polling drive..." indefinitely or silently
+        # skipping past it.
+        if isinstance(info, dict) and info.get("error") == "PHYSICAL_DISC_TROUBLE":
+            print(f"{C.RED}Disc looks physically damaged or unreadable.{C.R}")
+            CODE_BLURB = {
+                3042: "IFO file corrupt — DVD authoring damage; VOB scan slow and often fails",
+                2003: "SCSI error mid-read — drive lost the medium (tray-open / read fault)",
+                5010: "MakeMKV gave up opening the disc",
+            }
+            for code in info.get("codes", []):
+                blurb = CODE_BLURB.get(code, "")
+                print(f"  {C.YLW}MSG:{code}{C.R}  {blurb}")
+            for m in info.get("msgs", [])[-4:]:
+                print(f"  {C.D}{m}{C.R}")
+            print(f"  {C.YLW}Try: wipe disc with a soft cloth (concentric scratches), reinsert.{C.R}")
+            print(f"  {C.YLW}If repeated: skip this disc, continue with the next.{C.R}")
+            ans = auto_answer(args, "[p]ark item / [s]kip item / [r]etry: ", "s")
+            if ans.startswith("p"):
+                cur = state["queue"].pop(state["current_index"])
+                state["queue"].append(cur)
+                state["disc_index_in_item"] = 0
+                save_state(state, args.state)
+                append_log(args, f"BAD_DISC  {item.title} disc{disc_n}  parked to end (codes={info.get('codes')})")
+            elif ans.startswith("s"):
+                state["current_index"] += 1
+                state["disc_index_in_item"] = 0
+                save_state(state, args.state)
+                append_log(args, f"BAD_DISC  {item.title} disc{disc_n}  skipped (codes={info.get('codes')})")
             beep(args, ok=False)
             eject(args)
             continue
