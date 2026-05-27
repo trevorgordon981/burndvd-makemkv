@@ -311,22 +311,69 @@ def movie_filename(item: QueueItem, disc_n: int) -> str:
     return f"{base}.mkv"
 
 # -------- probe --------
+PROBE_STALL_S = 60      # kill makemkvcon if no output for this long (it's hung)
+PROBE_HARD_S = 300      # absolute cap on a single probe attempt
+
+
 def probe_disc(args) -> dict | None:
     def _run_once():
+        # makemkvcon occasionally hangs ("stuck" in ps, 0% CPU) on certain DVDs
+        # — most often after the LibreDrive "Opening Blu-ray/DVD disc" step
+        # and before TINFO/CINFO lines start streaming. A plain subprocess.run
+        # with timeout=300 would wait the full 300s before giving up, leaving
+        # the user staring at "No disc detected for >2min" while the drive is
+        # actually locked by a dead process. Stream stdout with a stall
+        # watchdog and kill early on a 60s output gap so the outer loop can
+        # retry without manual intervention.
         try:
-            # TV-show DVDs with 20-40 short titles per disc take longer than
-            # the original 120s allowance. Bumped to 300s and cache from 1MB
-            # to 128MB so the scan doesn't thrash the drive on title enum.
-            p = subprocess.run(
+            proc = subprocess.Popen(
                 [args.makemkvcon, "-r", "--cache=128", "info", args.device],
-                capture_output=True, text=True, timeout=300)
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1)
+        except OSError:
+            return None, None, None, None
+
+        q: queue.Queue = queue.Queue()
+        threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
+
+        lines: list[str] = []
+        last_line_t = time.time()
+        start = time.time()
+        killed = False
+        while True:
+            now = time.time()
+            if now - start > PROBE_HARD_S:
+                proc.kill()
+                killed = True
+                break
+            if now - last_line_t > PROBE_STALL_S:
+                proc.kill()
+                killed = True
+                break
+            try:
+                kind, payload = q.get(timeout=2)
+            except queue.Empty:
+                continue
+            if kind == "eof":
+                break
+            if kind == "line":
+                lines.append(payload.rstrip())
+                last_line_t = now
+        try:
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            try: proc.wait(timeout=5)
+            except subprocess.TimeoutExpired: pass
+
+        if killed and not any(line.startswith(("CINFO:", "TINFO:")) for line in lines):
             return None, None, None, None
-        if p.returncode != 0 and not p.stdout:
+        if proc.returncode not in (0, None) and not lines:
             return None, None, None, None
+
         cinfo, titles, msgs, rdisk = {}, {}, [], None
         msg_codes = set()
-        for line in p.stdout.splitlines():
+        for line in lines:
             tag, f = parse_line(line)
             if tag == "MSG" and len(f) >= 4:
                 msgs.append(f[3])
@@ -342,7 +389,7 @@ def probe_disc(args) -> dict | None:
                     tid, code = int(f[0]), int(f[1])
                     titles.setdefault(tid, {})[code] = f[3]
                 except ValueError: pass
-        return (cinfo, titles, msgs), msg_codes, rdisk, p
+        return (cinfo, titles, msgs), msg_codes, rdisk, proc
 
     result, codes, rdisk, _ = _run_once()
     if result is None:
@@ -651,6 +698,46 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         # Partition: episodes are >= TV_MIN_DUR_S; everything else is an extra.
         episode_rips = [p for p in rips if _src_dur_s(p) >= TV_MIN_DUR_S]
         extras_rips  = [p for p in rips if _src_dur_s(p) <  TV_MIN_DUR_S]
+
+        # Demote alternate-playlist duplicates to extras. A DVD often has
+        # multiple title entries pointing at the same underlying chapters via
+        # different playlists (chapter ordering, included vs skipped
+        # commercials, alternate audio). They share near-identical duration
+        # and byte size but would otherwise render as separate "episodes" in
+        # Jellyfin. Keep the earliest title per (duration, size) signature;
+        # route the rest to Extras/.
+        def _title_info(p):
+            tn = title_num_from_filename(p.name)
+            return info["titles"].get(tn, {}) if tn is not None else {}
+
+        def _byte_size(t_info):
+            try:
+                return int(t_info.get(11, "0"))
+            except ValueError:
+                return 0
+
+        def _is_dup(p, q):
+            t1, t2 = _title_info(p), _title_info(q)
+            d1 = parse_duration(t1.get(9, "0:00:00"))
+            d2 = parse_duration(t2.get(9, "0:00:00"))
+            if abs(d1 - d2) > 5:           # >5s apart, not a dup
+                return False
+            s1, s2 = _byte_size(t1), _byte_size(t2)
+            if max(s1, s2) == 0:           # no size data — duration only
+                return True
+            return abs(s1 - s2) / max(s1, s2) <= 0.01  # within 1% size
+
+        keepers, dup_extras = [], []
+        for p in sorted(episode_rips, key=lambda x: title_num_from_filename(x.name) or 0):
+            if any(_is_dup(p, k) for k in keepers):
+                dup_extras.append(p)
+            else:
+                keepers.append(p)
+        if dup_extras:
+            print(f"{C.YLW}  Detected {len(dup_extras)} alternate-playlist duplicate(s); routing to Extras/{C.R}")
+        episode_rips = keepers
+        extras_rips = extras_rips + dup_extras
+
         _move_extras(
             extras_rips,
             target_dir / "Extras",
