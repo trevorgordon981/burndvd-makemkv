@@ -118,19 +118,37 @@ if [ -z "$DEVICE" ]; then
     exit 1
 fi
 
+# Volume label from diskutil — works whether the disc is auto-mounted or not.
+# Previously we also required /Volumes/$VOLUME to exist, but that bites when
+# a disc is in the drive and readable yet macOS hasn't auto-mounted it (e.g.
+# after a previous burndvd run unmounted it for makemkvcon). makemkvcon
+# doesn't need the mount; the mount is actually a problem for it. Only
+# require the label.
 VOLUME=$(diskutil info "/dev/$DEVICE" 2>/dev/null \
     | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')
-if [ -z "${VOLUME:-}" ] || [ ! -d "/Volumes/$VOLUME" ]; then
-    echo "burndvd: no disc mounted in /dev/$DEVICE (disc:$DISC_INDEX). Insert and wait for spin-up." >&2
+if [ -z "${VOLUME:-}" ]; then
+    echo "burndvd: no Volume Name from diskutil info /dev/$DEVICE (disc:$DISC_INDEX)." >&2
+    echo "         Insert disc and wait for the drive to spin up, then retry." >&2
     exit 1
 fi
 
-SIZE_KB=$(df -k "/Volumes/$VOLUME" 2>/dev/null | awk 'NR==2 {print $3}')
-if ! [[ "${SIZE_KB:-0}" =~ ^[0-9]+$ ]]; then
-    echo "burndvd: could not read disc size for /Volumes/$VOLUME." >&2
+# Size from drutil status (works on unmounted media too — no /Volumes mount
+# required). drutil prints e.g. "Space Used: 831:40:44 blocks: 3742544 / 7.66GB / 7.14GiB".
+SIZE_GB=$(drutil status -drive "$((DISC_INDEX + 1))" 2>/dev/null \
+    | awk '/Space Used:/ {for(i=1;i<=NF;i++) if($i ~ /GB$/) {sub("GB","",$i); printf "%d", $i+0.5; exit}}')
+if ! [[ "${SIZE_GB:-0}" =~ ^[0-9]+$ ]] || [ "${SIZE_GB:-0}" = "0" ]; then
+    # Fall back to df if the disc IS mounted (the legacy path).
+    if [ -d "/Volumes/$VOLUME" ]; then
+        SIZE_KB=$(df -k "/Volumes/$VOLUME" 2>/dev/null | awk 'NR==2 {print $3}')
+        if [[ "${SIZE_KB:-0}" =~ ^[0-9]+$ ]]; then
+            SIZE_GB=$(( SIZE_KB / 1024 / 1024 ))
+        fi
+    fi
+fi
+if ! [[ "${SIZE_GB:-0}" =~ ^[0-9]+$ ]]; then
+    echo "burndvd: could not read disc size for /dev/$DEVICE (volume: $VOLUME)." >&2
     exit 1
 fi
-SIZE_GB=$(( SIZE_KB / 1024 / 1024 ))
 
 # Format auto-detect: drutil knows DVD vs BD, size tells BD apart from 4K UHD.
 # DISC_TYPE was set in the drive-pick loop above using the per-drive query.
