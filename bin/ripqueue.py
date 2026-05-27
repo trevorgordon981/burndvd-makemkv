@@ -314,9 +314,12 @@ def movie_filename(item: QueueItem, disc_n: int) -> str:
 def probe_disc(args) -> dict | None:
     def _run_once():
         try:
+            # TV-show DVDs with 20-40 short titles per disc take longer than
+            # the original 120s allowance. Bumped to 300s and cache from 1MB
+            # to 128MB so the scan doesn't thrash the drive on title enum.
             p = subprocess.run(
-                [args.makemkvcon, "-r", "--cache=1", "info", args.device],
-                capture_output=True, text=True, timeout=120)
+                [args.makemkvcon, "-r", "--cache=128", "info", args.device],
+                capture_output=True, text=True, timeout=300)
         except subprocess.TimeoutExpired:
             return None, None, None, None
         if p.returncode != 0 and not p.stdout:
@@ -363,9 +366,12 @@ def disc_label(info: dict) -> str:
     return c.get(2) or c.get(32) or c.get(30) or c.get(1) or "(unknown)"
 
 TV_MIN_DUR_S = 1200
-# Floor below which MakeMKV titles are noise (menu reels, transitions).
+# Floor below which MakeMKV titles are noise (menu reels, transitions, FBI
+# warnings, language stubs). 60s lets through ~130-260MB studio bumpers on
+# modern UHD discs; 120s catches all the legitimate junk without dropping
+# real short featurettes.
 # Between this and TV_MIN_DUR_S → routed to Extras/ as bonus content.
-EXTRAS_MIN_DUR_S = 60
+EXTRAS_MIN_DUR_S = 120
 
 def select_titles(item: QueueItem, info: dict) -> list[int]:
     durs = [(tid, parse_duration(t.get(9, "0:00:00"))) for tid, t in info["titles"].items()]
@@ -469,12 +475,22 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
     # Belt-and-suspenders for any tool that accidentally scans staging
     (staging / ".ignore").write_text("burndvd staging dir\n")
 
-    # Rip everything above the noise floor; partition into main vs extras
-    # post-rip by duration. This captures bonus features that would otherwise
-    # be silently dropped by --minlength=TV_MIN_DUR_S.
+    # Movies: title was pre-selected (longest) via select_titles; rip just
+    # that one. Saves ~10-15min and ~12GB staging churn per UHD movie (no
+    # alternate playlists / branching duplicates / bumpers written to disk).
+    # TV: rip everything above the noise floor, partition main vs extras
+    # by duration post-rip; loses the per-title pre-scan benefit but lets
+    # one MakeMKV invocation handle a whole season disc.
+    if item.type == "movie":
+        if len(title_ids) != 1:
+            return False, f"movie rip expects 1 title, got {title_ids}"
+        selector = str(title_ids[0])
+    else:
+        selector = "all"
+
     cmd = [args.makemkvcon, "-r", "--progress=-same", "--noscan",
            f"--minlength={EXTRAS_MIN_DUR_S}",
-           "mkv", args.device, "all", str(staging)]
+           "mkv", args.device, selector, str(staging)]
 
     print(f"{C.D}$ {' '.join(cmd)}{C.R}")
     print(f"{C.D}  staging: {staging}{C.R}")
@@ -901,12 +917,21 @@ def wait_for_disc(args, state: dict):
     last_poll_print = 0.0
     started = time.time()
     last_dropoff_hint = 0.0
+    # In --non-interactive mode (cron, launchd, background bash) stdin is
+    # typically closed, which makes select.select fire immediately on it as
+    # "readable" (read would return EOF). The previous code interpreted that
+    # as a user keypress and opened the menu, which then crashed on EOFError
+    # at the input() call. Skip the stdin check entirely when non-interactive.
+    poll_stdin = not getattr(args, "non_interactive", False)
     while True:
-        import select
-        r, _, _ = select.select([sys.stdin], [], [], 2.0)
-        if r:
-            sys.stdin.readline()
-            return ("cmd", menu(state, args))
+        if poll_stdin:
+            import select
+            r, _, _ = select.select([sys.stdin], [], [], 2.0)
+            if r:
+                sys.stdin.readline()
+                return ("cmd", menu(state, args))
+        else:
+            time.sleep(2.0)
         info = probe_disc(args)
         if info:
             return ("disc", info)
