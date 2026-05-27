@@ -150,7 +150,12 @@ esac
 # "ONE_PIECE_VOL_12", "BLACK_LAGOON_DISC_2". When the pattern matches we set
 # DEFAULT_TYPE=tv-season, capture the season number, and strip the marker tail
 # off the title so we don't end up with "Breaking Bad S03 D01" as the title.
-IFS=$'\t' read -r DEFAULT_TYPE DEFAULT_SEASON DEFAULT_TITLE \
+# Read the three defaults as three lines, not a tab-delimited single line.
+# Bash's read with IFS=\t collapses adjacent whitespace (tab counts) when the
+# middle field is empty (movie with no season number) — that shifts the title
+# into the season slot and leaves the title default empty. Line-per-field
+# preserves empty fields correctly.
+{ read -r DEFAULT_TYPE; read -r DEFAULT_SEASON; read -r DEFAULT_TITLE; } \
     < <(python3 - "$VOLUME" <<'PY'
 import re, sys
 spaced = sys.argv[1].replace('_', ' ').strip()
@@ -164,7 +169,9 @@ if m:
 else:
     typ, season = "movie", ""
     title = spaced.title()
-print(typ, season, title, sep="\t")
+print(typ)
+print(season)
+print(title)
 PY
 )
 
@@ -206,10 +213,14 @@ case "$TYPE" in
         SEASON_DIR="$ROOT/Season $(printf '%02d' "$SEASON")"
         DEFAULT_EP=1
         if [ -d "$SEASON_DIR" ]; then
-            HIGHEST_EP=$(ls "$SEASON_DIR" 2>/dev/null \
+            # Pipeline can produce no matches when the dir is empty or has no
+            # SxxEyy.mkv files. Under `set -euo pipefail` an empty-grep midway
+            # kills the whole script before the episode prompt. `|| true`
+            # downgrades the failure; empty HIGHEST_EP just leaves DEFAULT_EP=1.
+            HIGHEST_EP=$( (ls "$SEASON_DIR" 2>/dev/null \
                 | grep -oE "S0*${SEASON}E[0-9]+" \
                 | grep -oE 'E[0-9]+' | tr -d 'E' \
-                | sort -n | tail -1)
+                | sort -n | tail -1) || true )
             if [ -n "$HIGHEST_EP" ]; then
                 DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
             fi
