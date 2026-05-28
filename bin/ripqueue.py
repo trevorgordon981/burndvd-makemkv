@@ -436,9 +436,16 @@ def probe_disc(args) -> dict | None:
     result, codes, rdisk, _ = _run_once()
     if result is None:
         return None
-    # MSG 5010 "Failed to open disc" with no titles parsed almost always means
-    # macOS auto-mounted the volume and is holding the device exclusively.
-    if not result[1] and codes and 5010 in codes and rdisk:
+    # 0 titles parsed almost always means macOS auto-mounted the disc's volume
+    # and is holding the device exclusively. makemkvcon usually emits MSG 5010
+    # for this, but some discs silently return 0 titles with no 5010 code and no
+    # DRV/rdisk line, so don't gate the unmount on either. If titles are empty
+    # and an optical volume is currently mounted, unmount it and re-probe once.
+    # unmount_blocking_volume falls back to drutil + a `mount` scan when rdisk is
+    # None, so rdisk is a best-effort hint, not a requirement. _optical_mounts()
+    # gates this so we don't churn on AACS-locked / no-media discs (nothing
+    # mounted -> nothing to unmount).
+    if not result[1] and _optical_mounts():
         if unmount_blocking_volume(rdisk):
             result, codes, rdisk, _ = _run_once()
             if result is None:
@@ -527,6 +534,19 @@ def record_episode_count(item: QueueItem, disc_n: int, count: int, state: dict):
     state.setdefault("disc_episode_counts", {}).setdefault(ep_key(item), {})[str(disc_n)] = int(count)
 
 # -------- ripping --------
+def _staging_write_age(staging: Path) -> float:
+    """Seconds since the newest staged .mkv was last written, or a large number
+    if nothing's been written yet. Lets the progress display tell a real stall
+    (makemkvcon wedged) apart from a merely frozen PRGV counter while bytes are
+    still flowing. Single-title BD rips sit at PRGV 0% during the initial read
+    even though the .mkv grows steadily, which used to show a bogus 'stall' tag."""
+    try:
+        newest = max((p.stat().st_mtime for p in staging.rglob("*.mkv")),
+                     default=0.0)
+    except OSError:
+        return 1e9
+    return time.time() - newest if newest else 1e9
+
 def _draw_progress(start: float, total_v: int, mx: int, cur_task: str, stall_age_s: float):
     pct = 100.0 * total_v / mx if mx else 0
     el = time.time() - start
@@ -668,7 +688,8 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                         except subprocess.TimeoutExpired:
                             proc.kill(); proc.wait()
                         break
-                _draw_progress(start, total_v, mx, cur_task, stall_age)
+                _draw_progress(start, total_v, mx, cur_task,
+                               min(stall_age, _staging_write_age(staging)))
                 continue
             if kind == "eof":
                 break
@@ -688,7 +709,9 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                 if len(msgs) > 50: msgs = msgs[-50:]
             now = time.time()
             if now - last_print > 0.5 and mx > 0:
-                _draw_progress(start, total_v, mx, cur_task, now - last_progress_time)
+                _draw_progress(start, total_v, mx, cur_task,
+                               min(now - last_progress_time,
+                                   _staging_write_age(staging)))
                 last_print = now
     except KeyboardInterrupt:
         interrupted = True
