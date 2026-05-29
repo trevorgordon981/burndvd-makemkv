@@ -19,24 +19,6 @@ RIPQUEUE_PY="$HOME/scripts/ripqueue.py"
 LOG_DIR="$HOME/logs"
 mkdir -p "$LOG_DIR"
 
-# Optional pre-rip hook. If you have a heavy local process (large local LLM,
-# render job, etc.) competing with makemkvcon + ffmpeg for memory, drop a
-# script at ~/scripts/rip-mode-on that quiesces it; we run it here. Failure
-# is non-fatal; the rip continues either way. Remove the hook script to
-# disable.
-flip_to_rip_mode() {
-    if [ -x "$HOME/scripts/rip-mode-on" ]; then
-        echo "Running rip-mode-on hook..."
-        "$HOME/scripts/rip-mode-on" 2>&1 | tee -a "$LOG_DIR/rip-mode-hook.log" || \
-            echo "WARN: rip-mode-on failed (rc=$?); rip proceeds anyway" >&2
-    fi
-}
-
-# Note: no auto-flip-back hook. A multi-disc session would otherwise
-# reload weights every ~hour as discs swap, which costs more than the
-# memory headroom is worth. Flip back manually when the whole session
-# is done (if you wired up a rip-mode-on script in the first place).
-
 # Sweep orphan wrapper chains from previous runs. Each detached burndvd
 # launches `sh -c "sleep 999999 | script -q ... ripqueue.py --state STATE"`
 # which can't exit on its own (the sleep 999999 keeps the pipeline open).
@@ -77,7 +59,6 @@ rm -f "$STATE"
 # Pass-through when caller provides their own queue.
 for arg in "$@"; do
     if [ "$arg" = "--queue" ]; then
-        flip_to_rip_mode
         exec caffeinate -dimsu "$RIPQUEUE_PY" "$@"
     fi
 done
@@ -291,12 +272,6 @@ echo "Queue: $QUEUE"
 echo "Target: $ROOT"
 echo "Log:    $LOG"
 echo
-
-# Run the optional rip-mode-on hook before launching. No auto-undo hook;
-# whatever state rip-mode-on leaves the system in persists across the
-# whole session. Provide a rip-mode-off script of your own if you want
-# to invert it manually at the end.
-flip_to_rip_mode
 
 # Launch detached so closing the terminal can't SIGHUP the rip mid-write
 # (root cause of the 2026-05-23 Mean Streets stall: terminal close killed
