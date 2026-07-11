@@ -303,22 +303,35 @@ def _drive_identity(drive_idx: int) -> str | None:
     Returns None if no drive at that index. The exact format we capture is
     drutil's `Vendor Product Rev` triple, which is stable across reboots
     of the SAME drive but differs across drive substitutions."""
-    try:
-        r = subprocess.run(["drutil", "status", "-drive", str(drive_idx + 1)],
-                           capture_output=True, text=True, timeout=10)
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    # drutil output looks like:
-    #   Vendor   Product           Rev
-    #   HL-DT-ST BD-RE BU40N       1.03
-    # Skip the header, grab the data row.
-    for line in (r.stdout or "").splitlines():
-        s = line.strip()
-        if not s or s.lower().startswith(("vendor", "type:", "name:", "sessions:",
-                                          "tracks:", "overwritable:", "space ",
-                                          "writability:", "book ")):
-            continue
-        return s
+    # drutil on a USB-attached BU40N (SupportLevel: Unsupported) is flaky:
+    # `drutil status` intermittently returns an empty/headerless body even when
+    # the drive AND disc are present. A single empty read used to abort the whole
+    # rip at startup ("--device disc:N doesn't map to any optical drive"), so
+    # retry a few times before concluding the drive is really absent. A genuine
+    # drive substitution still returns the NEW identity consistently, so
+    # hotswap/change-detection is unaffected (worst case: a few extra seconds
+    # before a truly-absent drive is reported).
+    for _attempt in range(6):
+        try:
+            r = subprocess.run(["drutil", "status", "-drive", str(drive_idx + 1)],
+                               capture_output=True, text=True, timeout=10)
+        except (subprocess.TimeoutExpired, OSError):
+            r = None
+        if r is not None:
+            # drutil output looks like:
+            #   Vendor   Product           Rev
+            #   HL-DT-ST BD-RE BU40N       1.03
+            # Skip the header, grab the data row.
+            for line in (r.stdout or "").splitlines():
+                s = line.strip()
+                if not s or s.lower().startswith(("vendor", "type:", "name:", "sessions:",
+                                                  "tracks:", "overwritable:", "space ",
+                                                  "writability:", "book ")):
+                    continue
+                return s
+        # transient empty/failed read — wait and retry before giving up
+        if _attempt < 5:
+            time.sleep(1.5)
     return None
 
 def _drutil_disk_node(drive_idx: int | None = None) -> str | None:
