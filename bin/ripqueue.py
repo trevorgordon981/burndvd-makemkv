@@ -25,6 +25,9 @@ DEFAULT_MAKEMKVCON = "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"
 # Local staging keeps in-flight files off NAS (forum recommendation: avoid
 # direct-to-SMB rips; fragmentation + Jellyfin scan races during rip).
 LOCAL_STAGING_BASE = Path.home() / ".cache" / "burndvd" / "staging"
+STAGING_GROWTH_FACTOR = 1.05
+STAGING_HEADROOM_GB = 8.0
+PARALLEL_RIP_RESERVE_GB = 110.0
 
 # -------- presentation --------
 class C:
@@ -1220,6 +1223,60 @@ def _free_gb(path: Path) -> float:
     except Exception:
         return shutil.disk_usage(path).free / 1e9
 
+def staging_space_requirement(item: QueueItem, info: dict,
+                              title_ids: list[int]) -> tuple[float, float | None, bool]:
+    """Return (required_gb, selected_gb, used_legacy_fallback).
+
+    Movies write only their selected title. TV and double-feature jobs invoke
+    MakeMKV with selector=all plus EXTRAS_MIN_DUR_S, so budget every title that
+    command can write. If any required TINFO byte count is absent or invalid,
+    fail safe to the historical 60GB BD/DVD or 110GB UHD ceiling.
+    """
+    legacy_gb = 110.0 if (item.format or "").upper() == "4K" else 60.0
+    titles = info.get("titles", {}) if isinstance(info, dict) else {}
+    if item.type == "movie":
+        written_ids = list(title_ids)
+    else:
+        written_ids = [tid for tid, title in titles.items()
+                       if parse_duration(title.get(9, "0:00:00")) >= EXTRAS_MIN_DUR_S]
+    if not written_ids:
+        return legacy_gb, None, True
+
+    selected_bytes = 0
+    for tid in written_ids:
+        title = titles.get(tid, titles.get(str(tid)))
+        try:
+            size_bytes = int(title.get(11, "0") or "0")
+        except (AttributeError, TypeError, ValueError):
+            size_bytes = 0
+        if size_bytes <= 0:
+            return legacy_gb, None, True
+        selected_bytes += size_bytes
+
+    selected_gb = selected_bytes / 1e9
+    required_gb = selected_gb * STAGING_GROWTH_FACTOR + STAGING_HEADROOM_GB
+    return required_gb, selected_gb, False
+
+def staging_space_error(free_gb: float, required_gb: float, item_format: str,
+                        selected_gb: float | None, used_legacy_fallback: bool,
+                        active_other_rips: int = 0) -> str | None:
+    total_required = required_gb + active_other_rips * PARALLEL_RIP_RESERVE_GB
+    if free_gb >= total_required:
+        return None
+    if active_other_rips:
+        return (f"low disk space on local staging vs in-flight rips: "
+                f"{free_gb:.1f}GB free, need {total_required:.1f}GB "
+                f"({required_gb:.1f}GB for this {item_format} + "
+                f"{PARALLEL_RIP_RESERVE_GB:.0f}GB per active in-flight rip "
+                f"× {active_other_rips})")
+    if used_legacy_fallback:
+        detail = f"legacy-safe fallback for {item_format}; title byte metadata unavailable"
+    else:
+        detail = (f"{selected_gb:.1f}GB selected titles + 5% growth allowance "
+                  f"+ {STAGING_HEADROOM_GB:.0f}GB headroom")
+    return (f"low disk space on local staging: {free_gb:.1f}GB free at "
+            f"{LOCAL_STAGING_BASE}, need {required_gb:.1f}GB ({detail})")
+
 def _title_complete(staged: Path, info: dict) -> bool:
     """True if a staged .mkv is a fully-ripped title (not the truncated one that
     makemkvcon was mid-write on when it was killed). Prefers ffprobe duration vs
@@ -1343,7 +1400,8 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
     # Local staging — keeps in-flight files off NAS
     LOCAL_STAGING_BASE.mkdir(parents=True, exist_ok=True)
     local_free_gb = shutil.disk_usage(LOCAL_STAGING_BASE).free / 1e9
-    local_need = 110 if (item.format or "").upper() == "4K" else 60
+    local_need, selected_gb, legacy_space_fallback = staging_space_requirement(
+        item, info, title_ids)
     # Account for parallel in-flight rips on other drives. The single-rip
     # `free >= local_need` check passes for both rips of a 220GB parallel
     # UHD pair when ~200GB is free (audit follow-up 2026-05-31), then they
@@ -1369,18 +1427,20 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                 pass  # owner exited; staging is abandoned, no future growth
     except OSError:
         pass
-    # Reserve a full local_need-equivalent (max 110GB UHD ceiling, we don't
-    # know each rip's format from outside) per active other rip, on top of
-    # this rip's local_need.
-    required_with_parallel = local_need + (active_other_rips * 110)
-    if local_free_gb < local_need:
-        return False, (f"low disk space on local staging: {local_free_gb:.1f}GB free at "
-                       f"{LOCAL_STAGING_BASE}, need {local_need}GB for {item.format}")
-    if local_free_gb < required_with_parallel:
-        return False, (f"low disk space on local staging vs in-flight rips: "
-                       f"{local_free_gb:.1f}GB free, need {required_with_parallel}GB "
-                       f"({local_need}GB for this {item.format} + ~110GB per active "
-                       f"in-flight rip × {active_other_rips})")
+    # Keep the conservative 110GB reservation for each active rip because its
+    # selected-title metadata belongs to another process and is unavailable.
+    space_error = staging_space_error(
+        local_free_gb, local_need, item.format, selected_gb,
+        legacy_space_fallback, active_other_rips)
+    if space_error:
+        return False, space_error
+    if legacy_space_fallback:
+        budget_detail = "legacy-safe fallback (title byte metadata unavailable)"
+    else:
+        budget_detail = (f"{selected_gb:.1f}GB selected + 5% + "
+                         f"{STAGING_HEADROOM_GB:.0f}GB headroom")
+    print(f"{C.D}  staging budget: need {local_need:.1f}GB "
+          f"({budget_detail}); {local_free_gb:.1f}GB free{C.R}")
 
     staging = LOCAL_STAGING_BASE / f"{int(time.time())}-{os.getpid()}"
     shutil.rmtree(staging, ignore_errors=True)

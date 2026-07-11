@@ -339,3 +339,53 @@ def test_validate_queue_cli_is_hardware_free(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "Queue valid: 1 item(s)." in result.stdout
+
+
+def _movie_space_fixture(size_bytes=32_100_000_000):
+    item = ripqueue.QueueItem(
+        title="2 Fast 2 Furious (2003)",
+        type="movie",
+        discs=1,
+        target_root="/Volumes/Media/Movies/2 Fast 2 Furious (2003)",
+        format="BD",
+    )
+    info = {"titles": {0: {9: "1:47:00", 11: str(size_bytes)}}}
+    return item, info
+
+
+def test_dynamic_staging_budget_allows_exact_2f2f_incident():
+    item, info = _movie_space_fixture()
+    required, selected, fallback = ripqueue.staging_space_requirement(item, info, [0])
+    assert selected == pytest.approx(32.1)
+    assert required == pytest.approx(41.705)
+    assert fallback is False
+    assert ripqueue.staging_space_error(
+        49.7, required, item.format, selected, fallback) is None
+
+
+def test_dynamic_staging_budget_rejects_just_under_requirement():
+    item, info = _movie_space_fixture()
+    required, selected, fallback = ripqueue.staging_space_requirement(item, info, [0])
+    error = ripqueue.staging_space_error(
+        required - 0.001, required, item.format, selected, fallback)
+    assert error is not None
+    assert "32.1GB selected titles + 5% growth allowance + 8GB headroom" in error
+
+
+@pytest.mark.parametrize(("media_format", "fallback_gb"), [("BD", 60.0), ("4K", 110.0)])
+def test_missing_title_bytes_uses_legacy_safe_fallback(media_format, fallback_gb):
+    item, info = _movie_space_fixture(size_bytes=0)
+    item.format = media_format
+    required, selected, fallback = ripqueue.staging_space_requirement(item, info, [0])
+    assert (required, selected, fallback) == (fallback_gb, None, True)
+
+
+def test_parallel_rip_keeps_110gb_reservation():
+    item, info = _movie_space_fixture()
+    required, selected, fallback = ripqueue.staging_space_requirement(item, info, [0])
+    assert ripqueue.staging_space_error(
+        required + 109.9, required, item.format, selected, fallback,
+        active_other_rips=1) is not None
+    assert ripqueue.staging_space_error(
+        required + 110.0, required, item.format, selected, fallback,
+        active_other_rips=1) is None
