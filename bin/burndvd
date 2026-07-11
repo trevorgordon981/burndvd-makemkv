@@ -15,11 +15,35 @@
 
 set -euo pipefail
 
-SCRIPT_DIR=$(python3 -c 'import os,sys
-print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}")
+WRAPPER_PATH=$(python3 -c 'import os,sys
+print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(dirname "$WRAPPER_PATH")
 RIPQUEUE_PY="${BURNDVD_RIPQUEUE_PY:-$SCRIPT_DIR/ripqueue.py}"
 METADATA_PY="${BURNDVD_METADATA_PY:-$SCRIPT_DIR/burndvd_metadata.py}"
 LOG_DIR="$HOME/logs"
+
+# Run a command under script(1)'s pseudo-terminal while deliberately keeping
+# its stdin open. The feeder writes nothing; it polls its pipe for the reader
+# closing, then exits immediately with the child. This preserves the detached
+# rip's TTY without the old immortal `sleep 999999 | script ...` pipeline.
+run_logged_pty() {
+    [ "$#" -ge 2 ] || { echo "burndvd: internal pty runner needs LOG COMMAND..." >&2; return 64; }
+    local log_path="$1"
+    shift
+    python3 -c 'import select, sys
+p = select.poll()
+p.register(sys.stdout.fileno(), select.POLLERR | select.POLLHUP)
+p.poll()' \
+        | /usr/bin/script -q "$log_path" "$@"
+}
+
+# Private entrypoint used by the detached parent and hardware-free lifecycle
+# tests. It exits before orphan sweeping, disc discovery, unmounting, or eject.
+if [ "${1:-}" = "--internal-pty-run" ]; then
+    shift
+    run_logged_pty "$@" || exit $?
+    exit 0
+fi
 
 # Read a prompt without letting EOF terminate the whole wrapper under
 # `set -e`.  This accepts normal terminal input and piped answers; when stdin
@@ -59,12 +83,9 @@ fi
 
 mkdir -p "$LOG_DIR"
 
-# Sweep orphan wrapper chains from previous runs. Each detached burndvd
-# launches `sh -c "sleep 999999 | script -q ... ripqueue.py --state STATE"`
-# which can't exit on its own (the sleep 999999 keeps the pipeline open).
-# When the rip finishes, the sh/sleep/script chain leaks. We identify
-# orphans by --state value: any process group whose ripqueue.py has exited
-# is dead-weight and gets killed.
+# Sweep orphan wrapper chains from older launcher versions. Those detached
+# wrappers used `sleep 999999 | script ...`, which leaked the feeder after
+# ripqueue/script exited. New launches use run_logged_pty and self-clean.
 #
 # Bottom bare-sleep cleanup was removed 2026-05-31: with two drives in
 # parallel, a still-in-flight other-drive rip's `sleep 999999` can get
@@ -550,14 +571,17 @@ echo
 # the whole process group, leaving a half-written 52GB staging file).
 #
 # - nohup: child ignores SIGHUP, inherited by the whole chain
-# - sleep 999999 |: keeps script(1)'s stdin from EOFing into the child pty,
-#   which would otherwise trip ripqueue.py's "press Enter for menu" path
+# - internal pty runner: keeps script(1)'s stdin open only while its child lives
+#   and reaps the feeder immediately afterward
 # - script -q: gives ripqueue.py a real pty (its isatty() check requires one)
 #   and captures everything to LOG
 # - </dev/null + redirects: detach from this shell's stdio
-nohup sh -c "sleep 999999 | script -q '$LOG' caffeinate -dimsu '$RIPQUEUE_PY' --queue '$QUEUE' --state '$STATE' --device disc:$DISC_INDEX --non-interactive --on-fail=skip" </dev/null >/dev/null 2>&1 &
-disown
+nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
+    caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
+    --device "disc:$DISC_INDEX" --non-interactive --on-fail=skip \
+    </dev/null >/dev/null 2>&1 &
 RIP_LAUNCHER=$!
+disown
 
 echo "Rip launched detached (pid $RIP_LAUNCHER). Tailing log;"
 echo "When the rip finishes, the disc auto-ejects and the tail exits."

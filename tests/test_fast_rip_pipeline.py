@@ -8,6 +8,7 @@ import pty
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -100,6 +101,34 @@ def test_prompt_headless_required_value_without_default_fails_explicitly():
         )
     assert result.returncode == 64
     assert "a value is required" in result.stderr
+
+
+def test_internal_pty_launcher_keeps_stdin_open_and_reaps_feeder(tmp_path):
+    log_path = tmp_path / "pty-lifecycle.log"
+    token = f"burndvd-lifecycle-{os.getpid()}-{time.time_ns()}"
+    child = (
+        "import os,select; "
+        "assert os.isatty(0); "
+        "readable,_,_=select.select([0],[],[],0.2); "
+        "assert not readable, 'stdin reached EOF while child was alive'; "
+        f"print({token!r}, flush=True)"
+    )
+    started = time.monotonic()
+    result = subprocess.run(
+        [str(BURNDVD), "--internal-pty-run", str(log_path),
+         sys.executable, "-c", child],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    elapsed = time.monotonic() - started
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 3
+    assert token in log_path.read_text(encoding="utf-8")
+    time.sleep(0.1)
+    processes = subprocess.check_output(
+        ["ps", "-axo", "command="], text=True, timeout=2)
+    assert token not in processes
 
 
 @pytest.mark.parametrize(
