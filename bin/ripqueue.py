@@ -132,6 +132,11 @@ class QueueItem:
     # per-title subfolder) — each feature gets its own "<base>/<Name>/" folder.
     features: list = field(default_factory=list)
 
+
+REQUIRED_QUEUE_COLUMNS = {"title", "type", "discs", "target_root", "format"}
+VALID_QUEUE_TYPES = {"movie", "tv-season", "double-feature"}
+VALID_QUEUE_FORMATS = {"4K", "BD", "DVD"}
+
 def _parse_features(raw: str) -> list:
     """Parse the CSV `features` column (a JSON array string) into a list of
     {"title_id": int, "name": str} dicts. Tolerates empty/missing values."""
@@ -139,26 +144,109 @@ def _parse_features(raw: str) -> list:
     if not raw:
         return []
     data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("features must be a JSON array")
     out = []
-    for d in data:
-        out.append({"title_id": int(d["title_id"]), "name": str(d["name"]).strip()})
+    seen = set()
+    for index, d in enumerate(data, start=1):
+        if not isinstance(d, dict):
+            raise ValueError(f"feature {index} must be an object")
+        try:
+            title_id = int(d["title_id"])
+            raw_name = d["name"]
+            if not isinstance(raw_name, str):
+                raise TypeError("name is not a string")
+            name = raw_name.strip()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"feature {index} requires integer title_id and non-empty name"
+            ) from exc
+        if title_id < 0 or not name:
+            raise ValueError(
+                f"feature {index} requires non-negative title_id and non-empty name"
+            )
+        if title_id in seen:
+            raise ValueError(f"duplicate feature title_id {title_id}")
+        seen.add(title_id)
+        out.append({"title_id": title_id, "name": name})
     return out
+
+
+def validate_queue_item(item: QueueItem) -> None:
+    """Reject queue rows that would otherwise fail late or target a bad path."""
+
+    if not item.title or "\x00" in item.title:
+        raise ValueError("title must be non-empty and contain no NUL byte")
+    if item.type not in VALID_QUEUE_TYPES:
+        raise ValueError(
+            f"type must be one of {sorted(VALID_QUEUE_TYPES)}, got {item.type!r}"
+        )
+    if item.format not in VALID_QUEUE_FORMATS:
+        raise ValueError(
+            f"format must be one of {sorted(VALID_QUEUE_FORMATS)}, got {item.format!r}"
+        )
+    if item.discs < 1:
+        raise ValueError("discs must be at least 1")
+    if not item.target_root or not Path(item.target_root).is_absolute():
+        raise ValueError("target_root must be an absolute path")
+    if item.type == "tv-season" and item.season < 1:
+        raise ValueError("tv-season rows require season >= 1")
+    if item.episode_start < 1:
+        raise ValueError("episode_start must be at least 1")
+    if item.type == "double-feature" and len(item.features) < 2:
+        raise ValueError("double-feature rows require at least two features")
+    if item.type != "double-feature" and item.features:
+        raise ValueError("features are only valid for double-feature rows")
+
 
 def load_queue(path: Path) -> list[QueueItem]:
     items: list[QueueItem] = []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            items.append(QueueItem(
-                title=row["title"].strip(),
-                type=row["type"].strip(),
-                discs=csv_int(row, "discs", 1),
-                target_root=row["target_root"].strip(),
-                format=row["format"].strip(),
-                season=csv_int(row, "season", 0),
-                episode_start=csv_int(row, "episode_start", 1),
-                notes=(row.get("notes") or "").strip(),
-                features=_parse_features(row.get("features", "")),
-            ))
+    try:
+        f = open(path, newline="", encoding="utf-8-sig")
+    except OSError as exc:
+        raise ValueError(f"cannot open queue {path}: {exc}") from exc
+    with f:
+        reader = csv.DictReader(f)
+        raw_fields = reader.fieldnames or []
+        duplicate_fields = sorted(
+            {name for name in raw_fields if raw_fields.count(name) > 1}
+        )
+        if duplicate_fields:
+            raise ValueError(
+                f"queue {path} has duplicate column(s): {', '.join(duplicate_fields)}"
+            )
+        fields = set(raw_fields)
+        missing = sorted(REQUIRED_QUEUE_COLUMNS - fields)
+        if missing:
+            raise ValueError(
+                f"queue {path} is missing required column(s): {', '.join(missing)}"
+            )
+        for row in reader:
+            row_number = reader.line_num
+            if None in row:
+                raise ValueError(
+                    f"queue {path} row {row_number} has extra unquoted CSV field(s)"
+                )
+            if not any((value or "").strip() for value in row.values()):
+                continue
+            try:
+                item = QueueItem(
+                    title=(row["title"] or "").strip(),
+                    type=(row["type"] or "").strip(),
+                    discs=csv_int(row, "discs", 1),
+                    target_root=(row["target_root"] or "").strip(),
+                    format=(row["format"] or "").strip().upper(),
+                    season=csv_int(row, "season", 0),
+                    episode_start=csv_int(row, "episode_start", 1),
+                    notes=(row.get("notes") or "").strip(),
+                    features=_parse_features(row.get("features", "")),
+                )
+                validate_queue_item(item)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"queue {path} row {row_number}: {exc}") from exc
+            items.append(item)
+    if not items:
+        raise ValueError(f"queue {path} contains no items")
     return items
 
 # -------- state --------
@@ -209,7 +297,33 @@ def warn_queue_divergence(state: dict, items: list[QueueItem]):
 def load_or_init(args, items) -> dict:
     p = Path(args.state)
     if p.exists():
-        state = json.loads(p.read_text())
+        raw = p.read_text(encoding="utf-8")
+        # `mktemp` creates an empty file. Manual/headless launches commonly pass
+        # that path as --state, which previously made json.loads("") crash before
+        # the first queue item. Empty/whitespace means "new state"; malformed
+        # non-empty JSON remains a hard error so a real resume is never discarded.
+        if not raw.strip():
+            print(f"{C.CYA}New run{C.R}: state file {p} is empty; "
+                  f"loaded {len(items)} queue items.")
+            return default_state(items)
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"state file {p} is not valid JSON at line {exc.lineno}, "
+                f"column {exc.colno}; refusing to overwrite resume data"
+            ) from exc
+        if not isinstance(state, dict):
+            raise ValueError(f"state file {p} must contain a JSON object")
+        for key, expected_type in (
+            ("queue", list),
+            ("current_index", int),
+            ("completed", list),
+        ):
+            if key not in state or not isinstance(state[key], expected_type):
+                raise ValueError(
+                    f"state file {p} has invalid or missing {key!r}"
+                )
         state.setdefault("disc_episode_counts", {})
         state.pop("next_episode", None)
         # Auto-discard a fully-complete snapshot when the new CSV is a different
@@ -2231,6 +2345,9 @@ def wait_for_disc(args, state: dict):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--queue")
+    ap.add_argument("--validate-queue", metavar="PATH",
+                    help="parse and validate a queue, then exit without "
+                         "querying a drive or MakeMKV")
     ap.add_argument("--scan", action="store_true",
                     help="probe the disc, print its title table as JSON, and "
                          "exit (used by burndvd to detect double-feature discs)")
@@ -2257,6 +2374,14 @@ def main():
                          "retry attempts up to 2 times before giving up; "
                          "abort exits non-zero.")
     args = ap.parse_args()
+
+    # Deliberately precedes signal setup, drive identity probing, and the
+    # makemkvcon existence check. The burndvd wrapper uses this as a CPU-only
+    # preflight of the exact CSV it is about to launch.
+    if args.validate_queue:
+        items = load_queue(Path(args.validate_queue))
+        print(f"Queue valid: {len(items)} item(s).")
+        return
 
     # SIGUSR1 → "skip current queue item" via stoprip --skip-current.
     # The handler just sets a flag; the main loop checks between items so

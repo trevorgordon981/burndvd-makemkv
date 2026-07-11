@@ -12,7 +12,7 @@ Detected disc:
   size:    ~23 GiB
   format:  BD (auto)
 
-Title (add year): [Parks And Recreation (YYYY)]
+Title (include year): [Parks And Recreation]
 Type [tv-season]:
 Format [BD]:
 Season number [6]:
@@ -30,6 +30,9 @@ When the rip finishes, the disc auto-ejects and the tail exits.
 
 - **Auto-detect** the inserted disc, drive, format (DVD/BD/4K), and best-guess
   title/season/disc-number from the volume label.
+- **Canonical movie folders**: movie titles must end in `(YYYY)`. Known compact
+  Fast-franchise labels such as `2F2F` and `FFTokyoDriftUHDPK75` expand to their
+  official title, punctuation, and release year.
 - **Auto-next-episode** prompt: scans the season folder, defaults to
   highest-existing + 1. Press Enter to accept.
 - **Plex/Jellyfin naming**: writes `Title - SxxEyy.mkv` under
@@ -84,6 +87,10 @@ a sensible default. Episode-start defaults to the next slot after whatever
 already exists in the season folder, so back-to-back disc rips don't need
 manual counting.
 
+Prompts accept terminal or piped input. If headless stdin ends, a prompt uses
+its safe default; required values without a default fail explicitly. Unknown
+movie titles never fall through without a release year.
+
 ## Multi-disc / queue mode
 
 Drive `ripqueue.py` directly with a CSV:
@@ -100,7 +107,9 @@ caffeinate -dimsu ripqueue.py --queue queue.csv --state ~/ripqueue-state.json
 ```
 
 The state file persists progress across runs, so resuming after a crash
-or a shell exit picks up where it left off.
+or a shell exit picks up where it left off. An empty state file created by
+`mktemp` is treated as a new run; malformed non-empty JSON is refused so real
+resume data is never silently overwritten.
 
 Useful flags:
 
@@ -109,18 +118,23 @@ Useful flags:
 - `--min-free-gb 200` — bail before a rip if the target volume is low.
 - `--device disc:1` — force a specific drive.
 - `--no-eject` / `--no-sound` — quieter operation.
+- `--validate-queue queue.csv` — CPU-only CSV/embedded-JSON validation; exits
+  before drive discovery or any MakeMKV operation.
 
 ## Layout
 
 ```
 bin/
   burndvd        smart single-disc wrapper (bash)
+  burndvd_metadata.py  hardware-free title inference + queue writer
   ripqueue.py    queue worker (python, stdlib only)
   ejectdisc      tiny drutil wrapper
   subocr         bash wrapper around subocr.py (uses pyobjc venv)
   subocr.py      Apple Vision OCR for PGS subs (python + pyobjc)
 examples/
   subocr-shows.json   per-show config example
+tests/
+  test_fast_rip_pipeline.py  prompt, metadata, CSV/JSON, state + dry-run tests
 ```
 
 ## Pitfalls

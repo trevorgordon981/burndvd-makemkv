@@ -15,8 +15,48 @@
 
 set -euo pipefail
 
-RIPQUEUE_PY="$HOME/scripts/ripqueue.py"
+SCRIPT_DIR=$(python3 -c 'import os,sys
+print(os.path.dirname(os.path.realpath(sys.argv[1])))' "${BASH_SOURCE[0]}")
+RIPQUEUE_PY="${BURNDVD_RIPQUEUE_PY:-$SCRIPT_DIR/ripqueue.py}"
+METADATA_PY="${BURNDVD_METADATA_PY:-$SCRIPT_DIR/burndvd_metadata.py}"
 LOG_DIR="$HOME/logs"
+
+# Read a prompt without letting EOF terminate the whole wrapper under
+# `set -e`.  This accepts normal terminal input and piped answers; when stdin
+# is closed (nohup/automation), an available default is selected explicitly.
+# A required value with no default fails with EX_USAGE instead of silently
+# constructing a malformed queue.
+prompt_value() {
+    local target_name="$1"
+    local prompt_text="$2"
+    local default_value="${3:-}"
+    local required="${4:-0}"
+    local value=""
+
+    if IFS= read -r -p "$prompt_text" value; then
+        :
+    else
+        value="$default_value"
+        if [ -n "$default_value" ]; then
+            printf '\nburndvd: stdin ended; using default %q.\n' "$default_value" >&2
+        else
+            printf '\nburndvd: stdin ended and this prompt has no default.\n' >&2
+        fi
+    fi
+    [ -n "$value" ] || value="$default_value"
+    if [ "$required" = "1" ] && [ -z "$value" ]; then
+        echo "burndvd: a value is required for: $prompt_text" >&2
+        return 64
+    fi
+    printf -v "$target_name" '%s' "$value"
+}
+
+# Tests source this file in library-only mode so prompt behavior can be proven
+# without running orphan cleanup or issuing a single optical-drive command.
+if [ "${BURNDVD_LIBRARY_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 mkdir -p "$LOG_DIR"
 
 # Sweep orphan wrapper chains from previous runs. Each detached burndvd
@@ -25,8 +65,15 @@ mkdir -p "$LOG_DIR"
 # When the rip finishes, the sh/sleep/script chain leaks. We identify
 # orphans by --state value: any process group whose ripqueue.py has exited
 # is dead-weight and gets killed.
+#
+# Bottom bare-sleep cleanup was removed 2026-05-31: with two drives in
+# parallel, a still-in-flight other-drive rip's `sleep 999999` can get
+# reparented to launchd as soon as its `sh` parent exits, and the bare-
+# sleep matcher would catch and kill it — terminating its pipe before
+# the in-flight NAS transfer finishes. macOS GCs orphan bare sleeps
+# eventually; tolerating a few zombies for hours is the lesser evil.
 sweep_burndvd_orphans() {
-    local state pid args ppid
+    local state pid claim claim_state
     local states
     states=$(ps -Ao args= 2>/dev/null \
         | grep -oE -- "--state [^ ]+" \
@@ -35,26 +82,143 @@ sweep_burndvd_orphans() {
     for state in $states; do
         # Skip if any python ripqueue.py is still serving this state.
         pgrep -f "python.*ripqueue.py.*$state" >/dev/null 2>&1 && continue
-        # Orphan: kill every remaining process that references this state.
+        # Orphan: kill every remaining process that references this state,
+        # and clean up the exit-sentinel sibling file (written by ripqueue's
+        # top-level finally block — accumulates 1 per rip over a 500-disc
+        # session if we don't sweep it).
         for pid in $(pgrep -f "$state" 2>/dev/null || true); do
             kill "$pid" 2>/dev/null || true
         done
+        rm -f "${state}.exit" 2>/dev/null || true
     done
-    # Mop up any sleep 999999 reparented to launchd (parent=1) after its
-    # sh died above. Bare sleep, no state in args, so the loop above misses it.
-    for pid in $(pgrep -x sleep 2>/dev/null || true); do
-        args=$(ps -o args= -p "$pid" 2>/dev/null || true)
-        [ "$args" = "sleep 999999" ] || continue
-        ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
-        [ "$ppid" = "1" ] && kill "$pid" 2>/dev/null || true
-    done
+    # Log rotation (added 2026-05-31 for the 500-title campaign): each rip
+    # produces a ~200KB-1MB log under ~/logs/burndvd-*.log. Over the
+    # campaign that's ~500MB of small files that accumulate forever. Delete
+    # logs older than 30 days; the rip-summary.log keeps the audit trail.
+    find "$HOME/logs" -maxdepth 1 -name "burndvd-*.log" -mtime +30 \
+        -delete 2>/dev/null || true
+    # Similarly for subocr-postrip logs (one per rip).
+    find "$HOME/logs" -maxdepth 1 -name "subocr-postrip-*.log" -mtime +30 \
+        -delete 2>/dev/null || true
+    # Clean stale drive claims: each claim records its owning ripqueue's
+    # --state path; if that ripqueue isn't running, the claim is stale and
+    # blocks future burndvds from picking the drive. A claim with no state
+    # file inside is mid-creation by another wrapper unless it's old.
+    local claim_dir="$HOME/.cache/burndvd/drive-claims"
+    if [ -d "$claim_dir" ]; then
+        for claim in "$claim_dir"/disc-*.claim; do
+            [ -d "$claim" ] || continue
+            claim_state=$(cat "$claim/state" 2>/dev/null || true)
+            if [ -n "$claim_state" ]; then
+                pgrep -f "python.*ripqueue.py.*$claim_state" >/dev/null 2>&1 \
+                    && continue
+            else
+                # No state recorded; treat as orphan only if old (>5 min)
+                # so we don't race another wrapper's mid-creation window.
+                [ -z "$(find "$claim" -maxdepth 0 -mmin +5 2>/dev/null)" ] \
+                    && continue
+            fi
+            rm -rf "$claim" 2>/dev/null || true
+        done
+    fi
 }
 sweep_burndvd_orphans
+
+SLACK_CHANNEL_FAIL="C0ADXES92LE"  # #deploy-notifications
+RIP_SUMMARY_LOG="$HOME/logs/rip-summary.log"
+
+# Post one-line failure alert to Slack. Used after the rip's exit sentinel
+# shows a non-success / non-Ctrl-C exit. Without this, failed rips only
+# surface as a stderr print on the wrapper terminal, which is invisible
+# if the user wasn't watching (across 500 rips that's 10-25 silent
+# failures). Reuses the Hermes bot token from ~/.hermes/.env (same source
+# as the tailnet watcher + mlx-vlm-healthcheck + rip-progress poster).
+slack_post_failure() {
+    local text="$1"
+    local token
+    token=$(grep '^SLACK_BOT_TOKEN=' "$HOME/.hermes/.env" 2>/dev/null \
+        | cut -d= -f2- | tr -d '"' | tr -d "'")
+    [ -n "$token" ] || return 0
+    /usr/bin/curl -sS -m 10 -X POST https://slack.com/api/chat.postMessage \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        -d "$(python3 -c 'import json,sys
+print(json.dumps({"channel": sys.argv[1], "text": sys.argv[2], "unfurl_links": False}))' "$SLACK_CHANNEL_FAIL" "$text")" \
+        >/dev/null 2>&1 || true
+}
+
+# Append one line to ~/logs/rip-summary.log so there's a single-source
+# audit trail across the campaign without grepping through per-rip logs.
+# Format: ISO timestamp, status, volume label, exit info, log basename.
+append_rip_summary() {
+    local volume="$1" status="$2" exit_code="$3" reason="$4" log_path="$5"
+    mkdir -p "$(dirname "$RIP_SUMMARY_LOG")"
+    printf '%s\t%s\t%s\texit=%s\treason=%s\tlog=%s\n' \
+        "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+        "$status" \
+        "${volume:-?}" \
+        "$exit_code" \
+        "$reason" \
+        "$(basename "$log_path")" \
+        >> "$RIP_SUMMARY_LOG" 2>/dev/null || true
+}
+
+# Note any in-flight burndvd rip that targets the same (title, season) and
+# warn the user about it, but do NOT block. The previous blocking version
+# (added 2026-05-30, removed 2026-05-31) defeated the whole point of the
+# detached-rip + background-NAS-transfer pipeline: it forced the second
+# wrapper to wait through D1's transfer, eliminating the speed-up.
+#
+# Correctness without waiting is guaranteed by ripqueue.py's `starting_ep()`
+# (ripqueue.py:730), which re-scans the season dir at *actual rip time* —
+# long after the prior rip's files have landed on the NAS. So even if the
+# DEFAULT_EP prompt below shows a stale number, ripqueue overrides it at
+# rip time and files land with the correct numbering. Verified on S05D2
+# 2026-05-30: wrapper suggested [4], actual rip landed E08–E14. The prompt
+# is purely a UX hint; the on-disk outcome is decided later.
+warn_concurrent_rip() {
+    local title="$1" season="$2"
+    local pid state_file
+    for pid in $(pgrep -f "python.*ripqueue.py" 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        state_file=$(ps -o args= -p "$pid" 2>/dev/null \
+            | grep -oE -- "--state [^ ]+" | awk '{print $2}' | tr -d "'\"")
+        [ -z "$state_file" ] && continue
+        [ -f "$state_file" ] || continue
+        if python3 - "$state_file" "$title" "$season" >/dev/null 2>&1 <<'PY'
+import json, sys
+sp, t, s = sys.argv[1:]
+try:
+    d = json.load(open(sp))
+except Exception:
+    sys.exit(1)
+for q in d.get("queue", []):
+    if q.get("title") == t and str(q.get("season")) == s:
+        sys.exit(0)
+sys.exit(1)
+PY
+        then
+            echo "  Note: another burndvd is ripping $title S$season (pid $pid)."
+            echo "  The Episode-start default below may be stale (the NAS scan can't"
+            echo "  see files still in transfer). ripqueue will re-check at actual rip"
+            echo "  time and pick the right number — just accept the default."
+            return 0
+        fi
+    done
+}
 
 # Per-invocation state. Single-disc mode is one rip; cross-invocation resume
 # isn't useful here and the shared file caused stale "queue complete" exits.
 STATE=$(mktemp -t burndvd-state.XXXX.json)
 rm -f "$STATE"
+# Record this rip's state file inside the drive claim (if we have one) so
+# sweep_burndvd_orphans can decide when the claim is stale: when the
+# ripqueue with this --state path is no longer running. Touch a sentinel
+# at the same time so the directory mtime reflects "claim is for an
+# active rip", not "claim was made N minutes ago and abandoned".
+if [ -n "${DRIVE_CLAIM_HELD:-}" ]; then
+    echo "$STATE" > "$DRIVE_CLAIM_HELD/state" 2>/dev/null || true
+fi
 
 # Pass-through when caller provides their own queue.
 for arg in "$@"; do
@@ -65,12 +229,32 @@ done
 
 # --- Smart single-disc mode ---
 # Multi-drive auto-pick: enumerate all optical drives via `drutil list`, pick
-# the first one that (a) has media and (b) isn't already being ripped by
-# another makemkvcon. drutil's 1-based index maps to makemkvcon's 0-based
-# disc:N. Behaves identically with one drive; supports N drives without a flag.
+# the first one that (a) has media, (b) isn't already being ripped by another
+# makemkvcon, AND (c) isn't claimed by another burndvd wrapper that's
+# between drive-pick and makemkvcon-spawn. drutil's 1-based index maps to
+# makemkvcon's 0-based disc:N. Behaves identically with one drive; supports
+# N drives without a flag.
+#
+# Drive-pick race fix (2026-05-31): the prior version only checked pgrep for
+# makemkvcon, which leaves a 1–3s window between "drive picked" and
+# "makemkvcon spawned" during which a second simultaneous burndvd would see
+# the same drive as free and claim it too. Both wrappers would then race
+# their makemkvcons against the same physical drive, with one losing.
+# Solution: hold an exclusive flock on a per-drive lock file for the wrapper's
+# entire lifetime, opened on FD 200. Lock auto-releases when wrapper exits.
+DRIVE_CLAIM_DIR="$HOME/.cache/burndvd/drive-claims"
+mkdir -p "$DRIVE_CLAIM_DIR"
 DEVICE=""
 DISC_INDEX=""
 DISC_TYPE=""
+# Robust makemkvcon disc:N numbering, GUARDED for `set -euo pipefail` (empty greps
+# return non-zero; without the guards they would silently abort the whole script).
+# makemkvcon numbers drives by ascending /dev/disk number, which can DIFFER from
+# drutil's drive order after an eject/reinsert/USB re-enum. So detect 'busy' by the
+# device a running rip physically holds (lsof, ground truth), and number media
+# drives by disk#.
+BUSY_DEVS=$( { for p in $(pgrep -f makemkvcon 2>/dev/null || true); do lsof -p "$p" 2>/dev/null | grep -oE '/dev/r?disk[0-9]+' || true; done | grep -oE 'disk[0-9]+' | sort -u; } || true )
+SORTED_NUMS=$( { drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]' | while read -r _l; do _ix=$(printf '%s\n' "$_l" | awk '{print $1}'); _inf=$(drutil status -drive "$_ix" 2>/dev/null || true); printf '%s' "$_inf" | grep -q "No Media Inserted" && continue; printf '%s' "$_inf" | sed -n 's|.*Name: */dev/disk\([0-9]*\).*|\1|p' | head -1; done | sort -n; } || true )
 while read -r line; do
     idx=$(printf '%s\n' "$line" | awk '/^[[:space:]]*[0-9]+/ {print $1}')
     [ -z "$idx" ] && continue
@@ -78,10 +262,39 @@ while read -r line; do
     printf '%s' "$info" | grep -q "No Media Inserted" && continue
     dev=$(printf '%s' "$info" | sed -n 's|.*Name: */dev/\(disk[0-9]*\).*|\1|p' | head -1)
     [ -z "$dev" ] && continue
-    discN=$((idx - 1))
-    if pgrep -f "makemkvcon.*disc:$discN([^0-9]|$)" >/dev/null 2>&1; then
+    # correct makemkvcon disc:N = rank of this device's disk# among media drives (guarded)
+    dnum=$(printf '%s' "$dev" | grep -oE '[0-9]+')
+    discN=$(printf '%s\n' "$SORTED_NUMS" | grep -nxF "$dnum" | head -1 | cut -d: -f1 || true); discN=$(( ${discN:-1} - 1 ))
+    # busy = the device a running rip physically holds (ground truth, not an index guess)
+    if printf '%s\n' "$BUSY_DEVS" | grep -qx "$dev"; then
         continue
     fi
+    # Atomic claim via `mkdir` (POSIX-atomic, works on macOS where `flock`
+    # isn't available without Homebrew). Claim persists for the lifetime
+    # of the ripqueue, not the wrapper — the wrapper can be Ctrl-C'd off
+    # the tail while ripqueue keeps running, so an EXIT-trap rmdir would
+    # release too early and let a second burndvd race onto the still-busy
+    # drive between makemkvcon titles. Instead the claim records its
+    # owning ripqueue's --state path, and sweep_burndvd_orphans removes
+    # the claim when that state's ripqueue is no longer running.
+    drive_claim="$DRIVE_CLAIM_DIR/disc-$discN.claim"
+    if ! mkdir "$drive_claim" 2>/dev/null; then
+        # Existing claim, but the OUTER pgrep above already confirmed no
+        # active makemkvcon for disc:N — so the drive HARDWARE is free.
+        # The prior claim is from a rip whose makemkvcon has exited but
+        # whose ripqueue is still doing background NAS transfers (which
+        # don't touch the drive). Take over the stale claim. Without
+        # this, the second disc of a batch couldn't start until the first
+        # finished its full transfer — defeating the parallel-pipeline
+        # design the user explicitly wants (audit-follow-up 2026-05-31).
+        rm -rf "$drive_claim" 2>/dev/null
+        if ! mkdir "$drive_claim" 2>/dev/null; then
+            # Another wrapper raced us into the same takeover; skip.
+            continue
+        fi
+    fi
+    DRIVE_CLAIM_HELD="$drive_claim"
+    echo "$$" > "$drive_claim/pid" 2>/dev/null || true
     DEVICE="$dev"
     DISC_INDEX="$discN"
     DISC_TYPE=$(printf '%s' "$info" | awk '/Type:/ {print $2; exit}')
@@ -100,11 +313,10 @@ if [ -z "$DEVICE" ]; then
 fi
 
 # Volume label from diskutil — works whether the disc is auto-mounted or not.
-# Previously we also required /Volumes/$VOLUME to exist, but that bites when
-# a disc is in the drive and readable yet macOS hasn't auto-mounted it (e.g.
-# after a previous burndvd run unmounted it for makemkvcon). makemkvcon
-# doesn't need the mount; the mount is actually a problem for it. Only
-# require the label.
+# Previously we also required /Volumes/$VOLUME to exist, but that bites when a
+# disc is in the drive and readable yet macOS hasn't auto-mounted it (e.g.
+# after a previous burndvd run unmounted it). makemkvcon doesn't need the
+# mount; the mount is actually a problem for it. Only require the label.
 VOLUME=$(diskutil info "/dev/$DEVICE" 2>/dev/null \
     | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}')
 if [ -z "${VOLUME:-}" ]; then
@@ -118,7 +330,7 @@ fi
 SIZE_GB=$(drutil status -drive "$((DISC_INDEX + 1))" 2>/dev/null \
     | awk '/Space Used:/ {for(i=1;i<=NF;i++) if($i ~ /GB$/) {sub("GB","",$i); printf "%d", $i+0.5; exit}}')
 if ! [[ "${SIZE_GB:-0}" =~ ^[0-9]+$ ]] || [ "${SIZE_GB:-0}" = "0" ]; then
-    # Fall back to df if the disc IS mounted (the legacy path).
+    # Fall back to df if the disc IS mounted (the old path)
     if [ -d "/Volumes/$VOLUME" ]; then
         SIZE_KB=$(df -k "/Volumes/$VOLUME" 2>/dev/null | awk 'NR==2 {print $3}')
         if [[ "${SIZE_KB:-0}" =~ ^[0-9]+$ ]]; then
@@ -154,25 +366,12 @@ esac
 # middle field is empty (movie with no season number) — that shifts the title
 # into the season slot and leaves the title default empty. Line-per-field
 # preserves empty fields correctly.
+if [ ! -f "$METADATA_PY" ]; then
+    echo "burndvd: metadata helper not found: $METADATA_PY" >&2
+    exit 1
+fi
 { read -r DEFAULT_TYPE; read -r DEFAULT_SEASON; read -r DEFAULT_TITLE; } \
-    < <(python3 - "$VOLUME" <<'PY'
-import re, sys
-spaced = sys.argv[1].replace('_', ' ').strip()
-tv_pat = r'(?i)(S\d+\s*D\d+|Season[\s-]+\d+|Disc[\s-]+\d+|Vol(?:ume)?[\s-]+\d+)'
-m = re.search(tv_pat, spaced)
-if m:
-    typ = "tv-season"
-    sm = re.search(r'(?i)(?<![A-Za-z])S0*(\d+)|Season[\s-]+0*(\d+)', spaced)
-    season = (sm.group(1) or sm.group(2)) if sm else ""
-    title = re.sub(tv_pat + r'.*$', '', spaced).strip().rstrip('-').strip().title()
-else:
-    typ, season = "movie", ""
-    title = spaced.title()
-print(typ)
-print(season)
-print(title)
-PY
-)
+    < <(python3 "$METADATA_PY" defaults "$VOLUME")
 
 cat <<EOF
 Detected disc:
@@ -183,21 +382,39 @@ Detected disc:
 
 EOF
 
-read -r -p "Title (add year): [$DEFAULT_TITLE (YYYY)] " TITLE
-TITLE="${TITLE:-$DEFAULT_TITLE}"
+prompt_value TITLE "Title (include year): [$DEFAULT_TITLE] " "$DEFAULT_TITLE" 1
 
-read -r -p "Type [$DEFAULT_TYPE]: " TYPE
-TYPE="${TYPE:-$DEFAULT_TYPE}"
+prompt_value TYPE "Type [$DEFAULT_TYPE]: " "$DEFAULT_TYPE" 1
+# Accept "tv" as shorthand for the canonical "tv-season".
+[ "$TYPE" = "tv" ] && TYPE="tv-season"
 
-read -r -p "Format [$DEFAULT_FORMAT]: " FORMAT
-FORMAT="${FORMAT:-$DEFAULT_FORMAT}"
+# Compact Fast-franchise aliases and mastering labels become canonical Plex
+# names. Unknown movie titles must explicitly end in a year; this prevents a
+# headless EOF from silently creating another ambiguous folder.
+if [ "$TYPE" = "movie" ]; then
+    TITLE=$(python3 "$METADATA_PY" normalize-movie "$TITLE")
+    if ! python3 "$METADATA_PY" has-year "$TITLE"; then
+        echo "burndvd: movie titles must end in a four-digit year, e.g. Movie (2003)." >&2
+        prompt_value TITLE "Movie title (include year): " "" 1
+        TITLE=$(python3 "$METADATA_PY" normalize-movie "$TITLE")
+    fi
+    if ! python3 "$METADATA_PY" has-year "$TITLE"; then
+        echo "burndvd: refusing non-canonical movie title '$TITLE' (missing year)." >&2
+        exit 64
+    fi
+fi
+
+prompt_value FORMAT "Format [$DEFAULT_FORMAT]: " "$DEFAULT_FORMAT" 1
+# Normalize to canonical uppercase: the case statements below match 4K/BD/DVD
+# exactly, so "4k", "bd", "dvd" would otherwise fall through to the error arm.
+FORMAT=$(printf '%s' "$FORMAT" | tr '[:lower:]' '[:upper:]')
 
 SEASON=""
 EP_START=""
+FEATURES_JSON=""   # populated only when the user confirms a double feature
 case "$TYPE" in
     tv-season)
-        read -r -p "Season number${DEFAULT_SEASON:+ [$DEFAULT_SEASON]}: " SEASON
-        SEASON="${SEASON:-$DEFAULT_SEASON}"
+        prompt_value SEASON "Season number${DEFAULT_SEASON:+ [$DEFAULT_SEASON]}: " "$DEFAULT_SEASON" 1
         if ! [[ "$SEASON" =~ ^[0-9]+$ ]]; then
             echo "burndvd: season must be a number." >&2; exit 1
         fi
@@ -209,6 +426,7 @@ case "$TYPE" in
         # Auto-suggest next episode: scan the season dir for the highest existing
         # SxxEyy.mkv and default to that+1. Press Enter to accept; type a number
         # to override. Falls back to 1 if the dir is empty/missing.
+        warn_concurrent_rip "$TITLE" "$SEASON"
         SEASON_DIR="$ROOT/Season $(printf '%02d' "$SEASON")"
         DEFAULT_EP=1
         if [ -d "$SEASON_DIR" ]; then
@@ -224,33 +442,87 @@ case "$TYPE" in
                 DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
             fi
         fi
-        read -r -p "Episode start [$DEFAULT_EP]: " EP_START
-        EP_START="${EP_START:-$DEFAULT_EP}"
+        prompt_value EP_START "Episode start [$DEFAULT_EP]: " "$DEFAULT_EP" 1
         ;;
     movie)
         case "$FORMAT" in
-            4K)     ROOT="/Volumes/Media/Movies 4K/$TITLE" ;;
-            BD|DVD) ROOT="/Volumes/Media/Movies/$TITLE" ;;
+            4K)     ROOT="/Volumes/Media/Movies 4K/$TITLE"; MOVIE_BASE="/Volumes/Media/Movies 4K" ;;
+            BD|DVD) ROOT="/Volumes/Media/Movies/$TITLE";    MOVIE_BASE="/Volumes/Media/Movies" ;;
             *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
         esac
+
+        # Double-feature detection: probe the disc's title table and, if it
+        # carries two or more feature-length titles, offer to rip them as
+        # separate movies. The scan also primes MakeMKV (and unmounts an
+        # auto-mounted DVD volume) before the real rip. Single-feature discs
+        # see one extra ~probe of latency and are otherwise unaffected.
+        echo
+        echo "Scanning disc titles for a possible double feature..."
+        SCAN_JSON=$("$RIPQUEUE_PY" --scan --device "disc:$DISC_INDEX" 2>/dev/null || echo "[]")
+        NFEAT=$(printf '%s' "$SCAN_JSON" \
+            | python3 -c 'import sys,json
+try: print(sum(1 for t in json.load(sys.stdin) if t.get("feature")))
+except Exception: print(0)' 2>/dev/null || echo 0)
+        if [ "${NFEAT:-0}" -ge 2 ]; then
+            echo
+            echo "Found $NFEAT feature-length titles on this disc:"
+            printf '%s' "$SCAN_JSON" | python3 -c 'import sys,json
+for t in json.load(sys.stdin):
+    if t.get("feature"):
+        print("  t%02d  %8s  %10s  %s" % (t["id"], t["dur"], t["size"], t["name"]))'
+            echo
+            prompt_value DF "Treat as a double feature (rip each as its own movie)? [y/N] " "n"
+            if [[ "$DF" =~ ^[Yy] ]]; then
+                FEAT_IDS=$(printf '%s' "$SCAN_JSON" | python3 -c 'import sys,json
+print(" ".join(str(t["id"]) for t in json.load(sys.stdin) if t.get("feature")))')
+                FEAT_PAIRS=()
+                echo "Name each movie (include year, e.g. \"Death Proof (2007)\"):"
+                for fid in $FEAT_IDS; do
+                    DUR=$(printf '%s' "$SCAN_JSON" | python3 -c "import sys,json
+print(next(t['dur'] for t in json.load(sys.stdin) if t['id']==$fid))")
+                    MNAME=""
+                    while :; do
+                        prompt_value MNAME "  t$(printf '%02d' "$fid") ($DUR): " "" 1
+                        MNAME=$(python3 "$METADATA_PY" normalize-movie "$MNAME")
+                        if python3 "$METADATA_PY" has-year "$MNAME"; then
+                            break
+                        fi
+                        echo "  (movie name must end in a four-digit year — or Ctrl-C to abort)"
+                    done
+                    FEAT_PAIRS+=("$fid"$'\t'"$MNAME")
+                done
+                FEATURES_JSON=$(python3 -c 'import sys,json
+pairs=[a.split("\t",1) for a in sys.argv[1:]]
+print(json.dumps([{"title_id":int(i),"name":n} for i,n in pairs]))' "${FEAT_PAIRS[@]}")
+                TYPE="double-feature"
+                ROOT="$MOVIE_BASE"   # base dir; each feature gets its own subfolder
+                echo
+                echo "Double feature → ${#FEAT_PAIRS[@]} movies under $ROOT/"
+            fi
+        fi
         ;;
     *)
-        echo "burndvd: unknown type '$TYPE' (expected 'movie' or 'tv-season')." >&2
+        echo "burndvd: unknown type '$TYPE' (expected 'movie', 'tv', or 'tv-season')." >&2
         exit 1
         ;;
 esac
 
 QUEUE=$(mktemp -t burndvd-queue.XXXX.csv)
-{
-    echo "title,type,season,episode_start,discs,target_root,format,notes"
-    # CSV-quote everything that can contain commas/spaces.
-    python3 -c '
-import csv, sys
-w = csv.writer(sys.stdout, quoting=csv.QUOTE_MINIMAL)
-w.writerow([sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], "1",
-            sys.argv[5], sys.argv[6], sys.argv[7]])
-' "$TITLE" "$TYPE" "$SEASON" "$EP_START" "$ROOT" "$FORMAT" "auto-built from $VOLUME"
-} > "$QUEUE"
+python3 "$METADATA_PY" write-queue \
+    --output "$QUEUE" \
+    --title "$TITLE" \
+    --type "$TYPE" \
+    --season "$SEASON" \
+    --episode-start "$EP_START" \
+    --target-root "$ROOT" \
+    --format "$FORMAT" \
+    --notes "auto-built from $VOLUME" \
+    --features "$FEATURES_JSON"
+
+# Parse and validate the exact on-disk queue before unmounting anything or
+# spawning the detached rip. This is a CPU-only dry run: --validate-queue exits
+# before drive discovery, MakeMKV checks, or state creation.
+python3 "$RIPQUEUE_PY" --validate-queue "$QUEUE" >/dev/null
 
 VOLUME_SLUG=$(printf '%s' "$VOLUME" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')
 LOG="$LOG_DIR/burndvd-${VOLUME_SLUG:-disc}-$(date +%Y%m%dT%H%M%S).log"
@@ -337,8 +609,52 @@ kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 trap - INT TERM
 
-if [ -x "$HOME/.local/bin/ejectdisc" ]; then
-    echo
-    echo "Rip complete. Ejecting disc."
-    "$HOME/.local/bin/ejectdisc" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+# Surface ripqueue's actual exit status. Without this, a failed rip looks
+# identical to a successful one from the wrapper's POV (just "pgrep returned
+# no results"), so across a 500-disc queue failures would silently swap discs
+# without the user knowing. ripqueue writes the sentinel in its top-level
+# finally block so any exit path (success, sys.exit, KeyboardInterrupt,
+# unexpected exception) lands here.
+RIP_EXIT_CODE=0
+RIP_EXIT_REASON="unknown"
+if [ -f "${STATE}.exit" ]; then
+    RIP_EXIT_CODE=$(python3 -c "import json,sys
+try: d=json.load(open(sys.argv[1])); print(d.get('exit_code', 1))
+except Exception: print(1)" "${STATE}.exit" 2>/dev/null || echo 1)
+    RIP_EXIT_REASON=$(python3 -c "import json,sys
+try: d=json.load(open(sys.argv[1])); print(d.get('reason', 'unknown'))
+except Exception: print('unknown')" "${STATE}.exit" 2>/dev/null || echo unknown)
+fi
+
+case "$RIP_EXIT_CODE" in
+    0)
+        echo
+        echo "✓ Rip complete (exit 0)."
+        append_rip_summary "$VOLUME" "SUCCESS" "$RIP_EXIT_CODE" \
+            "$RIP_EXIT_REASON" "$LOG"
+        ;;
+    130)
+        echo
+        echo "Rip interrupted (Ctrl-C). State on disk is current at $STATE."
+        append_rip_summary "$VOLUME" "INTERRUPT" "$RIP_EXIT_CODE" \
+            "$RIP_EXIT_REASON" "$LOG"
+        ;;
+    *)
+        echo
+        echo "✗ Rip FAILED (exit $RIP_EXIT_CODE, reason: $RIP_EXIT_REASON)" >&2
+        echo "  Log: $LOG" >&2
+        echo "  NOT ejecting — leaving disc in drive so you can decide." >&2
+        append_rip_summary "$VOLUME" "FAILED" "$RIP_EXIT_CODE" \
+            "$RIP_EXIT_REASON" "$LOG"
+        slack_post_failure ":x: *Rip FAILED* — \`$VOLUME\` (exit $RIP_EXIT_CODE, $RIP_EXIT_REASON). Disc left in drive. Log: \`$(basename "$LOG")\`"
+        ;;
+esac
+
+# Only eject on success or interrupt; on failure leave the disc so the user
+# can inspect / retry without losing physical state.
+if [ -x "$HOME/.local/bin/ejectdisc" ] && [ "$RIP_EXIT_CODE" != "1" ] && [ "$RIP_EXIT_CODE" -lt 2 ]; then
+    if [ "$RIP_EXIT_CODE" = "0" ]; then
+        echo "Ejecting disc."
+        "$HOME/.local/bin/ejectdisc" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+    fi
 fi
