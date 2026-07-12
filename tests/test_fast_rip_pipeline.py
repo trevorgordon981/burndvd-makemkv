@@ -423,14 +423,14 @@ def test_parallel_rip_keeps_110gb_reservation():
 def test_detached_retry_policy_has_one_second_chance_then_fails_closed():
     assert ripqueue.MAX_NONINTERACTIVE_RETRIES == 1
     assert ripqueue.noninteractive_failure_action("retry", 0) == "retry"
-    assert ripqueue.noninteractive_failure_action("retry", 1) == "skip"
+    assert ripqueue.noninteractive_failure_action("retry", 1) == "abort"
     assert ripqueue.noninteractive_failure_action("skip", 0) == "skip"
     assert ripqueue.noninteractive_failure_action("abort", 0) == "abort"
 
 
 def test_repeated_same_byte_stall_bypasses_remaining_retry():
     assert ripqueue.noninteractive_failure_action(
-        "retry", 0, repeated_same_byte_stall=True) == "skip"
+        "retry", 0, repeated_same_byte_stall=True) == "abort"
 
 
 def test_burndvd_enables_bounded_retry_for_detached_rips():

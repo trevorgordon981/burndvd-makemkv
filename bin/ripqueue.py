@@ -65,10 +65,14 @@ def noninteractive_failure_action(on_fail: str, retries_used: int,
     """
     if on_fail == "abort":
         return "abort"
-    if repeated_same_byte_stall:
-        return "skip"
-    if on_fail == "retry" and retries_used < MAX_NONINTERACTIVE_RETRIES:
-        return "retry"
+    if on_fail == "retry":
+        if repeated_same_byte_stall:
+            return "abort"
+        if retries_used < MAX_NONINTERACTIVE_RETRIES:
+            return "retry"
+        # `retry` means one recovery attempt and then a real non-zero failure.
+        # Returning skip here used to turn a failed disc into a green exit 0.
+        return "abort"
     return "skip"
 
 def csv_int(row: dict, key: str, default: int) -> int:
@@ -2716,14 +2720,24 @@ def main():
                 ans = input("[r]etry / [s]kip? ").strip().lower()
 
             if same_byte_count >= 2:
-                ans = "skip"
+                if not (args.non_interactive and args.on_fail == "retry"):
+                    ans = "skip"
+                disposition = ("stopping" if ans == "abort" else "skipping")
                 print(f"{C.YLW}Same-byte stall at total={byte} hit "
-                      f"{same_byte_count}x; skipping disc as bad-sector.{C.R}")
-                append_log(args, f"SKIP  {item.title} disc{disc_n}  "
+                      f"{same_byte_count}x; {disposition} as bad-sector.{C.R}")
+                append_log(args, f"BAD_SECTOR  {item.title} disc{disc_n}  "
                                  f"repeated stall at PRGV total={byte}")
-            elif args.non_interactive:
+
+            if args.non_interactive:
                 if ans == "abort":
-                    print(f"{C.RED}--on-fail=abort; exiting non-zero.{C.R}")
+                    if args.on_fail == "retry":
+                        print(f"{C.RED}Automatic retry exhausted; exiting "
+                              f"non-zero and leaving the disc in place.{C.R}")
+                        append_log(args, f"RETRY_EXHAUSTED {item.title} "
+                                         f"disc{disc_n} after "
+                                         f"{retries_used} retry")
+                    else:
+                        print(f"{C.RED}--on-fail=abort; exiting non-zero.{C.R}")
                     save_state(state, args.state)
                     sys.exit(2)
                 if ans == "retry":
@@ -2737,15 +2751,8 @@ def main():
                     save_state(state, args.state)
                     time.sleep(NONINTERACTIVE_RETRY_DELAY_S)
                 else:
-                    if args.on_fail == "retry" and retries_used:
-                        print(f"[r]etry / [s]kip? s  {C.D}(automatic retry "
-                              f"limit reached; failing closed){C.R}")
-                        append_log(args, f"RETRY_EXHAUSTED {item.title} "
-                                         f"disc{disc_n} after "
-                                         f"{retries_used} retry")
-                    else:
-                        print(f"[r]etry / [s]kip? s  "
-                              f"{C.D}(--on-fail={args.on_fail}){C.R}")
+                    print(f"[r]etry / [s]kip? s  "
+                          f"{C.D}(--on-fail={args.on_fail}){C.R}")
 
             if ans.startswith("s"):
                 state["current_index"] += 1; state["disc_index_in_item"] = 0
