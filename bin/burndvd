@@ -578,7 +578,7 @@ echo
 # - </dev/null + redirects: detach from this shell's stdio
 nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
     caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
-    --device "disc:$DISC_INDEX" --non-interactive --on-fail=skip \
+    --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry \
     </dev/null >/dev/null 2>&1 &
 RIP_LAUNCHER=$!
 disown

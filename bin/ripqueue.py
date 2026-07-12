@@ -28,6 +28,12 @@ LOCAL_STAGING_BASE = Path.home() / ".cache" / "burndvd" / "staging"
 STAGING_GROWTH_FACTOR = 1.05
 STAGING_HEADROOM_GB = 8.0
 PARALLEL_RIP_RESERVE_GB = 110.0
+# Detached `burndvd` sessions get one automatic second attempt.  More than
+# that turns a marginal/bad sector into hours of unattended rereading, while
+# zero retries throws away the useful cases where a drive recovers after a
+# short settle.  Interactive users can still explicitly choose another retry.
+MAX_NONINTERACTIVE_RETRIES = 1
+NONINTERACTIVE_RETRY_DELAY_S = 5
 
 # -------- presentation --------
 class C:
@@ -47,6 +53,23 @@ def render_bar(frac: float, width: int = 30) -> str:
 def sanitize(s: str) -> str:
     s = re.sub(r"[\\/:\*\?\"<>\|]", "", s)
     return re.sub(r"\s+", " ", s).strip()
+
+
+def noninteractive_failure_action(on_fail: str, retries_used: int,
+                                  repeated_same_byte_stall: bool = False) -> str:
+    """Return abort/retry/skip for a detached rip failure.
+
+    `retries_used` counts completed automatic retries, not the initial attempt.
+    The helper is deliberately pure so the bounded behavior can be tested
+    without an optical drive.
+    """
+    if on_fail == "abort":
+        return "abort"
+    if repeated_same_byte_stall:
+        return "skip"
+    if on_fail == "retry" and retries_used < MAX_NONINTERACTIVE_RETRIES:
+        return "retry"
+    return "skip"
 
 def csv_int(row: dict, key: str, default: int) -> int:
     raw = (row.get(key) or "").strip()
@@ -2431,7 +2454,7 @@ def main():
     ap.add_argument("--on-fail", choices=["skip", "retry", "abort"],
                     default="skip",
                     help="non-interactive disposition for FAIL. "
-                         "retry attempts up to 2 times before giving up; "
+                         "retry makes one additional attempt (two total); "
                          "abort exits non-zero.")
     args = ap.parse_args()
 
@@ -2668,10 +2691,14 @@ def main():
             beep(args, ok=False)
 
             # Force-skip after the same byte stalls twice in a row: that's
-            # a bad sector / bad disc, not something a retry will fix.
+            # a bad sector / bad disc, not something a retry will fix.  All
+            # other detached retries are bounded as well; the old help text
+            # claimed a limit but `--on-fail=retry` actually looped forever.
             byte = stall_byte(result)
             recent = state.setdefault("recent_stall_bytes", {})
             key = f"{item.title}||disc{disc_n}"
+            retry_counts = state.setdefault("failure_retry_counts", {})
+            retries_used = int(retry_counts.get(key, 0))
             prior = recent.get(key)
             same_byte_count = (prior["count"] + 1
                                if byte is not None and prior
@@ -2680,26 +2707,50 @@ def main():
             if byte is not None:
                 recent[key] = {"byte": byte, "count": same_byte_count}
 
+            if args.non_interactive:
+                ans = noninteractive_failure_action(
+                    args.on_fail, retries_used,
+                    repeated_same_byte_stall=(same_byte_count >= 2),
+                )
+            else:
+                ans = input("[r]etry / [s]kip? ").strip().lower()
+
             if same_byte_count >= 2:
+                ans = "skip"
                 print(f"{C.YLW}Same-byte stall at total={byte} hit "
                       f"{same_byte_count}x; skipping disc as bad-sector.{C.R}")
                 append_log(args, f"SKIP  {item.title} disc{disc_n}  "
                                  f"repeated stall at PRGV total={byte}")
-                ans = "s"
             elif args.non_interactive:
-                if args.on_fail == "abort":
+                if ans == "abort":
                     print(f"{C.RED}--on-fail=abort; exiting non-zero.{C.R}")
                     save_state(state, args.state)
                     sys.exit(2)
-                ans = "r" if args.on_fail == "retry" else "s"
-                print(f"[r]etry / [s]kip? {ans}  "
-                      f"{C.D}(--on-fail={args.on_fail}){C.R}")
-            else:
-                ans = input("[r]etry / [s]kip? ").strip().lower()
+                if ans == "retry":
+                    retry_counts[key] = retries_used + 1
+                    print(f"[r]etry / [s]kip? r  {C.D}(automatic retry "
+                          f"{retries_used + 1}/{MAX_NONINTERACTIVE_RETRIES}; "
+                          f"settling drive {NONINTERACTIVE_RETRY_DELAY_S}s){C.R}")
+                    append_log(args, f"RETRY {item.title} disc{disc_n}  "
+                                     f"automatic {retries_used + 1}/"
+                                     f"{MAX_NONINTERACTIVE_RETRIES}")
+                    save_state(state, args.state)
+                    time.sleep(NONINTERACTIVE_RETRY_DELAY_S)
+                else:
+                    if args.on_fail == "retry" and retries_used:
+                        print(f"[r]etry / [s]kip? s  {C.D}(automatic retry "
+                              f"limit reached; failing closed){C.R}")
+                        append_log(args, f"RETRY_EXHAUSTED {item.title} "
+                                         f"disc{disc_n} after "
+                                         f"{retries_used} retry")
+                    else:
+                        print(f"[r]etry / [s]kip? s  "
+                              f"{C.D}(--on-fail={args.on_fail}){C.R}")
 
             if ans.startswith("s"):
                 state["current_index"] += 1; state["disc_index_in_item"] = 0
                 recent.pop(key, None)
+                retry_counts.pop(key, None)
             save_state(state, args.state); continue
 
         log_final_durations(args, item, disc_n, result["files"])
@@ -2717,6 +2768,8 @@ def main():
             "ts": time.time(),
         })
         state.get("recent_stall_bytes", {}).pop(f"{item.title}||disc{disc_n}", None)
+        state.get("failure_retry_counts", {}).pop(
+            f"{item.title}||disc{disc_n}", None)
         state["rip_durations_s"].append(result["elapsed_s"])
         state["rip_durations_s"] = state["rip_durations_s"][-30:]
         if disc_n >= item.discs:
