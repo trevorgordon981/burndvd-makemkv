@@ -75,10 +75,83 @@ prompt_value() {
     printf -v "$target_name" '%s' "$value"
 }
 
+# Multi-part movie discs normalize to the same canonical title, but their
+# physical labels retain PT/PART 1, 2, etc. They are not double features.
+# Probing them here and immediately reopening the BU40N in ripqueue can yield
+# MakeMKV MSG:5010, so these labels must take the single-probe path.
+movie_volume_is_multipart() {
+    local upper_label
+    upper_label=$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')
+    [[ "$upper_label" =~ (^|[^[:alnum:]])(PT|PART)[._[:space:]-]*[0-9]{1,2}($|[^[:digit:]]) ]]
+}
+
+append_ripqueue_mode_arg_once() {
+    local wanted="$1" existing
+    for existing in ${RIPQUEUE_MODE_ARGS[@]+"${RIPQUEUE_MODE_ARGS[@]}"}; do
+        [ "$existing" = "$wanted" ] && return 0
+    done
+    RIPQUEUE_MODE_ARGS+=("$wanted")
+}
+
+# Pick the safe output mode for a TV disc after its authoritative episode
+# contract is known.  Existing slots are not a reason to refuse the optical
+# read: they mean the new payload must be isolated as review evidence instead
+# of being published as SxxExx files.  Inventory outside the season contract
+# is still a hard stop because it signals a numbering repair is required.
+select_tv_output_mode_for_range() {
+    local season_dir="$1" title="$2" season="$3"
+    local first_ep="$4" last_ep="$5" expected_episodes="$6"
+    local contract_recognized="${7:-0}"
+    local existing_ep overlap_ep=""
+
+    [ "$TV_OUTPUT_MODE" = "normal" ] || return 0
+    [ -d "$season_dir" ] || return 0
+
+    for existing_ep in $(find "$season_dir" -maxdepth 1 -type f -size +0 \
+        -name "${title} - S$(printf '%02d' "$season")E*.mkv" -print \
+        | sed -nE 's/.*E([0-9]+)\.mkv$/\1/p'); do
+        existing_ep=$((10#$existing_ep))
+        if [ "$existing_ep" -gt "$expected_episodes" ]; then
+            echo "burndvd: season has E$existing_ep beyond authoritative total $expected_episodes; repair first." >&2
+            return 65
+        fi
+        if [ "$existing_ep" -ge "$first_ep" ] && [ "$existing_ep" -le "$last_ep" ]; then
+            [ -n "$overlap_ep" ] || overlap_ep="$existing_ep"
+        fi
+    done
+
+    if [ -n "$overlap_ep" ]; then
+        if [ "$contract_recognized" != "1" ]; then
+            echo "burndvd: authoritative slot E$overlap_ep already exists, but this disc has no verified metadata contract." >&2
+            echo "         Refusing automatic review; use --rerip-review only after checking the manual contract." >&2
+            return 65
+        fi
+        TV_OUTPUT_MODE="review"
+        # This is an automatic decision, not the user's explicit review
+        # override.  Keep that provenance through the backend so it rechecks
+        # the season inventory and the built-in metadata contract under lock.
+        append_ripqueue_mode_arg_once "--auto-rerip-review"
+        echo "Existing authoritative slot E$overlap_ep detected."
+        echo "Mode: protected review capture (published SxxExx files remain unchanged)."
+    fi
+}
+
 # Tests source this file in library-only mode so prompt behavior can be proven
 # without running orphan cleanup or issuing a single optical-drive command.
 if [ "${BURNDVD_LIBRARY_ONLY:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
+fi
+
+# A normal run publishes a previously-unoccupied physical-disc range.  If its
+# authoritative slots are already occupied, smart single-disc mode switches
+# to protected review output automatically.  The explicit flag remains
+# available for callers that want to force review output up front.
+TV_OUTPUT_MODE="normal"
+RIPQUEUE_MODE_ARGS=()
+if [ "${1:-}" = "--rerip-review" ]; then
+    TV_OUTPUT_MODE="review"
+    append_ripqueue_mode_arg_once "--rerip-review"
+    shift
 fi
 
 mkdir -p "$LOG_DIR"
@@ -102,7 +175,7 @@ sweep_burndvd_orphans() {
         | grep -E "burndvd-state" || true)
     for state in $states; do
         # Skip if any python ripqueue.py is still serving this state.
-        pgrep -f "python.*ripqueue.py.*$state" >/dev/null 2>&1 && continue
+        pgrep -if "python.*ripqueue.py.*$state" >/dev/null 2>&1 && continue
         # Orphan: kill every remaining process that references this state,
         # and clean up the exit-sentinel sibling file (written by ripqueue's
         # top-level finally block — accumulates 1 per rip over a 500-disc
@@ -131,7 +204,7 @@ sweep_burndvd_orphans() {
             [ -d "$claim" ] || continue
             claim_state=$(cat "$claim/state" 2>/dev/null || true)
             if [ -n "$claim_state" ]; then
-                pgrep -f "python.*ripqueue.py.*$claim_state" >/dev/null 2>&1 \
+                pgrep -if "python.*ripqueue.py.*$claim_state" >/dev/null 2>&1 \
                     && continue
             else
                 # No state recorded; treat as orphan only if old (>5 min)
@@ -145,20 +218,22 @@ sweep_burndvd_orphans() {
 }
 sweep_burndvd_orphans
 
-SLACK_CHANNEL_FAIL="C0ADXES92LE"  # #deploy-notifications
+# Optional failure notifications. Public installs remain silent unless the
+# operator explicitly provides a destination channel.
+SLACK_CHANNEL_FAIL="${BURNDVD_SLACK_CHANNEL:-}"
 RIP_SUMMARY_LOG="$HOME/logs/rip-summary.log"
 
-# Post one-line failure alert to Slack. Used after the rip's exit sentinel
-# shows a non-success / non-Ctrl-C exit. Without this, failed rips only
-# surface as a stderr print on the wrapper terminal, which is invisible
-# if the user wasn't watching (across 500 rips that's 10-25 silent
-# failures). Reuses the Hermes bot token from ~/.hermes/.env (same source
-# as the tailnet watcher + mlx-vlm-healthcheck + rip-progress poster).
+# Optionally post one-line failure alerts to Slack. Both the destination and
+# token are opt-in for public installs; an optional env file can supply
+# SLACK_BOT_TOKEN without putting it on the command line.
 slack_post_failure() {
     local text="$1"
-    local token
-    token=$(grep '^SLACK_BOT_TOKEN=' "$HOME/.hermes/.env" 2>/dev/null \
-        | cut -d= -f2- | tr -d '"' | tr -d "'")
+    local token="${BURNDVD_SLACK_BOT_TOKEN:-${SLACK_BOT_TOKEN:-}}"
+    [ -n "$SLACK_CHANNEL_FAIL" ] || return 0
+    if [ -z "$token" ] && [ -n "${BURNDVD_SLACK_ENV:-}" ]; then
+        token=$(grep '^SLACK_BOT_TOKEN=' "$BURNDVD_SLACK_ENV" 2>/dev/null \
+            | cut -d= -f2- | tr -d '"' | tr -d "'")
+    fi
     [ -n "$token" ] || return 0
     /usr/bin/curl -sS -m 10 -X POST https://slack.com/api/chat.postMessage \
         -H "Authorization: Bearer $token" \
@@ -200,7 +275,7 @@ append_rip_summary() {
 warn_concurrent_rip() {
     local title="$1" season="$2"
     local pid state_file
-    for pid in $(pgrep -f "python.*ripqueue.py" 2>/dev/null || true); do
+    for pid in $(pgrep -if "python.*ripqueue.py" 2>/dev/null || true); do
         [ "$pid" = "$$" ] && continue
         state_file=$(ps -o args= -p "$pid" 2>/dev/null \
             | grep -oE -- "--state [^ ]+" | awk '{print $2}' | tr -d "'\"")
@@ -220,9 +295,8 @@ sys.exit(1)
 PY
         then
             echo "  Note: another burndvd is ripping $title S$season (pid $pid)."
-            echo "  The Episode-start default below may be stale (the NAS scan can't"
-            echo "  see files still in transfer). ripqueue will re-check at actual rip"
-            echo "  time and pick the right number — just accept the default."
+            echo "  The physical-disc contract remains authoritative; ripqueue will"
+            echo "  serialize and isolate an occupied episode range as review output."
             return 0
         fi
     done
@@ -244,7 +318,8 @@ fi
 # Pass-through when caller provides their own queue.
 for arg in "$@"; do
     if [ "$arg" = "--queue" ]; then
-        exec caffeinate -dimsu "$RIPQUEUE_PY" "$@"
+        exec caffeinate -dimsu "$RIPQUEUE_PY" \
+            ${RIPQUEUE_MODE_ARGS[@]+"${RIPQUEUE_MODE_ARGS[@]}"} "$@"
     fi
 done
 
@@ -432,6 +507,11 @@ FORMAT=$(printf '%s' "$FORMAT" | tr '[:lower:]' '[:upper:]')
 
 SEASON=""
 EP_START=""
+EXPECTED_EPISODES=""
+EXPECTED_DISC_EPISODES=""
+EXPECTED_TITLE_IDS=""
+EXPECTED_PHYSICAL_DISC=""
+CONTRACT_RECOGNIZED=0
 FEATURES_JSON=""   # populated only when the user confirms a double feature
 case "$TYPE" in
     tv-season)
@@ -444,26 +524,57 @@ case "$TYPE" in
             BD|DVD) ROOT="/Volumes/Media/TV Shows/$TITLE" ;;
             *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
         esac
-        # Auto-suggest next episode: scan the season dir for the highest existing
-        # SxxEyy.mkv and default to that+1. Press Enter to accept; type a number
-        # to override. Falls back to 1 if the dir is empty/missing.
+        # Episode identity comes from the physical-disc contract, never from
+        # highest-existing+1 (which turns an accidental re-rip into E11+).
         warn_concurrent_rip "$TITLE" "$SEASON"
         SEASON_DIR="$ROOT/Season $(printf '%02d' "$SEASON")"
-        DEFAULT_EP=1
-        if [ -d "$SEASON_DIR" ]; then
-            # Pipeline can produce no matches when the dir is empty or has no
-            # SxxEyy.mkv files. Under `set -euo pipefail` an empty-grep midway
-            # kills the whole script before the episode prompt. `|| true`
-            # downgrades the failure; empty HIGHEST_EP just leaves DEFAULT_EP=1.
-            HIGHEST_EP=$( (ls "$SEASON_DIR" 2>/dev/null \
-                | grep -oE "S0*${SEASON}E[0-9]+" \
-                | grep -oE 'E[0-9]+' | tr -d 'E' \
-                | sort -n | tail -1) || true )
-            if [ -n "$HIGHEST_EP" ]; then
-                DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
-            fi
+        CONTRACT_JSON=$(python3 "$METADATA_PY" episode-contract \
+            --title "$TITLE" --season "$SEASON" --volume "$VOLUME" 2>/dev/null || true)
+        if [ -n "$CONTRACT_JSON" ]; then
+            CONTRACT_RECOGNIZED=1
+            read -r DEFAULT_EP EXPECTED_DISC_EPISODES EXPECTED_EPISODES CONTRACT_DISC EXPECTED_TITLE_IDS \
+                < <(printf '%s' "$CONTRACT_JSON" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(d["episode_start"], d["expected_disc_episodes"], d["expected_episodes"], d["disc"], json.dumps(d["expected_title_ids"],separators=(",",":")))')
+            END_EP=$((DEFAULT_EP + EXPECTED_DISC_EPISODES - 1))
+            EXPECTED_PHYSICAL_DISC="$CONTRACT_DISC"
+            echo "Episode contract: disc $CONTRACT_DISC -> S$(printf '%02d' "$SEASON")E$(printf '%02d' "$DEFAULT_EP")-E$(printf '%02d' "$END_EP") (${EXPECTED_EPISODES} total)."
+        else
+            echo "burndvd: no verified episode contract for '$TITLE' S$SEASON / '$VOLUME'." >&2
+            prompt_value EXPECTED_EPISODES "Expected total season episodes: " "" 1
+            prompt_value DEFAULT_EP "First episode on this physical disc: " "" 1
+            prompt_value EXPECTED_DISC_EPISODES "Episodes on this physical disc: " "" 1
+            prompt_value EXPECTED_TITLE_IDS "Episode title IDs as JSON (example [1,2,3]): " "" 1
+            prompt_value EXPECTED_PHYSICAL_DISC "Physical disc number: " "" 1
         fi
+        for numeric in "$EXPECTED_EPISODES" "$DEFAULT_EP" "$EXPECTED_DISC_EPISODES" "$EXPECTED_PHYSICAL_DISC"; do
+            [[ "$numeric" =~ ^[0-9]+$ ]] && [ "$numeric" -gt 0 ] || {
+                echo "burndvd: episode contract values must be positive integers." >&2
+                exit 64
+            }
+        done
+        END_EP=$((DEFAULT_EP + EXPECTED_DISC_EPISODES - 1))
+        if [ "$END_EP" -gt "$EXPECTED_EPISODES" ]; then
+            echo "burndvd: disc range E$DEFAULT_EP-E$END_EP exceeds season total $EXPECTED_EPISODES." >&2
+            exit 64
+        fi
+
+        select_tv_output_mode_for_range \
+            "$SEASON_DIR" "$TITLE" "$SEASON" \
+            "$DEFAULT_EP" "$END_EP" "$EXPECTED_EPISODES" \
+            "$CONTRACT_RECOGNIZED" || exit $?
+        if [ "$CONTRACT_RECOGNIZED" = "1" ]; then
+            # The wrapper's scan is advisory.  The backend rechecks under the
+            # season lock and safely switches to review if a slot appears
+            # between this scan and the optical read.
+            append_ripqueue_mode_arg_once "--auto-rerip-review"
+        fi
+
         prompt_value EP_START "Episode start [$DEFAULT_EP]: " "$DEFAULT_EP" 1
+        if [ "$EP_START" != "$DEFAULT_EP" ]; then
+            echo "burndvd: episode start is contract-bound to $DEFAULT_EP; refusing $EP_START." >&2
+            exit 65
+        fi
         ;;
     movie)
         case "$FORMAT" in
@@ -472,6 +583,11 @@ case "$TYPE" in
             *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
         esac
 
+        if movie_volume_is_multipart "$VOLUME"; then
+            echo
+            echo "Multipart movie label detected; skipping the double-feature pre-scan."
+            echo "The rip will keep its PT/PART suffix and open the drive only once."
+        else
         # Double-feature detection: probe the disc's title table and, if it
         # carries two or more feature-length titles, offer to rip them as
         # separate movies. The scan also primes MakeMKV (and unmounts an
@@ -521,6 +637,7 @@ print(json.dumps([{"title_id":int(i),"name":n} for i,n in pairs]))' "${FEAT_PAIR
                 echo "Double feature → ${#FEAT_PAIRS[@]} movies under $ROOT/"
             fi
         fi
+        fi
         ;;
     *)
         echo "burndvd: unknown type '$TYPE' (expected 'movie', 'tv', or 'tv-season')." >&2
@@ -535,6 +652,10 @@ python3 "$METADATA_PY" write-queue \
     --type "$TYPE" \
     --season "$SEASON" \
     --episode-start "$EP_START" \
+    --expected-episodes "$EXPECTED_EPISODES" \
+    --expected-disc-episodes "$EXPECTED_DISC_EPISODES" \
+    --expected-title-ids "$EXPECTED_TITLE_IDS" \
+    --expected-physical-disc "$EXPECTED_PHYSICAL_DISC" \
     --target-root "$ROOT" \
     --format "$FORMAT" \
     --notes "auto-built from $VOLUME" \
@@ -578,7 +699,8 @@ echo
 # - </dev/null + redirects: detach from this shell's stdio
 nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
     caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
-    --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry \
+    --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry --verify \
+    ${RIPQUEUE_MODE_ARGS[@]+"${RIPQUEUE_MODE_ARGS[@]}"} \
     </dev/null >/dev/null 2>&1 &
 RIP_LAUNCHER=$!
 disown
@@ -623,8 +745,34 @@ tail -f "$LOG" &
 TAIL_PID=$!
 trap 'kill "$TAIL_PID" 2>/dev/null; exit 130' INT TERM
 
-while pgrep -f "python.*ripqueue.py.*$STATE" >/dev/null 2>&1; do
-    sleep 10
+# The detached launcher can need several seconds to materialize the Python
+# process. Polling pgrep only once created a startup race: the wrapper decided
+# an as-yet-unstarted rip was a green exit, ejected the disc, and the real child
+# then failed. Wait for either the exact-state process or its exit sentinel.
+RIPQUEUE_SEEN=0
+LAUNCH_WAIT_S=0
+while [ "$LAUNCH_WAIT_S" -lt 30 ]; do
+    if pgrep -if "python.*ripqueue.py.*$STATE" >/dev/null 2>&1; then
+        RIPQUEUE_SEEN=1
+        break
+    fi
+    [ -f "${STATE}.exit" ] && break
+    sleep 1
+    LAUNCH_WAIT_S=$((LAUNCH_WAIT_S + 1))
+done
+
+if [ "$RIPQUEUE_SEEN" = "1" ]; then
+    while pgrep -if "python.*ripqueue.py.*$STATE" >/dev/null 2>&1; do
+        sleep 10
+    done
+fi
+
+# The process can disappear a fraction before its finally block's sentinel is
+# visible. Give that evidence a bounded grace period; absence stays failure.
+EXIT_WAIT_S=0
+while [ ! -f "${STATE}.exit" ] && [ "$EXIT_WAIT_S" -lt 10 ]; do
+    sleep 1
+    EXIT_WAIT_S=$((EXIT_WAIT_S + 1))
 done
 
 # Brief grace so the "Queue complete." line lands in the tail before we kill it.
@@ -639,7 +787,7 @@ trap - INT TERM
 # without the user knowing. ripqueue writes the sentinel in its top-level
 # finally block so any exit path (success, sys.exit, KeyboardInterrupt,
 # unexpected exception) lands here.
-RIP_EXIT_CODE=0
+RIP_EXIT_CODE=1
 RIP_EXIT_REASON="unknown"
 if [ -f "${STATE}.exit" ]; then
     RIP_EXIT_CODE=$(python3 -c "import json,sys

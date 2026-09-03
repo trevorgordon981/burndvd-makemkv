@@ -1,154 +1,235 @@
 # burndvd-makemkv
 
 Smart-defaults wrapper around MakeMKV for ripping discs to a Plex/Jellyfin
-library on macOS. One command per disc, Enter through the prompts, walks
-away while it rips. Multi-disc CSV mode for batch jobs.
+library on macOS. Run one command per disc, accept the detected metadata, and
+let the detached worker rip, verify, publish, and eject.
 
-```
+```text
 $ burndvd
 Detected disc:
-  device:  /dev/disk6
-  volume:  PARKS_AND_RECREATION_S6_D3
-  size:    ~23 GiB
+  device:  /dev/disk4
+  volume:  GAMEOFTHRONES_S4_DISC4
+  size:    ~45 GiB
   format:  BD (auto)
 
-Title (include year): [Parks And Recreation]
+Title (include year): [Game of Thrones]
 Type [tv-season]:
 Format [BD]:
-Season number [6]:
-Episode start [18]:                  # auto-detected from existing files
-
-Queue: /var/folders/.../burndvd-queue.XXXX.csv
-Target: /Volumes/Media/TV Shows/Parks and Recreation
-Log:    ~/logs/burndvd-parks-and-recreation-s6-d3-20260525T164353.log
-
-Rip launched detached (pid 56857). Tailing log;
-When the rip finishes, the disc auto-ejects and the tail exits.
+Season number [4]:
+Episode contract: disc 4 -> S04E09-E10 (10 total).
 ```
 
-## What it does
+## Safety model
 
-- **Auto-detect** the inserted disc, drive, format (DVD/BD/4K), and best-guess
-  title/season/disc-number from the volume label.
-- **Canonical movie folders**: movie titles must end in `(YYYY)`. Known compact
-  Fast-franchise labels such as `2F2F` and `FFTokyoDriftUHDPK75` expand to their
-  official title, punctuation, and release year.
-- **Auto-next-episode** prompt: scans the season folder, defaults to
-  highest-existing + 1. Press Enter to accept.
-- **Plex/Jellyfin naming**: writes `Title - SxxEyy.mkv` under
-  `/Volumes/Media/TV Shows/...` (configurable per format).
-- **Detached rip**: closes terminal-safe. Ripping continues after Ctrl-C or
-  shell exit; reattach with `tail -f <log>`.
-- **Local staging**: in-flight files land on the local disk, then atomic-move
-  to the library. Avoids fragmentation and scanner races over SMB.
-- **Multi-drive aware**: if more than one optical drive is connected, picks
-  the first one with media that isn't already being ripped.
-- **Auto-eject** when the queue completes (uses `ejectdisc`).
-- **Optional**: post-rip subtitle OCR (`subocr`) turns HDMV PGS bitmap subs
-  into `.srt` sidecars so web Jellyfin clients can render them.
+TV publication is contract-driven. It does not infer the next episode by
+scanning for the highest existing filename.
+
+- A TV queue row binds the show, season, physical-disc number, season total,
+  episode range, and MakeMKV title IDs.
+- The backend rechecks the observed disc label and content fingerprint before
+  reading or publishing it.
+- A recognized physical disc whose contracted slots are vacant publishes to
+  `SxxEyy`. If those slots are already occupied, plain `burndvd` automatically
+  captures the disc to a fingerprint-scoped review directory outside the
+  Jellyfin library. Existing episodes are never replaced.
+- An unrecognized/manual contract does not get that automatic privilege. If
+  its slots are occupied, it fails closed; use explicit `--rerip-review` only
+  after checking the contract.
+- Inventory beyond the authoritative season total is always a hard stop.
+- `--overwrite` is forbidden for TV in normal and review modes. It remains
+  available for movies.
+
+Review captures use traceable title names rather than `SxxEyy` names and do
+not create publication receipts. The default review root for the standard
+library is:
+
+```text
+/Volumes/Media/.repair-quarantine/burndvd-review/<Show>/Season NN/<fingerprint>/
+```
+
+Use `--review-root /absolute/out-of-library/path` for another layout. Relative
+paths, paths inside any `TV Shows`/`TV Shows 4K` tree, and symlink escapes are
+rejected. Incomplete TV salvage and transfer partials are kept outside the
+media library as well.
+
+### Atomic TV publication
+
+Completed TV files are copied to a same-filesystem quarantine path, flushed,
+then published with an atomic no-clobber operation. Hidden per-episode claims
+reserve the contracted range without creating zero-byte media files. A
+collision preserves the staged rip and the pre-existing destination.
+
+On the standard macOS layout, `/Volumes/Media` is the SMB view used by the
+library and `/private/nas/media` is the equivalent NFS view used for TV
+publication. The backend switches to NFS because that mount supports the
+same-filesystem hard-link fallback needed when SMB lacks atomic no-replace.
+If the NFS view is unavailable or unwritable, publication fails closed and
+staging is retained.
+
+Season coordination is host-local under `~/.cache/burndvd/locks`; equivalent
+SMB and NFS season paths map to the same lock key. Therefore every writer for
+a season must run through `burndvd` on the same host. This design does not
+claim multi-host locking.
+
+## Built-in TV contracts
+
+The current registry contains the audited four-disc layouts for **Game of
+Thrones seasons 1–6**, ten episodes per season. Contracts include exact title
+IDs, including non-contiguous selections where a disc contains bonus material
+(for example Season 4 Disc 1 uses titles 1 and 3).
+
+Other shows can be entered with a complete manual contract. Automatic review
+switching is reserved for registry-recognized label/title/season/disc tuples.
+
+## Verification and receipts
+
+The smart wrapper enables `--verify` by default. A successful verified normal
+publication records the disc content fingerprint and contract in:
+
+```text
+~/.local/state/burndvd/disc-receipts.jsonl
+```
+
+A later attempt to publish that same physical-disc fingerprint is refused.
+Use `--disc-receipts` to select another ledger. Corrupt or unreadable ledgers
+fail closed. Review captures never masquerade as published discs.
+
+## What else it does
+
+- Detects the inserted disc, drive, format, and best-guess title/season/disc.
+- Requires canonical movie titles ending in `(YYYY)` and normalizes known
+  compact Fast-franchise labels.
+- Uses Plex/Jellyfin movie and TV naming.
+- Rips to local staging, then transfers complete files to the NAS.
+- Runs detached so closing the terminal or pressing Ctrl-C on the log tail does
+  not kill the rip.
+- Supports multiple optical drives and refuses a drive already claimed by
+  another worker.
+- Auto-ejects after a successful queue.
+- Optionally runs `subocr` to convert PGS subtitles to `.srt` sidecars.
 
 ## Requirements
 
-- macOS (uses `drutil`, `diskutil`, `caffeinate`, Apple Vision for OCR).
-- [MakeMKV](https://www.makemkv.com/) at the default path
-  `/Applications/MakeMKV.app/Contents/MacOS/makemkvcon`, or override with
+- macOS (`drutil`, `diskutil`, and `caffeinate` are used).
+- [MakeMKV](https://www.makemkv.com/) at
+  `/Applications/MakeMKV.app/Contents/MacOS/makemkvcon`, or pass
   `--makemkvcon`.
-- Python 3.10+ (stdlib only for `ripqueue.py`; `subocr.py` needs PyObjC).
-- An optical drive. Tested against the LG BU40N (USB-C external BD/UHD).
+- Python 3.10+. `ripqueue.py` uses only the standard library; `subocr.py`
+  requires PyObjC.
+- An optical drive. The project has been exercised with the LG BU40N.
+- For the standard NAS layout, equivalent writable SMB `/Volumes/Media` and
+  NFS `/private/nas/media` mounts.
 
 ## Install
 
 ```sh
 git clone https://github.com/trevorgordon981/burndvd-makemkv.git ~/burndvd-makemkv
-ln -s ~/burndvd-makemkv/bin/burndvd    ~/.local/bin/burndvd
-ln -s ~/burndvd-makemkv/bin/ejectdisc  ~/.local/bin/ejectdisc
-ln -s ~/burndvd-makemkv/bin/subocr     ~/.local/bin/subocr   # optional
+ln -s ~/burndvd-makemkv/bin/burndvd   ~/.local/bin/burndvd
+ln -s ~/burndvd-makemkv/bin/ejectdisc ~/.local/bin/ejectdisc
+ln -s ~/burndvd-makemkv/bin/subocr    ~/.local/bin/subocr  # optional
 ```
 
-Make sure `~/.local/bin` is on your `PATH`.
+Put `~/.local/bin` on `PATH`.
 
-### Subtitle OCR (optional)
-
-`subocr` needs PyObjC (Apple Vision bindings):
+For subtitle OCR:
 
 ```sh
 python3 -m venv ~/.local/share/subocr/venv
 ~/.local/share/subocr/venv/bin/pip install pyobjc
 ```
 
-Or point `SUBOCR_VENV` at an existing venv. Per-show overrides
-(language, filters) go in `~/.config/subocr/shows.json`; see
+Per-show OCR overrides go in `~/.config/subocr/shows.json`; see
 `examples/subocr-shows.json`.
 
 ## Single-disc mode
 
-Just run `burndvd`. It detects the disc and asks 3-4 questions, each with
-a sensible default. Episode-start defaults to the next slot after whatever
-already exists in the season folder, so back-to-back disc rips don't need
-manual counting.
+Run `burndvd`. It detects the disc and prompts for metadata. Recognized TV
+labels receive a built-in immutable contract; unknown TV labels require these
+values explicitly:
 
-Prompts accept terminal or piped input. If headless stdin ends, a prompt uses
-its safe default; required values without a default fail explicitly. Unknown
-movie titles never fall through without a release year.
+- authoritative season episode count;
+- first episode on this physical disc;
+- number of episodes on the disc;
+- episode-bearing MakeMKV title IDs as JSON; and
+- physical-disc number.
+
+Prompt input may come from a terminal or a pipe. Headless EOF uses a safe
+default where one exists and fails explicitly for required values.
+
+Use `burndvd --rerip-review` to force a TV read into protected review output.
+This never publishes `SxxEyy` files.
+
+Failure notifications are optional. Set both a destination and token:
+
+```sh
+export BURNDVD_SLACK_CHANNEL='<channel-id>'
+export BURNDVD_SLACK_BOT_TOKEN='<bot-token>'
+```
+
+Alternatively, set `BURNDVD_SLACK_ENV` to an env file containing
+`SLACK_BOT_TOKEN`. With no channel configured, notification is a no-op.
 
 ## Multi-disc / queue mode
 
 Drive `ripqueue.py` directly with a CSV:
 
 ```csv
-title,type,season,episode_start,discs,target_root,format,notes
-Parks and Recreation,tv-season,6,1,3,/Volumes/Media/TV Shows/Parks and Recreation,BD,
-The Bear,tv-season,2,1,2,/Volumes/Media/TV Shows/The Bear,BD,
-Mean Streets (1973),movie,,,1,/Volumes/Media/Movies/Mean Streets (1973),BD,
+title,type,season,episode_start,expected_episodes,expected_disc_episodes,expected_title_ids,expected_physical_disc,discs,target_root,format,notes,features
+Game of Thrones,tv-season,4,3,10,3,"[1,2,3]",2,1,/Volumes/Media/TV Shows/Game of Thrones,BD,,
+Mean Streets (1973),movie,,,,,,,1,/Volumes/Media/Movies/Mean Streets (1973),BD,,
 ```
 
 ```sh
-caffeinate -dimsu ripqueue.py --queue queue.csv --state ~/ripqueue-state.json
+caffeinate -dimsu bin/ripqueue.py --queue queue.csv \
+  --state ~/.local/state/burndvd/ripqueue-state.json --verify
 ```
 
-The state file persists progress across runs, so resuming after a crash
-or a shell exit picks up where it left off. An empty state file created by
-`mktemp` is treated as a new run; malformed non-empty JSON is refused so real
-resume data is never silently overwritten.
+The state file persists queue progress. An empty state file is treated as a
+new run; malformed non-empty JSON is refused. Use the hardware-free validator
+before a run:
+
+```sh
+bin/ripqueue.py --validate-queue queue.csv
+```
 
 Useful flags:
 
-- `--overwrite` — clobber existing `.mkv` files instead of refusing.
-- `--verify` — re-check titles after the rip (slow; doubles disc time).
-- `--min-free-gb 200` — bail before a rip if the target volume is low.
-- `--device disc:1` — force a specific drive.
-- `--no-eject` / `--no-sound` — quieter operation.
-- `--validate-queue queue.csv` — CPU-only CSV/embedded-JSON validation; exits
-  before drive discovery or any MakeMKV operation.
+- `--verify` — decode-check output before recording a publication receipt.
+- `--rerip-review` — force TV output to protected review storage.
+- `--review-root PATH` — choose an absolute out-of-library review root.
+- `--disc-receipts PATH` — choose the durable fingerprint ledger.
+- `--min-free-gb 200` — refuse a rip when staging/target space is low.
+- `--device disc:1` — select a drive.
+- `--sync-move` — finish NAS publication before freeing the drive.
+- `--no-eject`, `--no-sound`, `--no-subocr` — disable optional behavior.
+- `--overwrite` — movie-only; rejected whenever a TV row is present.
 
 ## Layout
 
-```
+```text
 bin/
-  burndvd        smart single-disc wrapper (bash)
-  burndvd_metadata.py  hardware-free title inference + queue writer
-  ripqueue.py    queue worker (python, stdlib only)
-  ejectdisc      tiny drutil wrapper
-  subocr         bash wrapper around subocr.py (uses pyobjc venv)
-  subocr.py      Apple Vision OCR for PGS subs (python + pyobjc)
+  burndvd              smart single-disc wrapper
+  burndvd_metadata.py  hardware-free inference, contracts, queue writer
+  ripqueue.py          queue worker and protected publisher
+  ejectdisc            small drutil wrapper
+  subocr               subocr launcher
+  subocr.py             Apple Vision OCR for PGS subtitles
 examples/
-  subocr-shows.json   per-show config example
+  subocr-shows.json
 tests/
-  test_fast_rip_pipeline.py  prompt, metadata, CSV/JSON, state + dry-run tests
+  test_fast_rip_pipeline.py
+  test_burndvd_safety.py
 ```
 
-## Pitfalls
+## Common pitfalls
 
-- **macOS auto-mounts DVDs** at `/Volumes/<label>`, which holds the optical
-  drive exclusively and locks MakeMKV out. `burndvd` unmounts (without
-  ejecting) before launching the rip; BD/UHD discs aren't affected because
-  macOS can't mount their filesystems natively.
-- **Closing the terminal**: the rip is launched detached (`nohup` + `sleep |
-  script`), so a SIGHUP to your shell won't kill the rip. Reattach via the
-  log file printed at launch.
-- **NAS direct writes**: don't rip straight to SMB. The staging dir lives
-  under `~/.cache/burndvd/staging` and only the finished `.mkv` is moved
-  atomically into the library.
+- macOS may auto-mount DVDs and hold the optical drive. `burndvd` unmounts the
+  volume without ejecting before MakeMKV starts.
+- Do not bypass local staging or write in-progress media directly to SMB.
+- Do not run independent multi-host writers against the same season; the
+  coordination lock is intentionally host-local.
+- A failed transfer leaves staging in place. Fix the mount problem and inspect
+  the logged paths instead of deleting or retrying blindly.
 
 ## License
 

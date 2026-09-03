@@ -15,7 +15,7 @@ Companion to ~/scripts/rip-disc.sh (manual interactive ripper). This driver
 reads a pre-loaded queue.csv and auto-names per Plex/Jellyfin convention.
 """
 from __future__ import annotations
-import argparse, contextlib, csv, fcntl, json, os, queue, re, shutil, signal, subprocess, sys, threading, time
+import argparse, contextlib, csv, ctypes, errno, fcntl, hashlib, json, os, queue, re, shutil, signal, stat, subprocess, sys, threading, time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,6 +25,7 @@ DEFAULT_MAKEMKVCON = "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"
 # Local staging keeps in-flight files off NAS (forum recommendation: avoid
 # direct-to-SMB rips; fragmentation + Jellyfin scan races during rip).
 LOCAL_STAGING_BASE = Path.home() / ".cache" / "burndvd" / "staging"
+LOCAL_LOCK_BASE = Path.home() / ".cache" / "burndvd" / "locks"
 STAGING_GROWTH_FACTOR = 1.05
 STAGING_HEADROOM_GB = 8.0
 PARALLEL_RIP_RESERVE_GB = 110.0
@@ -34,6 +35,7 @@ PARALLEL_RIP_RESERVE_GB = 110.0
 # short settle.  Interactive users can still explicitly choose another retry.
 MAX_NONINTERACTIVE_RETRIES = 1
 NONINTERACTIVE_RETRY_DELAY_S = 5
+PHYSICAL_PROBE_RETRY_DELAY_S = 30
 
 # -------- presentation --------
 class C:
@@ -87,11 +89,9 @@ def move_with_progress(src: Path, dst: Path, label: str = "moving",
     multi-minute silence with no feedback. We run the move in a worker
     thread and poll dst size from the main thread.
     """
-    # season_dir_lock's claim mechanism creates 0-byte placeholder files at
-    # the chosen destination paths so parallel rips see those slots as
-    # taken. shutil.move would raise (cross-fs) or silently overwrite
-    # (same-fs) depending on the dst layout; explicitly unlink any 0-byte
-    # placeholder so semantics are uniform.
+    # Legacy movie transfers may encounter an owned zero-byte reservation.
+    # Protected TV publication never uses this mover or a final-path
+    # placeholder; it publishes via move_with_progress_noclobber instead.
     try:
         if dst.is_file() and dst.stat().st_size == 0:
             dst.unlink()
@@ -144,6 +144,236 @@ def move_with_progress(src: Path, dst: Path, label: str = "moving",
     print(f"  {C.GRN}done{C.R}  {total/1e9:.2f} GB in {fmt_dur(elapsed)}"
           f"  ({avg_mbps:.1f} MB/s avg)", flush=True)
 
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename on one filesystem, failing if destination exists."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        fn = libc.renameatx_np
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(-2, os.fsencode(source), -2, os.fsencode(destination), 0x4)
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        fn = libc.renameat2
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(-100, os.fsencode(source), -100, os.fsencode(destination), 0x1)
+    else:
+        rc = -1
+        ctypes.set_errno(errno.ENOTSUP)
+    if rc == 0:
+        return
+    native_errno = ctypes.get_errno()
+    if native_errno == errno.EEXIST:
+        raise FileExistsError(native_errno, os.strerror(native_errno), destination)
+
+    # Portable same-filesystem fallback. link() itself is no-clobber; if the
+    # filesystem cannot hard-link (notably SMB), fail closed rather than use a
+    # rename operation that could overwrite.
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError as fallback_error:
+        raise OSError(
+            native_errno,
+            f"atomic no-replace rename unsupported ({os.strerror(native_errno)}); "
+            f"hard-link fallback failed: {fallback_error}",
+            destination,
+        ) from fallback_error
+    # Publication is complete once link() succeeds.  Failure to retire the
+    # private partial must not be reported as a failed publish: the final file
+    # is already durable and the partial lives outside the media library.
+    try:
+        source.unlink()
+    except OSError:
+        pass
+
+
+def move_with_progress_noclobber(
+    src: Path, dst: Path, label: str = "moving", interval: float = 5.0, *,
+    placeholder_identity: tuple[int, int] | None = None,
+    claim_path: Path | None = None,
+    partial_root: Path | None = None,
+    lock_dir: Path | None = None,
+    publish_lock_held: bool = False,
+) -> None:
+    """Copy in quarantine, atomically publish without overwrite, retire source.
+
+    No bytes are written to a Jellyfin-visible final path.  The complete file
+    is copied to a same-filesystem quarantine path, then published with the
+    platform's atomic no-replace rename.  Episode reservations are separate
+    hidden claim files, bound by inode.  Source bytes are likewise read from a
+    pre-bound descriptor so pathname replacement cannot redirect the copy.
+    """
+
+    src, dst = Path(src), Path(dst)
+    if partial_root is None:
+        raise ValueError("protected TV move requires an out-of-library partial_root")
+    partial_root = Path(partial_root)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial_root.mkdir(parents=True, exist_ok=True)
+
+    source_fd = os.open(
+        str(src), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError(f"protected TV source is not a regular file: {src}")
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
+        total = source_stat.st_size
+        source_guard_fd = os.dup(source_fd)
+    except BaseException:
+        os.close(source_fd)
+        raise
+
+    token = f".{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.partial"
+    partial = partial_root / token
+    partial_fd = None
+    try:
+        partial_fd = os.open(
+            str(partial),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            0o644,
+        )
+        partial_stat = os.fstat(partial_fd)
+        if not stat.S_ISREG(partial_stat.st_mode):
+            raise OSError(f"protected TV partial is not a regular file: {partial}")
+        partial_identity = (partial_stat.st_dev, partial_stat.st_ino)
+        monitor_fd = os.dup(partial_fd)
+    except BaseException:
+        for descriptor in (partial_fd, source_fd, source_guard_fd):
+            if descriptor is not None:
+                try: os.close(descriptor)
+                except OSError: pass
+        raise
+
+    done_evt = threading.Event()
+    err_box: list[BaseException] = []
+
+    def worker():
+        try:
+            with os.fdopen(source_fd, "rb") as source_stream, \
+                    os.fdopen(partial_fd, "wb") as output:
+                shutil.copyfileobj(source_stream, output, length=8 * 1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
+        except BaseException as exc:
+            err_box.append(exc)
+        finally:
+            done_evt.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    start = time.time()
+    last_size = 0
+    last_t = start
+    print(f"{C.D}{label}: {src.name} -> {dst} (protected){C.R}", flush=True)
+    published = False
+    try:
+        while not done_evt.wait(timeout=interval):
+            current = os.fstat(monitor_fd).st_size
+            now = time.time()
+            delta_t = now - last_t
+            delta = current - last_size
+            mbps = delta / delta_t / (1024 * 1024) if delta_t > 0 else 0.0
+            eta = ((total - current) / (delta / delta_t)
+                   if delta > 0 and delta_t > 0 else 0)
+            fraction = current / total if total > 0 else 0.0
+            print(
+                f"  {render_bar(fraction)} {fraction*100:5.1f}%  "
+                f"{current/1e9:5.2f}/{total/1e9:5.2f} GB  "
+                f"{mbps:5.1f} MB/s  eta {fmt_dur(eta)}  "
+                f"elapsed {fmt_dur(now - start)}",
+                flush=True,
+            )
+            last_size, last_t = current, now
+        os.close(monitor_fd)
+        if err_box:
+            raise err_box[0]
+        copied = os.lstat(partial)
+        guarded_source = os.fstat(source_guard_fd)
+        if ((copied.st_dev, copied.st_ino) != partial_identity
+                or copied.st_size != total):
+            raise OSError(f"protected TV partial identity/size changed: {partial}")
+        if ((guarded_source.st_dev, guarded_source.st_ino) != source_identity
+                or guarded_source.st_size != total):
+            raise OSError(f"protected TV source identity/size changed: {src}")
+
+        publish_lock = (
+            contextlib.nullcontext()
+            if publish_lock_held or lock_dir is None else
+            season_dir_lock(lock_dir, what="protected TV publish")
+        )
+        with publish_lock:
+            if claim_path is not None:
+                claim = os.lstat(claim_path)
+                if (not stat.S_ISREG(claim.st_mode) or claim.st_size != 0
+                        or (claim.st_dev, claim.st_ino) != placeholder_identity):
+                    raise FileExistsError(
+                        f"TV slot claim ownership changed: {claim_path}"
+                    )
+            _atomic_rename_noreplace(partial, dst)
+            published = True
+            if claim_path is not None:
+                _remove_zero_placeholder(claim_path, placeholder_identity)
+
+        # Never blindly unlink a pathname after copying. Move whatever is at
+        # the source path to an unpredictable private name, verify its inode,
+        # and delete only when it is the exact source we copied.
+        retired = src.with_name(
+            f".{src.name}.burndvd-consumed-{os.getpid()}-"
+            f"{time.time_ns()}-{os.urandom(8).hex()}"
+        )
+        try:
+            os.rename(src, retired)
+        except OSError as exc:
+            raise OSError(
+                f"source path changed after publication; destination retained "
+                f"at {dst}: {exc}"
+            ) from exc
+        retired_stat = os.lstat(retired)
+        if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
+            retained_at = retired
+            if not src.exists():
+                try:
+                    os.rename(retired, src)
+                    retained_at = src
+                except OSError:
+                    pass
+            raise OSError(
+                f"source path was replaced during protected copy; completed "
+                f"destination retained at {dst}; foreign source retained at "
+                f"{retained_at}"
+            )
+        retired.unlink()
+    except BaseException:
+        try: os.close(monitor_fd)
+        except OSError: pass
+        # A successfully published file is the durable copy of the bound
+        # source. Never roll it back merely because source retirement raced.
+        if not published:
+            try:
+                current = os.lstat(partial)
+                if (current.st_dev, current.st_ino) == partial_identity:
+                    partial.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        try: os.close(source_guard_fd)
+        except OSError: pass
+
+    elapsed = time.time() - start
+    avg_mbps = total / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
+    print(f"  {C.GRN}done{C.R}  {total/1e9:.2f} GB in {fmt_dur(elapsed)}"
+          f"  ({avg_mbps:.1f} MB/s avg, protected)", flush=True)
+
 # -------- queue model --------
 @dataclass
 class QueueItem:
@@ -154,6 +384,10 @@ class QueueItem:
     format: str          # "4K" | "BD" | "DVD"
     season: int = 0
     episode_start: int = 1
+    expected_episodes: int = 0
+    expected_disc_episodes: int = 0
+    expected_title_ids: list = field(default_factory=list)
+    expected_physical_disc: int = 0
     notes: str = ""
     # Double-feature only: list of {"title_id": int, "name": str}. One physical
     # disc holding two (or more) distinct movies, each pinned to a specific
@@ -202,11 +436,26 @@ def _parse_features(raw: str) -> list:
     return out
 
 
+def _parse_title_ids(raw: str) -> list[int]:
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    values = json.loads(raw)
+    if not isinstance(values, list):
+        raise ValueError("expected_title_ids must be a JSON array")
+    result = [int(value) for value in values]
+    if any(value < 0 for value in result) or len(result) != len(set(result)):
+        raise ValueError("expected_title_ids must be unique non-negative integers")
+    return result
+
+
 def validate_queue_item(item: QueueItem) -> None:
     """Reject queue rows that would otherwise fail late or target a bad path."""
 
     if not item.title or "\x00" in item.title:
         raise ValueError("title must be non-empty and contain no NUL byte")
+    if sanitize(item.title) in {"", ".", ".."}:
+        raise ValueError("title must produce a safe non-empty path component")
     if item.type not in VALID_QUEUE_TYPES:
         raise ValueError(
             f"type must be one of {sorted(VALID_QUEUE_TYPES)}, got {item.type!r}"
@@ -223,10 +472,39 @@ def validate_queue_item(item: QueueItem) -> None:
         raise ValueError("tv-season rows require season >= 1")
     if item.episode_start < 1:
         raise ValueError("episode_start must be at least 1")
+    if item.type == "tv-season":
+        if item.expected_episodes < 1:
+            raise ValueError("tv-season rows require expected_episodes >= 1")
+        if item.expected_disc_episodes < 1:
+            raise ValueError(
+                "tv-season rows require expected_disc_episodes >= 1"
+            )
+        if item.expected_physical_disc < 1:
+            raise ValueError(
+                "tv-season rows require expected_physical_disc >= 1"
+            )
+        final_ep = item.episode_start + item.expected_disc_episodes - 1
+        if final_ep > item.expected_episodes:
+            raise ValueError(
+                "disc episode range exceeds expected_episodes "
+                f"({item.episode_start}-{final_ep} > {item.expected_episodes})"
+            )
+        if (item.expected_title_ids
+                and len(item.expected_title_ids) != item.expected_disc_episodes):
+            raise ValueError(
+                "expected_title_ids length must equal expected_disc_episodes"
+            )
     if item.type == "double-feature" and len(item.features) < 2:
         raise ValueError("double-feature rows require at least two features")
     if item.type != "double-feature" and item.features:
         raise ValueError("features are only valid for double-feature rows")
+
+
+def run_policy_error(items: list[QueueItem], *, overwrite: bool,
+                     rerip_review: bool) -> str | None:
+    if overwrite and any(item.type == "tv-season" for item in items):
+        return "--overwrite is forbidden for TV in every mode"
+    return None
 
 
 def load_queue(path: Path) -> list[QueueItem]:
@@ -268,6 +546,16 @@ def load_queue(path: Path) -> list[QueueItem]:
                     format=(row["format"] or "").strip().upper(),
                     season=csv_int(row, "season", 0),
                     episode_start=csv_int(row, "episode_start", 1),
+                    expected_episodes=csv_int(row, "expected_episodes", 0),
+                    expected_disc_episodes=csv_int(
+                        row, "expected_disc_episodes", 0
+                    ),
+                    expected_title_ids=_parse_title_ids(
+                        row.get("expected_title_ids", "")
+                    ),
+                    expected_physical_disc=csv_int(
+                        row, "expected_physical_disc", 0
+                    ),
                     notes=(row.get("notes") or "").strip(),
                     features=_parse_features(row.get("features", "")),
                 )
@@ -280,7 +568,7 @@ def load_queue(path: Path) -> list[QueueItem]:
     return items
 
 # -------- state --------
-STATE_VERSION = 2
+STATE_VERSION = 3
 def default_state(items: list[QueueItem]) -> dict:
     return {
         "version": STATE_VERSION,
@@ -399,6 +687,22 @@ def parse_duration(s: str) -> int:
 def title_num_from_filename(name: str):
     m = re.search(r"_t(\d+)\.mkv$", name)
     return int(m.group(1)) if m else None
+
+
+def partition_episode_contract(paths: list[Path], item: QueueItem
+                               ) -> tuple[list[Path], list[Path], list[int]]:
+    """Apply exact physical title identity while retaining disc order."""
+
+    if not item.expected_title_ids:
+        selected = paths[: item.expected_disc_episodes]
+        return selected, paths[item.expected_disc_episodes :], []
+    by_title = {title_num_from_filename(path.name): path for path in paths}
+    missing = [title_id for title_id in item.expected_title_ids
+               if title_id not in by_title]
+    if missing:
+        return [], paths, missing
+    selected = [by_title[title_id] for title_id in item.expected_title_ids]
+    return selected, [path for path in paths if path not in selected], []
 
 # -------- forum-derived guards --------
 def parse_save_summary(msgs: list[str]):
@@ -615,8 +919,32 @@ def scan_for_key_expiry(msgs: list[str]):
             if match: return int(match.group(1))
     return None
 
+def movie_part_from_notes(notes: str) -> int | None:
+    """Return an explicit PT/PART number embedded in the physical-disc label.
+
+    The single-disc wrapper records the untouched volume label in ``notes``.
+    Extended-edition movies commonly ship as ``..._PT1``/``..._PT2`` while
+    still normalizing to the same movie title.  Preserve that part marker in
+    the temporary rip filename so Part 2 cannot collide with Part 1 before the
+    two lossless files are joined.
+    """
+    match = re.search(
+        r"(?:^|[^A-Z0-9])(?:PT|PART)[._ -]*(\d{1,2})(?:$|[^0-9])",
+        notes,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    part_n = int(match.group(1))
+    return part_n if part_n > 0 else None
+
+
 def movie_filename(item: QueueItem, disc_n: int) -> str:
     base = sanitize(item.title)
+    physical_part = movie_part_from_notes(item.notes)
+    if physical_part is not None:
+        quality = " - [Bluray-2160p]" if item.format.upper() == "4K" else ""
+        return f"{base}{quality} - pt{physical_part}.mkv"
     if item.discs > 1:
         return f"{base} - disc{disc_n}.mkv"
     return f"{base}.mkv"
@@ -871,6 +1199,284 @@ def disc_label(info: dict) -> str:
     c = info.get("cinfo", {})
     return c.get(2) or c.get(32) or c.get(30) or c.get(1) or "(unknown)"
 
+
+DISC_RECEIPT_DEFAULT = Path.home() / ".local" / "state" / "burndvd" / "disc-receipts.jsonl"
+
+
+def require_free_extra_destination(source: Path, destination: Path,
+                                   overwrite: bool) -> None:
+    """Fail closed on an extra-name collision while retaining the new rip."""
+
+    if destination.exists() and not overwrite:
+        raise FileExistsError(
+            f"extras destination exists; source preserved: {source} -> {destination}"
+        )
+
+
+def disc_content_fingerprint(info: dict) -> str:
+    """Hash stable disc/title-table identity, excluding drive/runtime noise."""
+
+    rows = []
+    for title_id, values in sorted(info.get("titles", {}).items()):
+        rows.append([
+            int(title_id),
+            *[str(values.get(key, "")) for key in (2, 9, 10, 11, 27)],
+        ])
+    payload = {
+        "label": disc_label(info).casefold().strip(),
+        "titles": rows,
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def disc_receipt_seen(path: Path, fingerprint: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"corrupt disc receipt ledger {path}: line {line_number}"
+                    ) from exc
+                if row.get("fingerprint") == fingerprint and row.get("status") == "published":
+                    return True
+    except OSError:
+        # A receipt store that cannot be read is not evidence of uniqueness.
+        raise RuntimeError(f"cannot read disc receipt ledger: {path}")
+    return False
+
+
+def append_disc_receipt(path: Path, item: QueueItem, disc_n: int,
+                        fingerprint: str, files: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "version": 1,
+        "status": "published",
+        "fingerprint": fingerprint,
+        "title": item.title,
+        "season": item.season,
+        "disc": int(disc_n),
+        "expected_physical_disc": item.expected_physical_disc,
+        "episode_start": item.episode_start,
+        "expected_disc_episodes": item.expected_disc_episodes,
+        "expected_title_ids": list(item.expected_title_ids),
+        "expected_episodes": item.expected_episodes,
+        "files": list(files),
+        "ts": time.time(),
+    }
+    with path.open("a", encoding="utf-8") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def tv_slot_claim_path(destination: Path) -> Path:
+    """Hidden reservation path; never expose a partial ``.mkv`` to Jellyfin."""
+
+    return destination.with_name(f".{destination.name}.burndvd-claim")
+
+
+def _create_tv_slot_claim(path: Path) -> tuple[int, int]:
+    """Create one claim atomically and return its stable filesystem identity."""
+
+    descriptor = None
+    identity = None
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            0o644,
+        )
+        created = os.fstat(descriptor)
+        identity = (created.st_dev, created.st_ino)
+        if not stat.S_ISREG(created.st_mode) or created.st_size != 0:
+            raise OSError(f"invalid TV slot claim created at {path}")
+        return identity
+    except BaseException:
+        if identity is not None:
+            _remove_zero_placeholder(path, identity)
+        raise
+    finally:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+
+
+def _claim_tv_destinations(
+    destinations: list[Path],
+) -> dict[Path, tuple[Path, tuple[int, int]]]:
+    """Reserve all destinations or inode-safely roll back the entire batch."""
+
+    claims: dict[Path, tuple[Path, tuple[int, int]]] = {}
+    try:
+        for destination in destinations:
+            claim_path = tv_slot_claim_path(destination)
+            claims[destination] = (
+                claim_path, _create_tv_slot_claim(claim_path)
+            )
+    except BaseException:
+        _remove_claimed_placeholders(
+            [claim for claim, _ in claims.values()],
+            {claim: identity for claim, identity in claims.values()},
+        )
+        raise
+    return claims
+
+
+def _emit_claimed_tv_moves(
+    planned: list[tuple[Path, int, Path]],
+    claims: dict[Path, tuple[Path, tuple[int, int]]],
+    emit_move,
+    finals: list[str],
+) -> Exception | None:
+    """Emit a claimed TV batch and never strand claims after an interruption."""
+
+    for src, episode, final in planned:
+        claim_path, claim_identity = claims[final]
+        try:
+            emit_move(
+                src, final, f"moving episode {episode:02d}",
+                placeholder_identity=claim_identity,
+                claim_path=claim_path,
+                publish_lock_held=True,
+            )
+            finals.append(str(final))
+        except BaseException as exc:
+            _remove_claimed_placeholders(
+                [claim for claim, _ in claims.values()],
+                {claim: identity for claim, identity in claims.values()},
+            )
+            # Preserve process-control semantics after exact-inode cleanup.
+            if not isinstance(exc, Exception):
+                raise
+            return exc
+    return None
+
+
+def existing_episode_slots(item: QueueItem, target_dir: Path, *,
+                           include_claims: bool = False) -> dict[int, Path]:
+    slots: dict[int, Path] = {}
+    media_pattern = re.compile(
+        rf"^{re.escape(sanitize(item.title))} - S0*{item.season}E(\d+)\.mkv$",
+        re.IGNORECASE,
+    )
+    claim_pattern = re.compile(
+        rf"^\.{re.escape(sanitize(item.title))} - "
+        rf"S0*{item.season}E(\d+)\.mkv\.burndvd-claim$",
+        re.IGNORECASE,
+    )
+    try:
+        entries = list(target_dir.iterdir()) if target_dir.exists() else []
+    except OSError as exc:
+        raise RuntimeError(f"cannot inspect season directory {target_dir}: {exc}") from exc
+    for entry in entries:
+        match = media_pattern.match(entry.name)
+        is_claim = False
+        if match is None and include_claims:
+            match = claim_pattern.match(entry.name)
+            is_claim = match is not None
+        if not match:
+            continue
+        try:
+            if not is_claim and entry.stat().st_size <= 0 and not include_claims:
+                continue
+        except OSError as exc:
+            raise RuntimeError(f"cannot stat existing episode {entry}: {exc}") from exc
+        slots[int(match.group(1))] = entry
+    return slots
+
+
+def tv_contract_output_mode(item: QueueItem, target_dir: Path, *,
+                            rerip_review: bool = False,
+                            auto_rerip_review: bool = False
+                            ) -> tuple[str, str | None, list[int]]:
+    """Resolve normal/review TV output from the current season inventory.
+
+    Explicit review is isolated outside the media library and therefore does
+    not depend on the published season's numbering state.  Automatic review is
+    narrower: only an occupied authoritative range selects it.  Inventory
+    beyond the season total remains a hard error for every automatic/normal
+    publication decision.
+    """
+
+    if item.type != "tv-season":
+        return "normal", None, []
+    if rerip_review:
+        return "review", None, []
+    # Include 0-byte atomic slot reservations.  They represent an in-flight
+    # publication and must make a recognized concurrent read choose review.
+    slots = existing_episode_slots(item, target_dir, include_claims=True)
+    outside = sorted(ep for ep in slots if ep > item.expected_episodes)
+    if outside:
+        return "normal", (
+            f"season contains episode slots beyond authoritative total "
+            f"{item.expected_episodes}: {outside}; repair inventory first"
+        ), []
+    wanted = set(range(
+        item.episode_start,
+        item.episode_start + item.expected_disc_episodes,
+    ))
+    occupied = sorted(wanted.intersection(slots))
+    if occupied and auto_rerip_review:
+        return "review", None, occupied
+    if occupied:
+        return "normal", (
+            f"disc's authoritative episode slots already exist: {occupied}; "
+            "refusing append/re-rip (use --rerip-review for traceable review output)"
+        ), occupied
+    if len(slots) >= item.expected_episodes:
+        return "normal", (
+            f"season already has {len(slots)}/{item.expected_episodes} episodes; "
+            "refusing append/re-rip"
+        ), []
+    return "normal", None, []
+
+
+def tv_contract_preflight_error(item: QueueItem, target_dir: Path,
+                                rerip_review: bool = False) -> str | None:
+    """Fail before optical reads if a TV disc would occupy known content."""
+
+    _, error, _ = tv_contract_output_mode(
+        item, target_dir, rerip_review=rerip_review
+    )
+    return error
+
+
+def apply_tv_output_mode(args, item: QueueItem, target_dir: Path,
+                         phase: str) -> str | None:
+    """Apply an automatic occupied-slot review decision to one disc's args."""
+
+    mode, error, occupied = tv_contract_output_mode(
+        item,
+        target_dir,
+        rerip_review=getattr(args, "rerip_review", False),
+        auto_rerip_review=getattr(args, "auto_rerip_review", False),
+    )
+    if error:
+        return error
+    if mode == "review" and not getattr(args, "rerip_review", False):
+        args.rerip_review = True
+        slots = ",".join(str(ep) for ep in occupied) or "unknown"
+        print(
+            f"{C.YLW}Occupied authoritative TV slot(s) {slots} detected "
+            f"during {phase}; switching this disc to protected review output.{C.R}"
+        )
+        append_log(
+            args,
+            f"AUTO_RERIP_REVIEW {item.title} S{item.season:02d} "
+            f"phase={phase} occupied={slots}",
+        )
+    return None
+
 def disc_n_from_label(info: dict) -> int | None:
     # The old `\bdisc\s*[-_:]?\s*(\d+)\b` regex matched `\b` word boundaries,
     # which can fire inside titles that merely *start* with "disc" — e.g.
@@ -881,9 +1487,99 @@ def disc_n_from_label(info: dict) -> int | None:
     # underscore, dash, etc.). All real volume labels we've seen
     # (SOUTHPARK7_DISC2, CS_S2_D1, "South Park Season 5 - Disc 2") still
     # match cleanly. (audit #15, 2026-05-31)
-    m = re.search(r"(?<![A-Za-z])disc[\s_:-]*(\d+)\b",
+    m = re.search(r"(?<![A-Za-z0-9])(?:disc|disk|d)[\s_.:-]*0*(\d{1,2})(?=$|[^0-9])",
                   disc_label(info), re.IGNORECASE)
     return int(m.group(1)) if m else None
+
+
+def season_n_from_label(info: dict) -> int | None:
+    match = re.search(
+        r"(?<![A-Za-z0-9])(?:season|s)[\s_.:-]*0*(\d{1,2})(?=$|[^0-9])",
+        disc_label(info), re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def bound_physical_disc(item: QueueItem, info: dict, queue_disc_n: int) -> int:
+    """Bind TV contracts to an independently observed title/season/disc tuple."""
+
+    detected = disc_n_from_label(info)
+    if item.type != "tv-season":
+        return detected if detected is not None else queue_disc_n
+    label = disc_label(info)
+    normalized_label = re.sub(r"[^a-z0-9]+", "", label.casefold())
+    normalized_title = re.sub(r"[^a-z0-9]+", "", item.title.casefold())
+    if not normalized_title or normalized_title not in normalized_label:
+        raise ValueError(
+            f"physical TV title mismatch: expected {item.title!r}, label reports {label!r}"
+        )
+    detected_season = season_n_from_label(info)
+    if detected_season is None:
+        raise ValueError(
+            "cannot verify physical TV season: MakeMKV label has no season number"
+        )
+    if detected_season != item.season:
+        raise ValueError(
+            "physical TV season mismatch: "
+            f"contract expects season {item.season}, label reports {detected_season}"
+        )
+    if detected is None:
+        raise ValueError(
+            "cannot verify physical TV disc: MakeMKV label has no disc number"
+        )
+    if detected != item.expected_physical_disc:
+        raise ValueError(
+            "physical TV disc mismatch: "
+            f"contract expects disc {item.expected_physical_disc}, "
+            f"label reports {detected}"
+        )
+    return item.expected_physical_disc
+
+
+def automatic_review_contract_error(item: QueueItem, info: dict) -> str | None:
+    """Require an exact built-in metadata contract for automatic review.
+
+    ``--auto-rerip-review`` is intentionally accepted only for smart-wrapper
+    queues whose observed physical title/season/disc maps to a registry entry.
+    A hidden CLI switch by itself is not provenance: manual queue values must
+    match the registry field-for-field before the backend may auto-route them.
+    """
+
+    if item.type != "tv-season":
+        return "automatic review is only valid for TV seasons"
+    try:
+        import burndvd_metadata
+        contract = burndvd_metadata.episode_contract(
+            item.title, item.season, disc_label(info)
+        )
+    except (ImportError, AttributeError, TypeError, ValueError) as exc:
+        return f"cannot verify automatic-review metadata contract: {exc}"
+    if contract is None:
+        return (
+            "automatic review requires a registry-recognized physical-disc "
+            "metadata contract"
+        )
+    queued = {
+        "disc": item.expected_physical_disc,
+        "episode_start": item.episode_start,
+        "expected_disc_episodes": item.expected_disc_episodes,
+        "expected_episodes": item.expected_episodes,
+        "expected_title_ids": list(item.expected_title_ids),
+    }
+    expected = {
+        "disc": int(contract["disc"]),
+        "episode_start": int(contract["episode_start"]),
+        "expected_disc_episodes": int(contract["expected_disc_episodes"]),
+        "expected_episodes": int(contract["expected_episodes"]),
+        "expected_title_ids": [int(value)
+                               for value in contract["expected_title_ids"]],
+    }
+    if queued != expected:
+        return (
+            "automatic-review queue contract does not match the verified "
+            f"metadata registry: queued={queued}, expected={expected}"
+        )
+    return None
 
 # Floor above which a movie title is "feature-length" — used only by --scan
 # to flag candidate features so the burndvd wrapper can notice a disc with two
@@ -891,8 +1587,40 @@ def disc_n_from_label(info: dict) -> int | None:
 # generous (45 min) to catch short B-movies / grindhouse features; the wrapper
 # prompt defaults to "no", so a single movie + a long making-of just costs the
 # user one extra Enter.
+# Two titles within this ratio of the longest are treated as candidate encodes of
+# the SAME feature, so the pick is decided on bitrate rather than duration. Set
+# so a genuine alternate cut still qualifies (Superman Doomsday's pair differ by
+# 8%) while a real second feature or a short extra does not drag the comparison.
+MOVIE_ALT_CUT_MIN_RATIO = 0.85
 MOVIE_FEATURE_MIN_S = 2700
 TV_MIN_DUR_S = 600
+# A title can clear the absolute TV floor and still be bonus content, not an
+# episode: a 14-min 480p featurette (852s) cleared 600s and became a phantom
+# S01E05/E06 on X-Files S1D1 (2026-07-17), which also pushed the next disc's
+# episode-start up by two. Demote a candidate whose runtime is under
+# EP_BONUS_MEDIAN_RATIO x the disc's median candidate runtime; it is saved to
+# Extras/, never dropped. Self-calibrating per disc (22-min and 44-min shows
+# alike); only fires with >= EP_BONUS_MIN_COUNT candidates so a 1-2 episode
+# disc is never touched. Duration-only; the stronger SD-bonus-vs-HD-episode
+# signal needs per-stream resolution the probe does not yet capture (future).
+EP_BONUS_MEDIAN_RATIO = 0.4
+EP_BONUS_MIN_COUNT = 3
+
+def _median(xs):
+    s = sorted(xs); n = len(s)
+    if not n:
+        return 0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+def episode_bonus_split(cand):
+    """cand: list[(tid, dur_s)] already above the TV floor and not play-all.
+    Returns (episode_ids_sorted, bonus_ids_sorted, threshold_s|None)."""
+    if len(cand) < EP_BONUS_MIN_COUNT:
+        return sorted(t for t, _ in cand), [], None
+    thr = EP_BONUS_MEDIAN_RATIO * _median([d for _, d in cand])
+    eps = sorted(t for t, d in cand if d >= thr)
+    bonus = sorted(t for t, d in cand if d < thr)
+    return eps, bonus, thr
 # Floor below which MakeMKV titles are noise (menu reels, transitions, FBI
 # warnings, language stubs). Raised from 60 → 120 on 2026-05-26 after Power
 # of the Dog UHD rip kept two ~130-260MB bumpers; 60s let those through.
@@ -985,10 +1713,39 @@ def select_titles(item: QueueItem, info: dict) -> list[int]:
         present = set(info["titles"].keys())
         return [f["title_id"] for f in item.features if f["title_id"] in present]
     if item.type == "movie":
-        tid, dur = max(durs, key=lambda x: x[1])
-        return [tid] if dur > 0 else []
+        longest_tid, longest = max(durs, key=lambda x: x[1])
+        if longest <= 0:
+            return []
+        # A disc can carry the SAME feature twice at different quality, and the
+        # better encode is often the SHORTER title. Superman Doomsday
+        # (2026-07-24): t01 1h17m/9.6GB (~16.6 Mbps) vs t02 1h24m/3.2GB
+        # (~5.1 Mbps) -- picking by duration alone took the worse one and got
+        # 1.8GB into it before a human noticed. Among titles long enough to
+        # plausibly be the same feature, prefer the highest bitrate; fall back
+        # to longest when there is no genuine alternate to choose between.
+        def _title_bytes(tid: int) -> int:
+            try:
+                return int(info["titles"][tid].get(11, "0") or "0")
+            except (TypeError, ValueError):
+                return 0
+
+        peers = [(tid, dur) for tid, dur in durs
+                 if dur >= longest * MOVIE_ALT_CUT_MIN_RATIO]
+        rated = [(tid, _title_bytes(tid) / dur)
+                 for tid, dur in peers if dur > 0 and _title_bytes(tid) > 0]
+        if len(rated) > 1:
+            best_tid, best_rate = max(rated, key=lambda x: x[1])
+            if best_tid != longest_tid:
+                print(f"  movie pick: t{best_tid:02d} "
+                      f"({best_rate * 8 / 1e6:.1f} Mbps) over longer t{longest_tid:02d} "
+                      f"-- higher bitrate wins on a same-feature alternate")
+            return [best_tid]
+        return [longest_tid]
     play_all = play_all_title_ids(info)
-    return [tid for tid, dur in durs if dur >= TV_MIN_DUR_S and tid not in play_all]
+    cand = [(tid, dur) for tid, dur in durs
+            if dur >= TV_MIN_DUR_S and tid not in play_all]
+    eps, _bonus, _thr = episode_bonus_split(cand)
+    return eps
 
 def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]):
     # Persistent audit trail of the probe's full title table and the keep/skip
@@ -999,6 +1756,14 @@ def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]):
     # and to ripqueue-state.log so the reason survives across runs.
     chosen = set(title_ids)
     play_all = play_all_title_ids(info) if item.type not in ("movie", "double-feature") else set()
+    bonus_gate = set()
+    if item.type not in ("movie", "double-feature"):
+        _cand = [(tid, parse_duration(info["titles"][tid].get(9, "0:00:00")))
+                 for tid in info["titles"]
+                 if parse_duration(info["titles"][tid].get(9, "0:00:00")) >= TV_MIN_DUR_S
+                 and tid not in play_all]
+        _eps, _bonus_ids, _thr = episode_bonus_split(_cand)
+        bonus_gate = set(_bonus_ids)
     floor = TV_MIN_DUR_S if item.type != "movie" else 0
     rows = []
     for tid in sorted(info["titles"].keys()):
@@ -1011,6 +1776,8 @@ def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]):
             reason = "KEEP"
         elif item.type == "movie":
             reason = "skip (not longest title)"
+        elif tid in bonus_gate:
+            reason = "skip (short vs disc median -> Extras)"
         elif tid in play_all:
             # Tentative at probe time — the duration heuristic FLAGS it, but the
             # empirical frame-compare verdict (CONFIRMED vs SALVAGE) is decided
@@ -1031,13 +1798,16 @@ def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]):
                          f"t{tid:02d} {fmt_dur(dur_s)} ({dur_s}s) {size} "
                          f"{reason} | {name}")
 
+FFPROBE_BIN = "/opt/homebrew/bin/ffprobe"
+
+
 def ffprobe_dur_s(path: str) -> float:
     # Actual container duration of a landed file. Returns 0.0 if ffprobe is
     # missing or the read fails — logging is best-effort and must never abort
     # a completed rip.
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=60)
         return float(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else 0.0
@@ -1069,6 +1839,71 @@ FFMPEG_BIN = "/opt/homebrew/bin/ffmpeg"
 # flag. Clamped below the shortest kept episode so the reference always has a
 # frame there; a fractional fallback covers very short titles / test fixtures.
 PLAY_ALL_VERIFY_OFFSETS = (120.0, 300.0, 600.0)
+
+# Alternate-playlist dedup (see rip()'s TV partition). A Blu-ray TV disc
+# often lists each episode as two+ titles (main + alternate playlist),
+# identical in content; left in, each promotes as a phantom duplicate
+# episode. Two titles are duplicates only when runtimes match within
+# ALT_DEDUP_DUR_TOL_S AND a MAJORITY of sampled frames are byte-identical --
+# content-verified, so distinct episodes with equal runtimes are never
+# merged, and a strict majority absorbs the occasional fast-seek frame
+# artifact between two valid rips.
+ALT_DEDUP_DUR_TOL_S = 3
+ALT_DEDUP_OFFSETS = (180.0, 600.0, 1200.0, 1800.0, 2400.0)
+
+def _alt_playlist_duplicate(path_a: str, path_b: str, dur_s: float) -> bool:
+    usable = [o for o in ALT_DEDUP_OFFSETS if o < dur_s - 1]
+    if len(usable) < 3 and dur_s > 4:
+        usable = [round(dur_s * f, 2) for f in (0.2, 0.4, 0.6, 0.8)]
+    if len(usable) < 3:
+        return False  # too short to verify safely -> keep both
+    matches = probed = 0
+    for o in usable:
+        a = _frame_md5(path_a, o)
+        b = _frame_md5(path_b, o)
+        if a is None or b is None:
+            continue  # ffmpeg hiccup on one offset: skip, don't penalise
+        probed += 1
+        if a == b:
+            matches += 1
+    # need a real majority of frames that were actually probed
+    return probed >= 3 and matches >= (probed // 2 + 1)
+
+
+def _content_relation(path_a: str, path_b: str, dur_s: float) -> str:
+    """Return duplicate/distinct/unknown from decoded-frame identity."""
+
+    usable = [offset for offset in ALT_DEDUP_OFFSETS if offset < dur_s - 1]
+    if len(usable) < 3 and dur_s > 4:
+        usable = [round(dur_s * fraction, 2) for fraction in (0.2, 0.4, 0.6, 0.8)]
+    if len(usable) < 3:
+        return "unknown"
+    hashes = [(_frame_md5(path_a, offset), _frame_md5(path_b, offset))
+              for offset in usable]
+    probed = [(left, right) for left, right in hashes
+              if left is not None and right is not None]
+    if len(probed) < 3:
+        return "unknown"
+    matches = sum(left == right for left, right in probed)
+    return "duplicate" if matches >= (len(probed) // 2 + 1) else "distinct"
+
+
+def existing_content_collision(candidate: Path, candidate_duration: float,
+                               existing: dict[int, Path]) -> tuple[Path | None, str | None]:
+    """Find a decoded-content repeat; comparison failures block publication."""
+
+    for path in existing.values():
+        duration = ffprobe_dur_s(str(path))
+        if duration <= 0:
+            return None, f"cannot read duration for existing episode {path}"
+        if abs(duration - candidate_duration) > ALT_DEDUP_DUR_TOL_S:
+            continue
+        relation = _content_relation(str(candidate), str(path), candidate_duration)
+        if relation == "duplicate":
+            return path, None
+        if relation == "unknown":
+            return None, f"cannot prove content distinct from same-duration {path}"
+    return None, None
 
 def _frame_md5(path: str, offset_s: float) -> str | None:
     """md5 of the single decoded video frame at offset_s (seconds), or None on
@@ -1129,32 +1964,155 @@ def compute_target_dir(item: QueueItem) -> Path:
         return root
     return root / f"Season {item.season:02d}"
 
+
+def _validated_tv_review_root(
+    item: QueueItem, effective_target_dir: Path,
+    review_root: str | Path | None = None,
+) -> tuple[Path, list[Path]]:
+    """Return a resolved review root plus every forbidden library root."""
+
+    if item.type != "tv-season":
+        raise ValueError("review capture directories are only valid for TV")
+    effective_target_dir = effective_target_dir.expanduser().resolve(strict=False)
+    library_anchor = next(
+        (candidate for candidate in
+         (effective_target_dir, *effective_target_dir.parents)
+         if candidate.name.casefold() in {"tv shows", "tv shows 4k"}),
+        None,
+    )
+    if review_root is not None:
+        quarantine_root = Path(review_root).expanduser()
+        if not quarantine_root.is_absolute():
+            raise ValueError("--review-root must be an absolute path")
+    else:
+        if library_anchor is None:
+            raise ValueError(
+                "cannot derive an out-of-library review destination; "
+                "pass --review-root"
+            )
+        quarantine_root = (
+            library_anchor.parent / ".repair-quarantine" / "burndvd-review"
+        )
+
+    # Normalize ``..`` and resolve every existing symlinked ancestor before
+    # containment checks.  A lexical check alone can be walked or symlinked
+    # straight back into Jellyfin's tree.
+    quarantine_root = quarantine_root.resolve(strict=False)
+    if any(
+        candidate.name.casefold() in {"tv shows", "tv shows 4k"}
+        for candidate in (quarantine_root, *quarantine_root.parents)
+    ):
+        raise ValueError("review destination must be outside every TV media library")
+
+    forbidden_roots = [Path(item.target_root).expanduser().resolve(strict=False)]
+    if library_anchor is not None:
+        forbidden_roots.append(library_anchor)
+    for forbidden in forbidden_roots:
+        try:
+            quarantine_root.relative_to(forbidden)
+        except ValueError:
+            continue
+        raise ValueError("review destination must be outside the media library")
+    return quarantine_root, forbidden_roots
+
+
+def tv_partial_capture_root(
+    item: QueueItem, effective_target_dir: Path,
+    review_root: str | Path | None = None,
+) -> Path:
+    """Return the out-of-library root for incomplete protected TV copies."""
+
+    quarantine_root, forbidden_roots = _validated_tv_review_root(
+        item, effective_target_dir, review_root
+    )
+    partial_root = (quarantine_root / ".burndvd-partials").resolve(strict=False)
+    try:
+        partial_root.relative_to(quarantine_root)
+    except ValueError as exc:
+        raise ValueError("TV partial destination escaped its quarantine root") from exc
+    if any(
+        candidate.name.casefold() in {"tv shows", "tv shows 4k"}
+        for candidate in (partial_root, *partial_root.parents)
+    ):
+        raise ValueError("TV partial destination must be outside every TV library")
+    for forbidden in forbidden_roots:
+        try:
+            partial_root.relative_to(forbidden)
+        except ValueError:
+            continue
+        raise ValueError("TV partial destination must be outside the media library")
+    return partial_root
+
+
+def protected_quarantine_child(parent: Path, name: str) -> Path:
+    """Resolve one quarantine child and reject symlink/path escapes."""
+
+    parent = Path(parent).resolve(strict=False)
+    child = (parent / name).resolve(strict=False)
+    try:
+        child.relative_to(parent)
+    except ValueError as exc:
+        raise ValueError(f"quarantine child {name!r} escaped {parent}") from exc
+    if any(
+        candidate.name.casefold() in {"tv shows", "tv shows 4k"}
+        for candidate in (child, *child.parents)
+    ):
+        raise ValueError("quarantine child must be outside every TV library")
+    return child
+
+
+def tv_review_capture_dir(item: QueueItem, effective_target_dir: Path,
+                          fingerprint: str,
+                          review_root: str | Path | None = None) -> Path:
+    """Return a fingerprint-scoped TV review path outside media libraries."""
+
+    compact_fingerprint = re.sub(r"[^0-9a-f]", "", fingerprint.casefold())
+    if len(compact_fingerprint) < 16:
+        raise ValueError("review capture requires a valid disc fingerprint")
+    safe_title = sanitize(item.title)
+    if safe_title in {"", ".", ".."}:
+        raise ValueError("review title must be a safe non-empty path component")
+    quarantine_root, forbidden_roots = _validated_tv_review_root(
+        item, effective_target_dir, review_root
+    )
+    capture = (
+        quarantine_root / safe_title /
+        f"Season {item.season:02d}" / compact_fingerprint[:16]
+    ).resolve(strict=False)
+    try:
+        capture.relative_to(quarantine_root)
+    except ValueError as exc:
+        raise ValueError("review destination escaped its quarantine root") from exc
+    for forbidden in forbidden_roots:
+        try:
+            capture.relative_to(forbidden)
+        except ValueError:
+            continue
+        raise ValueError("review destination must be outside the media library")
+
+    return capture
+
 @contextlib.contextmanager
 def season_dir_lock(target_dir: Path, what: str = "rename"):
-    """Cross-process exclusive flock on <season_dir>/.burndvd.lock. Serializes
-    the rename DECISION across parallel ripqueue processes targeting the same
-    season. Without it, two rips (e.g. S6D1 on drive A, S6D2 on drive B, both
-    finishing makemkvcon around the same time) can both fs-scan an empty
-    season dir, both compute start_ep=1, and silently overwrite each other's
-    SxxEyy files when their async NAS transfers race.
+    """Host-local cross-process lock for one logical NAS season directory.
 
-    Held only during the FAST decision phase (starting_ep + collision scan +
-    placeholder creation), NOT during makemkvcon read or actual NAS transfers.
-    Subsequent rips see the 0-byte placeholder files in their dir scan and
-    pick the next free episode number; the real moves overwrite the
-    placeholders later (move_with_progress unlinks 0-byte dst pre-move).
-
-    Different seasons (different target_dir) use different lock files and
-    don't contend, so cross-season parallelism is unaffected. The lock file
-    is a hidden flag file inside the season dir; Plex/Jellyfin ignore
-    dotfiles."""
-    target_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = target_dir / ".burndvd.lock"
-    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    The SMB and NFS paths are two views of the same NAS data, but neither is a
+    reliable place for ``flock`` (NFS returns ENOTSUP, and cross-protocol locks
+    are not coherent).  All optical ripping runs on this host, so a local lock
+    is the authoritative coordinator.  Both mount prefixes deliberately hash
+    to the same key.  The lock covers only the fast decide-and-claim phase;
+    hidden per-episode claims protect the later transfer.
+    """
+    lock_path = season_lock_path(target_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(
+        str(lock_path), os.O_RDWR | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
     try:
-        # Blocking acquire — same-season parallel rips genuinely need to
-        # serialize here. In practice the held duration is sub-second
-        # (fs scan + placeholder touches), so callers don't notice.
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(f"invalid season lock file: {lock_path}")
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -1163,11 +2121,29 @@ def season_dir_lock(target_dir: Path, what: str = "rename"):
         try: os.close(fd)
         except Exception: pass
 
+
+def season_lock_path(target_dir: Path) -> Path:
+    """Return one local lock key for equivalent SMB and NFS NAS paths."""
+
+    normalized = os.path.normpath(os.fspath(target_dir))
+    for prefix in ("/Volumes/Media", "/private/nas/media"):
+        if normalized == prefix or normalized.startswith(prefix + os.sep):
+            relative = os.path.relpath(normalized, prefix)
+            normalized = "media-nas/" + relative
+            break
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return LOCAL_LOCK_BASE / f"season-{digest}.lock"
+
 # -------- episode counter (overwrite-safe) --------
 def ep_key(item: QueueItem) -> str:
     return f"{item.title}||S{item.season:02d}"
 
 def starting_ep(item: QueueItem, disc_n: int, state: dict) -> int:
+    # Contracted single-disc wrapper rows carry the physical disc's canonical
+    # episode start.  Never replace that explicit identity with highest+1: that
+    # was the direct cause of complete-season re-rips becoming E11, E12, ... .
+    if item.type == "tv-season" and item.expected_disc_episodes > 0:
+        return item.episode_start
     counts = state.get("disc_episode_counts", {}).get(ep_key(item), {})
     prior = sum(int(v) for k, v in counts.items() if int(k) < disc_n)
     state_based = item.episode_start + prior
@@ -1185,10 +2161,9 @@ def starting_ep(item: QueueItem, disc_n: int, state: dict) -> int:
                 for entry in season_dir.iterdir():
                     if entry.suffix.lower() != ".mkv":
                         continue
-                    # Ignore 0-byte files: these are slot-claim placeholders
-                    # (season_dir_lock) or orphans left by an aborted/rolled-
-                    # back move. Counting them would compute the wrong next
-                    # episode number on a re-rip (DBZ S6, 2026-07-07).
+                    # Ignore zero-byte media files left by legacy reservations
+                    # or aborted old releases. Current TV claims use separate
+                    # hidden .burndvd-claim paths and are scanned explicitly.
                     try:
                         if entry.stat().st_size == 0:
                             continue
@@ -1205,6 +2180,202 @@ def starting_ep(item: QueueItem, disc_n: int, state: dict) -> int:
 
 def record_episode_count(item: QueueItem, disc_n: int, count: int, state: dict):
     state.setdefault("disc_episode_counts", {}).setdefault(ep_key(item), {})[str(disc_n)] = int(count)
+
+# -------- play-all-only discs --------
+# Some box sets author exactly ONE playlist for the whole side: the disc offers
+# a single 2h45m title and no per-episode titles at all. This is not MakeMKV
+# filtering — `--minlength=0` reports the same one title — so no selector or
+# setting can recover the episodes (Viz's Naruto HD sets, 2026-08-08). The
+# play_all_title_ids heuristic can't help either: it needs >= 2 other
+# episode-length titles to compare against, and here there are none.
+#
+# The boundaries aren't lost though. These discs carry chapter marks at a fixed
+# count per episode, so the blob can be cut back into episodes exactly. Doing it
+# HERE — in staging, before naming — means the rest of the pipeline (episode
+# numbering, collision claim, NAS move, subocr) sees N real episodes rather than
+# one blob, and no downstream code needs to know this happened.
+#
+# Deliberately conservative, because a false positive shreds a legitimate rip:
+# fires only on a lone staged title long enough to be a compilation, only when
+# some chapter stride divides the marks into equal-length parts of plausible
+# episode runtime, and only after every cut is re-probed. Anything ambiguous is
+# left exactly as it was.
+PLAYALL_MIN_TOTAL_S = 70 * 60     # below this, one title is just an episode
+PLAYALL_EP_MIN_S = 15 * 60        # a cut shorter than this isn't an episode
+PLAYALL_EP_MAX_S = 45 * 60        # ...nor is one longer than this
+PLAYALL_SPREAD_TOL_S = 300.0      # real discs carry longer episodes: set 1
+                                  # disc 4 runs five at 23.5m and one at 26.3m
+                                  # (a longer cold open), a 179.8s spread that
+                                  # a 180s tolerance passed by two-tenths
+PLAYALL_MAX_STRIDE = 12
+PLAYALL_MIN_SHAPE_RATIO = 2.0     # uneven chapters within an episode; see below
+
+def _ff(tool: str) -> str:
+    """Absolute path to ffmpeg/ffprobe. burndvd gets launched from shells whose
+    PATH may not carry Homebrew, and a bare-name miss here would surface as
+    'this disc has no chapters' rather than as an error."""
+    return shutil.which(tool) or f"/opt/homebrew/bin/{tool}"
+
+def chapter_marks_s(path: str) -> list[float]:
+    """Chapter start times in seconds. Note -of json: the csv writer silently
+    emits nothing for chapter sections, which reads as 'disc has no chapters'."""
+    try:
+        r = subprocess.run(
+            [_ff("ffprobe"), "-v", "error", "-show_chapters", "-of", "json", str(path)],
+            capture_output=True, text=True, timeout=120)
+        return [float(c["start_time"])
+                for c in json.loads(r.stdout or "{}").get("chapters", [])]
+    except Exception:
+        return []
+
+def _intra_episode_shape_ratio(marks: list[float], stride: int) -> float:
+    """Median within-episode max/min chapter-gap ratio.
+
+    This is what separates a play-all from one long programme that merely has
+    chapters. A play-all's chapters describe an episode's internal structure and
+    are wildly uneven — Naruto runs OP 1.9m, A-part 8.6m, eyecatch 11.1m,
+    B-part 1.5m, ED 0.5m — and that shape repeats every stride. A single feature
+    or special chaptered mechanically every five minutes is flat instead, and
+    would otherwise sail through the equal-length gate and be shredded into
+    "episodes". Flat shape (ratio near 1) means don't touch it."""
+    ratios = []
+    for e in range(0, len(marks) - stride, stride):
+        gaps = [marks[e + i + 1] - marks[e + i] for i in range(stride)]
+        gaps = [g for g in gaps if g > 0]
+        if len(gaps) >= 2:
+            ratios.append(max(gaps) / min(gaps))
+    if not ratios:
+        return 0.0
+    ratios.sort()
+    return ratios[len(ratios) // 2]
+
+def _playall_plan(marks: list[float], total: float):
+    """Best (stride, edges) that cuts `marks` into equal, episode-length parts,
+    or None. Every stride dividing the marks evenly is scored and the most
+    uniform wins; the runtime, spread and shape gates reject the rest. On the
+    Naruto discs (36 marks) stride 5 gives 7 x 23.6min and stride 7 gives 5
+    parts ranging 25-43min — the spread gate is what tells those two apart."""
+    best = None
+    for stride in range(2, PLAYALL_MAX_STRIDE + 1):
+        # Discs disagree on whether a mark is placed at the very end: Naruto
+        # sets 1-3 give 7x5+1 = 36 marks, set 1 disc 4 gives 6x5 = 30 with no
+        # terminal mark. Accept either shape rather than assuming one — the
+        # first cut of this required (len-1) % stride == 0 and would have
+        # silently refused to split disc 4.
+        if (len(marks) - 1) % stride and len(marks) % stride:
+            continue
+        if _intra_episode_shape_ratio(marks, stride) < PLAYALL_MIN_SHAPE_RATIO:
+            continue
+        edges = [marks[i] for i in range(0, len(marks), stride)]
+        # Whatever runs past the last edge is its own episode if it's long
+        # enough to be one; otherwise that mark is a tail card sitting inside
+        # the final episode, which simply runs to the end.
+        if total - edges[-1] >= PLAYALL_EP_MIN_S:
+            edges.append(total)
+        else:
+            edges[-1] = total
+        lens = [edges[i + 1] - edges[i] for i in range(len(edges) - 1)]
+        if len(lens) < 2:
+            continue
+        if min(lens) < PLAYALL_EP_MIN_S or max(lens) > PLAYALL_EP_MAX_S:
+            continue
+        spread = max(lens) - min(lens)
+        if spread > PLAYALL_SPREAD_TOL_S:
+            continue
+        if best is None or spread < best[0]:
+            best = (spread, stride, edges, lens)
+    return best
+
+def split_chaptered_playall(args, rips: list, staging: Path) -> list:
+    """Expand a lone chaptered play-all title into its episodes, in staging.
+    Returns the new list of staged episode files, or `rips` untouched if this
+    disc isn't one of these."""
+    if getattr(args, "no_split_playall", False) or not rips:
+        return rips
+    # Not "the disc has exactly one title" — set 1 disc 4 shipped the play-all
+    # alongside a 12m41s bonus feature, and requiring a lone title meant the
+    # blob went through whole AND the bonus got numbered as an episode. What
+    # matters is that exactly one title is long enough to be a compilation;
+    # anything else on the disc rides through untouched and is classified
+    # normally below.
+    longs = [p for p in rips if ffprobe_dur_s(str(p)) >= PLAYALL_MIN_TOTAL_S]
+    if len(longs) != 1:
+        return rips
+    src = longs[0]
+    # SPLIT ONLY WHEN THE PLAY-ALL IS THE *ONLY* ROUTE TO EPISODES (2026-08-20).
+    #
+    # The `len(longs) != 1` test above asks "is exactly one title compilation-length", which
+    # says nothing about whether the disc ALSO shipped the episodes as standalone titles. When
+    # it does, this function used to carve a second, redundant copy of every episode out of the
+    # blob and hand both sets downstream to be numbered.
+    #
+    # Silicon Valley S3, 2026-08-20: disc 1 had five real 28-minute titles AND a play-all.
+    # Result was E01-E05 from the real titles and E06-E10 from `A6_t05_split_t900..904` -- the
+    # same five episodes again, cut at chapter strides that do not align with the episode
+    # starts. Disc 2 repeated it as E11-E20. A ten-episode season landed as twenty files, every
+    # episode duplicated, and the duplicates looked plausible because their RUNTIMES matched.
+    #
+    # The earlier comment above is still right about why "exactly one title on the disc" was too
+    # strict (set 1 disc 4 shipped the play-all beside a 12m41s bonus). The correct test is
+    # narrower than either: split only when the disc does not already yield episodes on its own.
+    # A lone bonus feature does not clear TV_MIN_DUR_S, so that disc still splits as intended.
+    others = [q for q in rips if q is not src and ffprobe_dur_s(str(q)) >= TV_MIN_DUR_S]
+    if len(others) >= PLAY_ALL_MIN_PARTS:
+        print(f"{C.YLW}  Play-all present, but the disc already carries {len(others)} "
+              f"episode-length titles — leaving the blob whole (it is excluded from "
+              f"numbering by the play-all detector, not split).{C.R}", flush=True)
+        return rips
+    total = ffprobe_dur_s(str(src))
+    marks = chapter_marks_s(str(src))
+    if len(marks) < 3:
+        print(f"{C.YLW}  Single {fmt_dur(total)} title with no chapter marks — "
+              f"leaving as one file.{C.R}", flush=True)
+        return rips
+    plan = _playall_plan(marks, total)
+    if plan is None:
+        print(f"{C.YLW}  Single {fmt_dur(total)} title, {len(marks)} chapters, but no "
+              f"stride cuts it into even episodes — leaving as one file.{C.R}", flush=True)
+        return rips
+    spread, stride, edges, lens = plan
+    n = len(lens)
+    print(f"{C.B}  Play-all detected: {fmt_dur(total)}, {len(marks)} chapters → "
+          f"{n} episodes at every {stride}th mark "
+          f"(lengths {min(lens)/60:.1f}–{max(lens)/60:.1f}m).{C.R}", flush=True)
+
+    out: list[Path] = []
+    for i in range(n):
+        # Synthetic title ids, not bare names: downstream code keys on the
+        # _tNN suffix, and episode_bonus_split sorts those ids — a part with no
+        # id yields None and sorted([None, 4]) is a TypeError. 900+ is clear of
+        # any real MakeMKV title index.
+        dst = staging / f"{src.stem}_split_t{900+i:03d}.mkv"
+        cmd = [_ff("ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+               "-ss", f"{edges[i]:.3f}", "-i", str(src), "-t", f"{lens[i]:.3f}",
+               "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
+               "-f", "matroska", str(dst)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        got = ffprobe_dur_s(str(dst)) if dst.exists() else 0.0
+        if r.returncode != 0 or abs(got - lens[i]) > 2.0:
+            # Any bad cut aborts the whole split: drop the partials and hand
+            # back the untouched blob, which is still a complete rip.
+            for p in out + [dst]:
+                try: p.unlink()
+                except OSError: pass
+            print(f"{C.RED}  Split failed on part {i+1} "
+                  f"({r.stderr.strip()[:200] or f'{got:.1f}s != {lens[i]:.1f}s'}) — "
+                  f"keeping the single file.{C.R}", flush=True)
+            append_log(args, f"PLAYALL_SPLIT_FAIL {src.name} part {i+1}")
+            return rips
+        out.append(dst)
+        print(f"{C.D}    part {i+1}/{n}  {got/60:5.2f}m  "
+              f"{dst.stat().st_size/2**30:.2f} GB{C.R}", flush=True)
+
+    # The blob stays in staging but drops out of the returned list, so it is
+    # neither numbered nor moved; staging cleanup discards it once the episodes
+    # have landed, and a failed move preserves staging with it still intact.
+    # Any other titles on the disc keep their original position in the list.
+    append_log(args, f"PLAYALL_SPLIT {src.name} → {n} episodes at stride {stride}")
+    return [q for p in rips for q in (out if p == src else [p])]
 
 # -------- ripping --------
 def _staging_write_age(staging: Path) -> float:
@@ -1350,10 +2521,34 @@ def _salvage_and_fail(args, item: QueueItem, info: dict, disc_n: int,
         shutil.rmtree(staging, ignore_errors=True)
         return False, f"{reason} (no complete titles to salvage)"
 
-    partial_dir = target_dir / "_partial"
+    # Every TV failure artifact is review evidence, even if the optical read
+    # began in normal mode.  Keep it out of Jellyfin unconditionally; this
+    # also closes the race where another process occupies the range while a
+    # recognized read subsequently fails before its post-rip mode recheck.
+    if item.type == "tv-season":
+        if str(target_dir).startswith("/Volumes/Media/"):
+            target_dir = Path(str(target_dir).replace(
+                "/Volumes/Media/", "/private/nas/media/", 1
+            ))
+        try:
+            partial_dir = tv_review_capture_dir(
+                item,
+                target_dir,
+                getattr(args, "current_disc_fingerprint", ""),
+                getattr(args, "review_root", None),
+            )
+            partial_dir = protected_quarantine_child(partial_dir, "_partial")
+        except ValueError as exc:
+            return False, (
+                f"{reason}; cannot isolate partial review output ({exc}) — "
+                f"staging PRESERVED at {staging}"
+            )
+    else:
+        partial_dir = target_dir / "_partial"
     saved_names = []
     try:
         partial_dir.mkdir(parents=True, exist_ok=True)
+        planned = []
         for p in complete:
             tnum = title_num_from_filename(p.name)
             tag = f"t{tnum:02d}" if tnum is not None else p.stem
@@ -1364,12 +2559,20 @@ def _salvage_and_fail(args, item: QueueItem, info: dict, disc_n: int,
                 name = (f"{sanitize(item.title)} - "
                         f"S{item.season:02d}D{disc_n} - {tag}.mkv")
             dest = partial_dir / name
-            if dest.exists() and dest.stat().st_size > 0 and not args.overwrite:
-                print(f"{C.YLW}  salvage: {dest.name} already present — skipping{C.R}")
-                try: p.unlink()
-                except OSError: pass
-                continue
-            move_with_progress(p, dest, label=f"salvaging {tag}")
+            allow_overwrite = bool(args.overwrite and item.type == "movie")
+            require_free_extra_destination(p, dest, allow_overwrite)
+            planned.append((p, dest, tag))
+        for p, dest, tag in planned:
+            if item.type == "tv-season":
+                move_with_progress_noclobber(
+                    p, dest, label=f"salvaging {tag}",
+                    partial_root=tv_partial_capture_root(
+                        item, target_dir, getattr(args, "review_root", None)
+                    ),
+                    lock_dir=target_dir,
+                )
+            else:
+                move_with_progress(p, dest, label=f"salvaging {tag}")
             saved_names.append(dest.name)
     except OSError as e:
         # Quarantine itself failed (mount drop): keep staging so nothing is lost.
@@ -1390,37 +2593,50 @@ def _salvage_and_fail(args, item: QueueItem, info: dict, disc_n: int,
 
 def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         target_dir: Path, state: dict, disc_n: int):
-    target_dir.mkdir(parents=True, exist_ok=True)
+    # Keep the TV no-overwrite invariant local to the destructive boundary as
+    # well as main()'s CLI policy check.  Tests and future callers must not be
+    # able to bypass it by invoking rip() directly.
+    if item.type == "tv-season" and getattr(args, "overwrite", False):
+        return False, "--overwrite is forbidden for TV in every mode"
 
     # Pre-check final filename collisions
     if item.type == "movie":
+        target_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = target_dir
         final_target = target_dir / movie_filename(item, disc_n)
         if final_target.exists() and not args.overwrite:
             return False, f"target file exists: {final_target} (use --overwrite)"
     else:
-        # Multi-disc seasons share one Season dir, so prior discs' episodes
-        # are expected here. Only block on files at or above this disc's start.
-        # Briefly hold the season lock so this scan + start_ep computation
-        # is consistent w.r.t. parallel rips of the same season (otherwise
-        # another rip could be mid-claim and we'd miss its slots).
-        with season_dir_lock(target_dir, what="precheck"):
-            start_ep = starting_ep(item, disc_n, state)
-            title_prefix = f"{sanitize(item.title)} - S{item.season:02d}E"
-            colliding = []
-            for p in target_dir.iterdir():
-                if p.suffix.lower() != ".mkv" or not p.name.startswith(title_prefix):
-                    continue
-                m = re.match(r"(\d{2})\.mkv$", p.name[len(title_prefix):])
-                if m and int(m.group(1)) >= start_ep:
-                    colliding.append(p.name)
-            if colliding and not args.overwrite:
-                shown = ", ".join(sorted(colliding)[:3])
-                more = f" (+{len(colliding) - 3} more)" if len(colliding) > 3 else ""
-                return False, (f"target {target_dir} has existing .mkv at or above "
-                               f"S{item.season:02d}E{start_ep:02d}: {shown}{more} "
-                               f"(use --overwrite)")
+        if getattr(args, "rerip_review", False):
+            contract_error = apply_tv_output_mode(
+                args, item, target_dir, "backend preflight"
+            )
+        else:
+            # Lock the authoritative inventory check.  A recognized smart
+            # run can turn an occupied range into isolated review output;
+            # manual/unrecognized queues keep the ordinary refusal.
+            with season_dir_lock(target_dir, what="precheck"):
+                contract_error = apply_tv_output_mode(
+                    args, item, target_dir, "backend preflight"
+                )
+        if contract_error:
+            return False, contract_error
 
-    free_gb = _free_gb(target_dir)
+        if getattr(args, "rerip_review", False):
+            try:
+                output_dir = tv_review_capture_dir(
+                    item,
+                    target_dir,
+                    getattr(args, "current_disc_fingerprint", ""),
+                    getattr(args, "review_root", None),
+                )
+            except ValueError as exc:
+                return False, str(exc)
+        else:
+            output_dir = target_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    free_gb = _free_gb(output_dir)
     if free_gb < args.min_free_gb:
         return False, f"low disk space at target: {free_gb:.1f}GB free, need {args.min_free_gb}GB"
 
@@ -1627,21 +2843,72 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         shutil.rmtree(staging, ignore_errors=True)
         return False, "no .mkv files in staging despite save-summary success"
 
+    # A same-season job can claim the authoritative range during the optical
+    # read.  Recheck before planning *any* library move so a recognized smart
+    # run still converts that late race into quarantined review output.
+    if item.type == "tv-season" and not getattr(args, "rerip_review", False):
+        with season_dir_lock(target_dir, what="post-rip output decision"):
+            contract_error = apply_tv_output_mode(
+                args, item, target_dir, "post-rip output decision"
+            )
+        if contract_error:
+            return False, f"{contract_error}; RIP PRESERVED at {staging}"
+        if getattr(args, "rerip_review", False):
+            try:
+                output_dir = tv_review_capture_dir(
+                    item,
+                    target_dir,
+                    getattr(args, "current_disc_fingerprint", ""),
+                    getattr(args, "review_root", None),
+                )
+            except ValueError as exc:
+                return False, f"{exc}; RIP PRESERVED at {staging}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
     # Deferred NAS moves: collect (src, dst, label) jobs instead of copying
     # inline, so the caller can eject + free the drive the moment staging is
     # done and run the SMB copy in the background. --sync-move copies inline
     # (legacy: drive held until the copy finishes).
     move_jobs: list = []
-    def _emit_move(src: Path, dst: Path, label: str):
+    def _emit_move(src: Path, dst: Path, label: str, *,
+                   placeholder_identity: tuple[int, int] | None = None,
+                   claim_path: Path | None = None,
+                   publish_lock_held: bool = False):
+        protected = item.type == "tv-season"
+        protected_lock_dir = dst.parent if protected else None
         if getattr(args, "sync_move", False):
-            move_with_progress(src, dst, label=label)
+            if protected:
+                move_with_progress_noclobber(
+                    src, dst, label=label,
+                    placeholder_identity=placeholder_identity,
+                    claim_path=claim_path,
+                    partial_root=protected_partial_root,
+                    lock_dir=protected_lock_dir,
+                    publish_lock_held=publish_lock_held,
+                )
+            else:
+                move_with_progress(src, dst, label=label)
         else:
-            move_jobs.append((src, dst, label))
+            move_jobs.append(
+                (src, dst, label, protected, placeholder_identity, claim_path,
+                 protected_partial_root, protected_lock_dir)
+            )
 
+    _dur_cache: dict = {}
     def _src_dur_s(src: Path) -> int:
         tnum = title_num_from_filename(src.name)
-        if tnum is None: return 0
-        return parse_duration(info["titles"].get(tnum, {}).get(9, "0:00:00"))
+        if tnum is not None:
+            d = parse_duration(info["titles"].get(tnum, {}).get(9, "0:00:00"))
+            if d:
+                return d
+        # Files that did not exist when the disc was probed -- the parts a
+        # play-all split produces -- have no entry in info["titles"]. Returning
+        # 0 for them classified seven real 23-minute episodes as extras and
+        # left the season empty (set 2 disc 1, 2026-08-09), so read the file.
+        key = str(src)
+        if key not in _dur_cache:
+            _dur_cache[key] = int(ffprobe_dur_s(key))
+        return _dur_cache[key]
 
     def _move_extras(extra_srcs: list, extras_dir: Path, name_for):
         """Route short titles to Extras/. name_for(src, tnum) → final filename."""
@@ -1650,11 +2917,14 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         for src in extra_srcs:
             tnum = title_num_from_filename(src.name)
             dest = extras_dir / name_for(src, tnum)
-            if dest.exists() and not args.overwrite:
-                print(f"{C.YLW}  extras: skip {dest.name} (exists){C.R}")
-                try: src.unlink()
-                except OSError: pass
-                continue
+            try:
+                require_free_extra_destination(
+                    src, dest, bool(args.overwrite and item.type == "movie")
+                )
+            except FileExistsError:
+                print(f"{C.YLW}  extras collision: {dest.name} exists; "
+                      f"staging PRESERVED at {staging}.{C.R}")
+                raise
             _emit_move(src, dest, f"moving extra t{tnum:02d}" if tnum is not None else "moving extra")
             finals.append(str(dest))
         print(f"{C.GRN}  {len(extra_srcs)} extra(s) -> {extras_dir}{C.R}")
@@ -1666,26 +2936,89 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
     # recover), and on persistent failure PRESERVE staging and bail cleanly.
     def _dest_writable() -> bool:
         try:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            probe = target_dir / f".writeprobe-{os.getpid()}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            probe = output_dir / f".writeprobe-{os.getpid()}"
             probe.write_text("ok"); probe.unlink()
             return True
         except OSError:
             return False
 
     if not _dest_writable():
+        # The primary target is a manually-mounted SMB share that does NOT
+        # auto-reconnect, so passively waiting can never recover it. Fall back
+        # to the NFS mount of the same NAS dir (self-healing, no creds) if SMB
+        # stays down — files land in the identical location.
+        _nfs_dir = Path(str(output_dir).replace("/Volumes/Media/",
+                                                 "/private/nas/media/"))
+        def _nfs_writable() -> bool:
+            if "/private/nas/media/" not in str(_nfs_dir):
+                return False
+            try:
+                _nfs_dir.mkdir(parents=True, exist_ok=True)
+                _pr = _nfs_dir / f".writeprobe-{os.getpid()}"
+                _pr.write_text("ok"); _pr.unlink()
+                return True
+            except OSError:
+                return False
+        _recovered = False
         for attempt in range(1, 13):  # ~10 min of retries
-            print(f"{C.YLW}  Target {target_dir} not writable "
-                  f"(attempt {attempt}/12) — mount may be reconnecting; "
-                  f"retrying in 50s. Staged rip is safe at {staging}.{C.R}")
+            if _nfs_writable():
+                print(f"{C.GRN}  SMB target unwritable; routing this transfer "
+                      f"through the NFS mount of the same NAS dir "
+                      f"({_nfs_dir}).{C.R}")
+                output_dir = _nfs_dir
+                if not (item.type == "tv-season"
+                        and getattr(args, "rerip_review", False)):
+                    target_dir = output_dir
+                _recovered = True
+                break
+            print(f"{C.YLW}  Target {output_dir} not writable "
+                  f"(attempt {attempt}/12) — SMB reconnecting and NFS also "
+                  f"down; retrying in 50s. Staged rip is safe at {staging}.{C.R}")
             time.sleep(50)
             if _dest_writable():
                 print(f"{C.GRN}  Target writable again; continuing move.{C.R}")
+                _recovered = True
                 break
-        else:
-            return False, (f"target not writable after retries — RIP PRESERVED at "
-                           f"{staging}; fix the mount and re-run to finish "
-                           f"(staging was NOT deleted)")
+        if not _recovered:
+            return False, (f"target not writable after retries (SMB+NFS both "
+                           f"down) — RIP PRESERVED at {staging}; fix the mount "
+                           f"and re-run (staging was NOT deleted)")
+
+    # SMB cannot provide atomic hard-link/no-replace publication.  The NFS
+    # view is the same NAS storage and does support atomic link(2), so every TV
+    # transfer uses it even when the interactive path came from /Volumes/Media.
+    # If that safe backend is unavailable, preserve staging and fail closed.
+    if item.type == "tv-season" and str(output_dir).startswith("/Volumes/Media/"):
+        nfs_output = Path(str(output_dir).replace(
+            "/Volumes/Media/", "/private/nas/media/", 1
+        ))
+        nfs_target = Path(str(target_dir).replace(
+            "/Volumes/Media/", "/private/nas/media/", 1
+        ))
+        if not _dir_writable(nfs_output) or not _dir_writable(nfs_target):
+            return False, (
+                "atomic TV publication backend (NFS) is unavailable; RIP "
+                f"PRESERVED at {staging}"
+            )
+        output_dir = nfs_output
+        target_dir = nfs_target
+        print(f"{C.D}  TV publication routed through atomic NFS view: "
+              f"{output_dir}{C.R}")
+
+    protected_partial_root = None
+    if item.type == "tv-season":
+        try:
+            if getattr(args, "rerip_review", False):
+                protected_partial_root = tv_partial_capture_root(
+                    item, target_dir, getattr(args, "review_root", None)
+                )
+            else:
+                protected_partial_root = tv_partial_capture_root(
+                    item, target_dir, getattr(args, "review_root", None)
+                )
+        except ValueError as exc:
+            return False, f"{exc}; RIP PRESERVED at {staging}"
 
     finals: list[str] = []
     if item.type == "movie":
@@ -1709,6 +3042,15 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                               f"{('t%02d' % tnum) if tnum is not None else src.stem}.mkv",
         )
     else:
+        _review_dir = (output_dir
+                       if getattr(args, "rerip_review", False) else None)
+        # A play-all-only disc arrives as one long chaptered title; cut it into
+        # episodes FIRST, so everything below — the extras partition, the
+        # relative-duration bonus gate, numbering, the NAS move — sees real
+        # episodes. Running it later meant set 1 disc 4's 12m41s bonus feature
+        # was measured against a 2h23m blob instead of six 23m episodes, so the
+        # bonus gate kept it and numbered it E23. No-op for every other disc.
+        rips = split_chaptered_playall(args, rips, staging)
         # Partition: episodes are >= TV_MIN_DUR_S; everything else is an extra.
         # A play-all title clears the episode floor (it's the longest title on
         # the disc), so duration alone would number it as a phantom episode and
@@ -1720,6 +3062,25 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                         if _src_dur_s(p) >= TV_MIN_DUR_S
                         and title_num_from_filename(p.name) not in play_all]
         extras_rips  = [p for p in rips if _src_dur_s(p) <  TV_MIN_DUR_S]
+        # Relative-duration gate: an "episode" that clears the absolute TV
+        # floor but runs far shorter than the disc's median episode is bonus
+        # content (e.g. a 14-min featurette among 44-min episodes). Move it
+        # into extras so it is SAVED as an extra, not numbered as a phantom
+        # episode (which also shoved the next disc's episode-start up). The
+        # play-all salvage below then runs on the cleaned episode list.
+        _gcand = [(title_num_from_filename(pp.name), _src_dur_s(pp)) for pp in episode_rips]
+        _gkeep, _gbonus, _gthr = episode_bonus_split(_gcand)
+        if _gbonus:
+            _gbonus_set = set(_gbonus)
+            _gdemoted = [pp for pp in episode_rips
+                         if title_num_from_filename(pp.name) in _gbonus_set]
+            episode_rips = [pp for pp in episode_rips
+                            if title_num_from_filename(pp.name) not in _gbonus_set]
+            extras_rips = extras_rips + _gdemoted
+            for _dp in _gdemoted:
+                print(f"{C.YLW}  demote t{title_num_from_filename(_dp.name):02d} "
+                      f"({fmt_dur(_src_dur_s(_dp))}) -> Extras: short vs disc median "
+                      f"{fmt_dur(int(_gthr))} (bonus, not an episode).{C.R}")
 
         # Empirical play-all verification (2026-07-10 DBZ S7D4 incident).
         # play_all_title_ids() is a cheap DURATION test: a title whose runtime
@@ -1777,7 +3138,9 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                 # finals[] tracking as ordinary extras. Distinct name marks it
                 # as an un-verified-away play-all bonus for later human review.
                 _move_extras(
-                    salvaged_playall, target_dir / "extras",
+                    salvaged_playall,
+                    (_review_dir if _review_dir is not None
+                     else target_dir / "extras"),
                     lambda src, tnum: f"{sanitize(item.title)} - {disc_lbl} bonus "
                                       f"t{tnum:02d} (unverified play-all flag).mkv",
                 )
@@ -1796,12 +3159,109 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         # cost (one stray Jellyfin entry); rely on the per-title MakeMKV
         # selector for TV box sets.
 
-        _move_extras(
-            extras_rips,
-            target_dir / "Extras",
-            lambda src, tnum: f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - extra - "
-                              f"{('t%02d' % tnum) if tnum is not None else src.stem}.mkv",
-        )
+        if getattr(args, "rerip_review", False):
+            assert _review_dir is not None
+            _move_extras(
+                extras_rips, _review_dir,
+                lambda src, tnum: (
+                    f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
+                    f"review-extra-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
+                ),
+            )
+        else:
+            _move_extras(
+                extras_rips,
+                target_dir / "Extras",
+                lambda src, tnum: f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - extra - "
+                                  f"{('t%02d' % tnum) if tnum is not None else src.stem}.mkv",
+            )
+        # Alternate-playlist dedup: keep the lowest-numbered title of each
+        # duplicate set, drop the rest so they never promote as phantom
+        # duplicate episodes. Content-verified (see _alt_playlist_duplicate).
+        if len(episode_rips) > 1:
+            _by_tid = sorted(episode_rips,
+                             key=lambda pp: title_num_from_filename(pp.name) or 0)
+            _kept, _dups = [], []
+            for _p in _by_tid:
+                _pd = _src_dur_s(_p)
+                _orig = next((k for k in _kept
+                              if abs(_src_dur_s(k) - _pd) <= ALT_DEDUP_DUR_TOL_S
+                              and _alt_playlist_duplicate(str(k), str(_p), _pd)),
+                             None)
+                if _orig is not None:
+                    _dups.append((_p, _orig))
+                else:
+                    _kept.append(_p)
+            for _p, _orig in _dups:
+                print(f"{C.YLW}  dedup: t{title_num_from_filename(_p.name):02d} is an "
+                      f"alternate playlist of t{title_num_from_filename(_orig.name):02d} "
+                      f"(frames match) - dropping from episodes.{C.R}")
+                append_log(args, f"ALTDUP {item.title} S{item.season:02d}D{disc_n} "
+                                 f"t{title_num_from_filename(_p.name):02d} == "
+                                 f"t{title_num_from_filename(_orig.name):02d} (dropped)")
+            episode_rips = _kept
+        if getattr(args, "rerip_review", False):
+            _move_extras(
+                episode_rips, _review_dir,
+                lambda src, tnum: (
+                    f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
+                    f"review-title-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
+                ),
+            )
+            episode_rips = []
+        else:
+            expected = item.expected_disc_episodes
+            if item.expected_title_ids:
+                selected, overflow, missing_ids = partition_episode_contract(
+                    episode_rips, item
+                )
+                if missing_ids:
+                    return False, (
+                        f"physical disc is missing contracted title ids {missing_ids}; "
+                        f"RIP PRESERVED at {staging}"
+                    )
+                if overflow:
+                    _move_extras(
+                        overflow, target_dir / "Extras",
+                        lambda src, tnum: (
+                            f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
+                            f"contract-extra-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
+                        ),
+                    )
+                episode_rips = selected
+            elif len(episode_rips) < expected:
+                return False, (
+                    f"physical disc yielded {len(episode_rips)} episode candidate(s), "
+                    f"but its contract requires {expected}; RIP PRESERVED at {staging}"
+                )
+            elif len(episode_rips) > expected:
+                overflow = episode_rips[expected:]
+                _move_extras(
+                    overflow, target_dir / "Extras",
+                    lambda src, tnum: (
+                        f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
+                        f"contract-overflow-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
+                    ),
+                )
+                episode_rips = episode_rips[:expected]
+
+            # Old runs predate the durable disc ledger. Compare decoded frames
+            # against every same-duration landed episode before publishing.
+            existing = existing_episode_slots(item, target_dir)
+            for candidate in episode_rips:
+                duplicate, identity_error = existing_content_collision(
+                    candidate, float(_src_dur_s(candidate)), existing
+                )
+                if identity_error:
+                    return False, (
+                        f"content identity check failed closed: {identity_error}; "
+                        f"RIP PRESERVED at {staging}"
+                    )
+                if duplicate is not None:
+                    return False, (
+                        f"decoded content duplicates existing episode {duplicate}; "
+                        f"refusing publication; RIP PRESERVED at {staging}"
+                    )
         rips = episode_rips
         if not rips:
             print(f"{C.YLW}  No titles >= {TV_MIN_DUR_S}s — extras-only disc.{C.R}")
@@ -1833,72 +3293,83 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
             accept = ans in ("", "y", "yes")
 
             if accept:
-                # Two-pass under the lock: (1) collision check + atomic slot
+                # Two-pass under the lock: (1) collision check + atomic hidden
                 # claim for every proposed episode, (2) enqueue the moves.
-                # Splitting it lets us roll back the placeholders cleanly if
-                # any slot is already taken — without this, a mid-loop
-                # FileExistsError leaves orphan 0-byte placeholders that
-                # would pollute the season dir and confuse the next rip's
-                # filesystem scan.
+                # Splitting it lets us roll back the claims cleanly if any slot
+                # is already taken, without ever exposing a partial .mkv.
                 planned = [
                     (src, ep,
                      target_dir / f"{sanitize(item.title)} - S{item.season:02d}E{ep:02d}.mkv")
                     for src, ep, _, _, _ in proposed
                 ]
                 for src, ep, final in planned:
-                    if final.exists() and final.stat().st_size > 0 and not args.overwrite:
+                    try:
+                        os.lstat(final)
+                    except FileNotFoundError:
+                        pass
+                    else:
                         # Preserve the completed rip; a naming collision must
                         # never destroy staged episodes (salvage doctrine).
                         print(f"{C.YLW}  Collision: {final} exists — staging "
                               f"PRESERVED at {staging}.{C.R}")
                         return False, (f"would overwrite {final} — RIP PRESERVED "
                                        f"at {staging} (not deleted; resolve manually)")
-                claimed: list[Path] = []
                 try:
-                    for src, ep, final in planned:
-                        # Atomic slot claim: 0-byte placeholder under the
-                        # lock so a same-season parallel rip's dir scan sees
-                        # this slot as taken and skips to a higher episode
-                        # number. move_with_progress unlinks 0-byte dst
-                        # before shutil.move, so the real NAS transfer
-                        # replaces this transparently later.
-                        try:
-                            os.close(os.open(str(final),
-                                             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                                             0o644))
-                            claimed.append(final)
-                        except FileExistsError:
-                            if not args.overwrite:
-                                raise
-                            # overwrite mode: caller accepts overwriting.
-                except FileExistsError as e:
-                    # Drop our own just-created 0-byte placeholders (safe: they
-                    # are empty), but PRESERVE the completed rip in staging —
-                    # a lost slot race must not destroy ripped episodes.
-                    for c in claimed:
-                        try: c.unlink()
-                        except OSError: pass
+                    claims = _claim_tv_destinations(
+                        [final for _, _, final in planned]
+                    )
+                except OSError as e:
                     print(f"{C.YLW}  Slot race lost — staging PRESERVED at "
                           f"{staging}.{C.R}")
-                    return False, (f"slot already claimed by parallel rip: {e} — "
+                    reason = ("slot already claimed by parallel rip" if
+                              e.errno == errno.EEXIST else
+                              "could not reserve every TV slot")
+                    return False, (f"{reason}: {e} — "
                                    f"RIP PRESERVED at {staging} (resolve manually)")
-                for src, ep, final in planned:
-                    _emit_move(src, final, f"moving episode {ep:02d}")
-                    finals.append(str(final))
+                emit_error = _emit_claimed_tv_moves(
+                    planned, claims, _emit_move, finals
+                )
+                if emit_error is not None:
+                    # Synchronous mode never reaches _run_finalize. The helper
+                    # has already removed this and all later exact claim inodes.
+                    return False, (
+                        f"protected TV publication failed: {emit_error}; RIP "
+                        f"PRESERVED at {staging}"
+                    )
                 record_episode_count(item, disc_n, len(proposed), state)
             else:
+                try:
+                    manual_dir = tv_review_capture_dir(
+                        item, target_dir,
+                        getattr(args, "current_disc_fingerprint", ""),
+                        getattr(args, "review_root", None),
+                    )
+                    manual_dir = protected_quarantine_child(
+                        manual_dir, "_manual-order"
+                    )
+                    manual_dir.mkdir(parents=True, exist_ok=True)
+                except (OSError, ValueError) as exc:
+                    return False, (
+                        f"cannot isolate manual-order TV output: {exc}; RIP "
+                        f"PRESERVED at {staging}"
+                    )
                 for src, _, tnum, _, _ in proposed:
                     tag = f"t{tnum:02d}" if tnum is not None else src.stem
-                    final = target_dir / f"{sanitize(item.title)} - S{item.season:02d} - {tag}.mkv"
-                    if final.exists() and not args.overwrite:
+                    final = manual_dir / (
+                        f"{sanitize(item.title)} - S{item.season:02d} - {tag}.mkv"
+                    )
+                    if final.exists():
                         print(f"{C.YLW}  Collision: {final} exists — staging "
                               f"PRESERVED at {staging}.{C.R}")
                         return False, (f"would overwrite {final} — RIP PRESERVED "
                                        f"at {staging} (not deleted; resolve manually)")
-                    _emit_move(src, final, f"moving {tag}")
+                    _emit_move(
+                        src, final, f"moving {tag}", publish_lock_held=True
+                    )
                     finals.append(str(final))
-                print(f"{C.YLW}Files renamed to traceable form (no SxxExx).{C.R}")
-                print(f"{C.YLW}  Manual rename required before Plex/Jellyfin will index.{C.R}")
+                print(f"{C.YLW}Files isolated outside the library in traceable "
+                      f"form (no SxxExx): {manual_dir}.{C.R}")
+                print(f"{C.YLW}  Review and promote manually when order is known.{C.R}")
                 try:
                     count = auto_answer(args,
                         "How many actual episodes were on this disc? [Enter to skip]: ", "")
@@ -1960,7 +3431,7 @@ def rip_double_feature(args, item: QueueItem, info: dict, state: dict, disc_n: i
 
 def verify(paths: list[str]):
     for p in paths:
-        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", p, "-f", "null", "-"],
+        r = subprocess.run([FFMPEG_BIN, "-nostdin", "-v", "error", "-i", p, "-f", "null", "-"],
                            capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"{p}: exit {r.returncode}; {r.stderr.strip()[:240]}"
@@ -2115,6 +3586,49 @@ def _rollback_incomplete_dst(src: Path, dst: Path):
     except OSError:
         pass
 
+
+def _unpack_move_job(job):
+    """Return the current move-job shape, accepting pre-hardening triples."""
+
+    if len(job) == 3:
+        src, dst, label = job
+        return src, dst, label, False, None, None, None, None
+    if len(job) == 6:
+        src, dst, label, protected, placeholder_identity, lock_dir = job
+        return (src, dst, label, bool(protected), placeholder_identity, None,
+                None, Path(lock_dir) if lock_dir is not None else None)
+    (src, dst, label, protected, placeholder_identity, claim_path,
+     partial_root, lock_dir) = job
+    if placeholder_identity is not None:
+        placeholder_identity = tuple(placeholder_identity)
+    return (src, dst, label, bool(protected), placeholder_identity,
+            Path(claim_path) if claim_path is not None else None,
+            Path(partial_root) if partial_root is not None else None,
+            Path(lock_dir) if lock_dir is not None else None)
+
+
+def _remove_zero_placeholder(
+    dst: Path, placeholder_identity: tuple[int, int] | None
+) -> None:
+    """Remove only an unpopulated regular-file claim; never foreign bytes."""
+
+    try:
+        current = os.lstat(dst)
+        if (stat.S_ISREG(current.st_mode) and current.st_size == 0
+                and (current.st_dev, current.st_ino) == placeholder_identity):
+            dst.unlink()
+    except OSError:
+        pass
+
+
+def _remove_claimed_placeholders(
+    claimed: list[Path], identities: dict[Path, tuple[int, int]]
+) -> None:
+    """Roll back only claims whose original inode is still at the path."""
+
+    for destination in claimed:
+        _remove_zero_placeholder(destination, identities.get(destination))
+
 def _run_finalize(args, result, item, disc_n):
     """Execute the deferred NAS moves, clean staging, verify, and kick subocr.
     Runs on a worker thread after the disc is already ejected. On ANY move
@@ -2125,21 +3639,43 @@ def _run_finalize(args, result, item, disc_n):
     with _FINALIZE_LOCK:
         done = 0
         try:
-            for i, (src, dst, label) in enumerate(jobs):
+            for i, job in enumerate(jobs):
+                (src, dst, label, protected, placeholder_identity, claim_path,
+                 partial_root, lock_dir) = (
+                    _unpack_move_job(job)
+                )
                 dst = Path(dst)
                 if not _await_dir_writable(dst.parent, staging):
                     raise OSError(f"target {dst.parent} not writable after retries")
-                move_with_progress(Path(src), dst, label=label)
+                if protected:
+                    move_with_progress_noclobber(
+                        Path(src), dst, label=label,
+                        placeholder_identity=placeholder_identity,
+                        claim_path=claim_path,
+                        partial_root=partial_root,
+                        lock_dir=lock_dir,
+                    )
+                else:
+                    move_with_progress(Path(src), dst, label=label)
                 done = i + 1
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
         except BaseException as e:
-            # Roll back the failed job's partial dst + every unattempted job's
-            # 0-byte slot-claim placeholder so a re-rip numbers correctly and no
-            # half-file pollutes the season dir. jobs[:done] already completed —
-            # those are real files, leave them. Staging is PRESERVED regardless.
-            for src, dst, label in jobs[done:]:
-                _rollback_incomplete_dst(Path(src), Path(dst))
+            # Protected partial bytes live only in quarantine. Roll back every
+            # unattempted job's exact hidden slot claim; never delete a final
+            # media pathname. jobs[:done] already completed and remain intact.
+            for job in jobs[done:]:
+                (src, dst, _, protected, placeholder_identity, claim_path,
+                 _, _) = (
+                    _unpack_move_job(job)
+                )
+                if protected:
+                    if placeholder_identity is not None and claim_path is not None:
+                        _remove_zero_placeholder(
+                            claim_path, placeholder_identity
+                        )
+                else:
+                    _rollback_incomplete_dst(Path(src), Path(dst))
             append_log(args, f"MOVE_FAIL {item.title} disc{disc_n} :: {e} "
                              f"(RIP PRESERVED at {staging}; "
                              f"{len(jobs) - done} incomplete slot(s) rolled back)")
@@ -2149,12 +3685,20 @@ def _run_finalize(args, result, item, disc_n):
             beep(args, ok=False)
             return
     files = result.get("files", [])
+    verified = True
     if args.verify and files:
         ok2, err = verify(files)
         if not ok2:
+            verified = False
             append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
             print(f"{C.RED}Verify failed (background): {err}{C.R}", flush=True)
             beep(args, ok=False)
+    fingerprint = result.get("disc_fingerprint")
+    if (args.verify and verified and fingerprint and files
+            and not getattr(args, "rerip_review", False)):
+        append_disc_receipt(
+            Path(args.disc_receipts), item, disc_n, fingerprint, files
+        )
     run_subocr_postrip(args, files)
 
 def start_background_finalize(args, result, item, disc_n):
@@ -2177,9 +3721,8 @@ def join_finalizers():
     for t in _FINALIZE_THREADS:
         t.join()
 
-# Push notification on FAIL is now handled out-of-process by ~/.hermes/bin/
-# disc-rip-watcher, which tails the log file. Single-source dedup, no
-# code-deploy required to cover in-flight ripqueue processes.
+# Operators can handle failure notification in the wrapper or with an
+# out-of-process watcher that tails this log.
 
 # -------- queue commands --------
 def show_remaining(state: dict):
@@ -2227,10 +3770,25 @@ def build_urgent_interactive() -> QueueItem:
     target_root = input("  target root path: ").strip()
     fmt = (input("  format [4K/BD/DVD] (BD): ").strip() or "BD")
     season, ep_start = 0, 1
+    expected_episodes, expected_disc_episodes = 0, 0
+    expected_physical_disc = 0
     if typ == "tv-season":
         season = int(input("  season number: ").strip())
         ep_start = int(input("  episode start (1): ").strip() or "1")
-    return QueueItem(title, typ, discs, target_root, fmt, season, ep_start, "urgent")
+        expected_episodes = int(input("  expected season episode count: ").strip())
+        expected_disc_episodes = int(
+            input("  expected episodes on this disc: ").strip()
+        )
+        expected_physical_disc = int(
+            input("  physical disc number: ").strip()
+        )
+    return QueueItem(
+        title=title, type=typ, discs=discs, target_root=target_root,
+        format=fmt, season=season, episode_start=ep_start,
+        expected_episodes=expected_episodes,
+        expected_disc_episodes=expected_disc_episodes, notes="urgent",
+        expected_physical_disc=expected_physical_disc,
+    )
 
 # -------- header --------
 def remaining_discs(state: dict) -> int:
@@ -2442,6 +4000,17 @@ def main():
     ap.add_argument("--makemkvcon", default=DEFAULT_MAKEMKVCON)
     ap.add_argument("--device", default="disc:0")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--rerip-review", action="store_true",
+                    help="explicitly re-read a known TV disc into a traceable "
+                         "out-of-library quarantine; never assign SxxExx names")
+    ap.add_argument("--auto-rerip-review", action="store_true",
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--review-root",
+                    help="absolute out-of-library root for TV review captures; "
+                         "normally derived from the TV Shows mount")
+    ap.add_argument("--disc-receipts", default=str(DISC_RECEIPT_DEFAULT),
+                    help="durable JSONL ledger used to reject a previously "
+                         "published physical disc")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--min-free-gb", type=int, default=200)
     ap.add_argument("--no-eject", action="store_true")
@@ -2452,6 +4021,9 @@ def main():
     ap.add_argument("--no-sound", action="store_true")
     ap.add_argument("--no-subocr", action="store_true",
                     help="Skip post-rip OCR of PGS subtitles to external .srt")
+    ap.add_argument("--no-split-playall", action="store_true",
+                    help="Keep a play-all-only disc as one file instead of "
+                         "cutting it into episodes on its chapter marks")
     ap.add_argument("--non-interactive", action="store_true",
                     help="never prompt: ambiguity prompts auto-skip the item, "
                          "rip/verify failures use --on-fail.")
@@ -2518,6 +4090,12 @@ def main():
     check_key_expiry(args)
 
     items = load_queue(Path(args.queue))
+    policy_error = run_policy_error(
+        items, overwrite=args.overwrite, rerip_review=args.rerip_review
+    )
+    if policy_error:
+        print(f"{C.RED}{policy_error}{C.R}", file=sys.stderr)
+        sys.exit(64)
     state = load_or_init(args, items)
     save_state(state, args.state)
 
@@ -2561,6 +4139,7 @@ def main():
             continue
 
         item = QueueItem(**state["queue"][state["current_index"]])
+        validate_queue_item(item)
         disc_n = state["disc_index_in_item"] + 1
         header(state, item, disc_n)
 
@@ -2589,16 +4168,16 @@ def main():
             continue
         info = payload
 
-        # burndvd builds a single-disc ephemeral queue per session, so disc_n
-        # is always 1 — collides with later discs of the same TV set ripped in
-        # separate sessions (extras "S01D1" clobbering each other). Prefer the
-        # disc number embedded in the MakeMKV disc label when present.
+        # Ephemeral wrapper queues number every invocation as queue disc 1.
+        # Bind the queued TV episode/title contract to the independently
+        # observed MakeMKV label instead of silently overriding stale metadata.
         if isinstance(info, dict) and "titles" in info:
-            detected = disc_n_from_label(info)
-            if detected is not None and detected != disc_n:
-                print(f"  {C.YLW}Disc label reports Disc {detected}; "
-                      f"overriding queue disc_n {disc_n} → {detected}.{C.R}")
-                disc_n = detected
+            try:
+                disc_n = bound_physical_disc(item, info, disc_n)
+            except ValueError as exc:
+                print(f"{C.RED}{exc}; refusing optical read.{C.R}", file=sys.stderr)
+                append_log(args, f"DISC_CONTRACT_FAIL {item.title} :: {exc}")
+                sys.exit(4)
 
         # AACS-locked: park or skip, don't churn retrying the same key.
         if isinstance(info, dict) and info.get("error") == "AACS_LOCKED":
@@ -2640,6 +4219,58 @@ def main():
                 print(f"  {C.D}{m}{C.R}")
             print(f"  {C.YLW}Try: wipe disc with a soft cloth (concentric scratches), reinsert.{C.R}")
             print(f"  {C.YLW}If repeated: skip this disc, continue with the next.{C.R}")
+
+            # A freshly inserted BU40N can report MSG:5010 once while it is
+            # still settling. Detached smart-mode used to auto-answer "skip",
+            # mark the queue green, and eject the disc. Honor the declared
+            # failure policy instead: one bounded 30s retry, then fail nonzero
+            # while leaving the medium in place for the operator.
+            probe_retry_key = f"{item.title}||disc{disc_n}"
+            probe_retry_counts = state.setdefault(
+                "physical_probe_failure_retry_counts", {}
+            )
+            probe_retries_used = int(
+                probe_retry_counts.get(probe_retry_key, 0)
+            )
+            if args.non_interactive and args.on_fail == "retry":
+                if probe_retries_used < MAX_NONINTERACTIVE_RETRIES:
+                    probe_retry_counts[probe_retry_key] = probe_retries_used + 1
+                    save_state(state, args.state)
+                    print(
+                        f"  {C.YLW}Transient probe retry "
+                        f"{probe_retries_used + 1}/{MAX_NONINTERACTIVE_RETRIES}; "
+                        f"settling drive {PHYSICAL_PROBE_RETRY_DELAY_S}s. "
+                        f"Disc stays in place.{C.R}",
+                        flush=True,
+                    )
+                    append_log(
+                        args,
+                        f"PROBE_RETRY  {item.title} disc{disc_n}  "
+                        f"automatic {probe_retries_used + 1}/"
+                        f"{MAX_NONINTERACTIVE_RETRIES}",
+                    )
+                    time.sleep(PHYSICAL_PROBE_RETRY_DELAY_S)
+                    continue
+                print(
+                    f"{C.RED}Automatic probe retry exhausted; exiting "
+                    f"non-zero and leaving the disc in place.{C.R}"
+                )
+                append_log(
+                    args,
+                    f"PROBE_RETRY_EXHAUSTED  {item.title} disc{disc_n}",
+                )
+                save_state(state, args.state)
+                beep(args, ok=False)
+                sys.exit(2)
+            if args.non_interactive and args.on_fail == "abort":
+                print(
+                    f"{C.RED}--on-fail=abort; exiting non-zero and leaving "
+                    f"the disc in place.{C.R}"
+                )
+                save_state(state, args.state)
+                beep(args, ok=False)
+                sys.exit(2)
+
             ans = auto_answer(args, "[p]ark item / [s]kip item / [r]etry: ", "s")
             if ans.startswith("p"):
                 cur = state["queue"].pop(state["current_index"])
@@ -2656,8 +4287,49 @@ def main():
             eject(args)
             continue
 
+        probe_retry_key = f"{item.title}||disc{disc_n}"
+        probe_retry_counts = state.get("physical_probe_failure_retry_counts", {})
+        if probe_retry_counts.pop(probe_retry_key, None) is not None:
+            save_state(state, args.state)
+
         label = disc_label(info)
         print(f"  Disc label: {C.MAG}{label}{C.R}")
+
+        fingerprint = disc_content_fingerprint(info)
+        # Mode is per physical disc.  Never mutate the process-wide argparse
+        # namespace: a review decision for one queue item must not leak into
+        # the next item or an already-running finalizer thread.
+        disc_args = argparse.Namespace(**vars(args))
+        disc_args.current_disc_fingerprint = fingerprint
+        target = compute_target_dir(item)
+        if (item.type == "tv-season"
+                and getattr(disc_args, "auto_rerip_review", False)
+                and not disc_args.rerip_review):
+            binding_error = automatic_review_contract_error(item, info)
+            if binding_error:
+                print(f"{C.RED}{binding_error}; refusing automatic review.{C.R}",
+                      file=sys.stderr)
+                append_log(disc_args, f"AUTO_REVIEW_CONTRACT_FAIL "
+                                      f"{item.title} :: {binding_error}")
+                sys.exit(4)
+            with season_dir_lock(target, what="fingerprint review decision"):
+                contract_error = apply_tv_output_mode(
+                    disc_args, item, target, "fingerprint review decision"
+                )
+            if contract_error:
+                print(f"{C.RED}{contract_error}.{C.R}", file=sys.stderr)
+                append_log(disc_args, f"TV_CONTRACT_FAIL {item.title} :: "
+                                      f"{contract_error}")
+                sys.exit(4)
+        if (item.type == "tv-season" and not disc_args.rerip_review
+                and disc_receipt_seen(Path(args.disc_receipts), fingerprint)):
+            print(
+                f"{C.RED}Physical disc fingerprint {fingerprint[:16]} was already "
+                f"published. Refusing re-rip; use --rerip-review to preserve a "
+                f"traceable comparison copy.{C.R}", file=sys.stderr,
+            )
+            append_log(args, f"DUP_DISC {item.title} disc{disc_n} {fingerprint}")
+            sys.exit(4)
 
         if not loose_match(label, item.title):
             print(f"{C.YLW}Disc label doesn't match expected '{item.title}'.{C.R}")
@@ -2685,10 +4357,11 @@ def main():
         print(f"  Selected {len(title_ids)} title(s): {title_ids}")
 
         if item.type == "double-feature":
-            ok, result = rip_double_feature(args, item, info, state, disc_n)
+            ok, result = rip_double_feature(disc_args, item, info, state, disc_n)
         else:
-            target = compute_target_dir(item)
-            ok, result = rip(args, item, info, title_ids, target, state, disc_n)
+            ok, result = rip(
+                disc_args, item, info, title_ids, target, state, disc_n
+            )
         if not ok:
             print(f"{C.RED}Rip failed: {result}{C.R}")
             append_log(args, f"FAIL  {item.title} disc{disc_n}  {result}")
@@ -2760,6 +4433,8 @@ def main():
                 retry_counts.pop(key, None)
             save_state(state, args.state); continue
 
+        result["disc_fingerprint"] = fingerprint
+
         log_final_durations(args, item, disc_n, result["files"])
 
         # Record the rip and advance the queue now. The NAS move + verify +
@@ -2795,16 +4470,24 @@ def main():
         eject(args)
         if result.get("move_jobs") is not None:
             # Async path: copy to NAS + verify + subocr on a worker thread.
-            start_background_finalize(args, result, item, disc_n)
+            start_background_finalize(disc_args, result, item, disc_n)
         else:
             # --sync-move / double-feature: files are already on the NAS.
-            if args.verify:
+            verified = True
+            if disc_args.verify:
                 print(f"{C.D}Verifying with ffmpeg...{C.R}")
                 ok2, err = verify(result["files"])
                 if not ok2:
+                    verified = False
                     append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
                     print(f"{C.RED}Verify failed: {err}{C.R}"); beep(args, ok=False)
-            run_subocr_postrip(args, result["files"])
+            if (disc_args.verify and verified and result.get("disc_fingerprint")
+                    and result["files"] and not disc_args.rerip_review):
+                append_disc_receipt(
+                    Path(disc_args.disc_receipts), item, disc_n,
+                    result["disc_fingerprint"], result["files"],
+                )
+            run_subocr_postrip(disc_args, result["files"])
 
     join_finalizers()
     print(f"\n{C.B}{C.GRN}Queue complete.{C.R}")

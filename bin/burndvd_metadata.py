@@ -19,6 +19,10 @@ QUEUE_FIELDS = (
     "type",
     "season",
     "episode_start",
+    "expected_episodes",
+    "expected_disc_episodes",
+    "expected_title_ids",
+    "expected_physical_disc",
     "discs",
     "target_root",
     "format",
@@ -26,7 +30,26 @@ QUEUE_FIELDS = (
     "features",
 )
 
+# Verified against the physical-title audit logs retained during the
+# 2026-09-02 Game of Thrones repair.  The per-disc counts are important: a
+# season total alone cannot distinguish a 25-minute bonus on Disc 1 from an
+# episode and will shift every later filename.
+TV_EPISODE_CONTRACTS = {
+    "gameofthrones": {
+        1: (10, ((1, 2), (1, 2, 3), (1, 2, 3), (1, 2))),
+        2: (10, ((1, 2, 3), (1, 2, 3), (1, 2, 3), (1,))),
+        3: (10, ((1, 2, 3), (1, 2, 3), (1, 2, 3), (1,))),
+        4: (10, ((1, 3), (1, 2, 3), (1, 2, 3), (1, 2))),
+        5: (10, ((1, 2), (1, 2, 3), (1, 2, 3), (1, 2))),
+        6: (10, ((1, 2, 5), (1, 2), (1, 2, 3), (1, 2))),
+    },
+}
+
 _YEAR_SUFFIX_RE = re.compile(r"\((?:18|19|20)\d{2}\)$")
+_GOT_DISC_RE = re.compile(
+    r"(?i)^game[._\s-]*of[._\s-]*thrones[._\s-]*"
+    r"s0*(\d+)[._\s-]*(?:disc|d)[._\s-]*0*(\d+)(?:$|[._\s-])"
+)
 
 
 def _compact(value: str) -> str:
@@ -83,6 +106,10 @@ def movie_title_has_year(value: str) -> bool:
 def infer_defaults(volume: str) -> tuple[str, str, str]:
     """Infer (type, season, title) from an optical volume label."""
 
+    got_disc = _GOT_DISC_RE.match(volume.strip())
+    if got_disc:
+        return "tv-season", got_disc.group(1), "Game of Thrones"
+
     spaced = volume.replace("_", " ").strip()
     tv_pat = r"(?i)(S\d+\s*D\d+|Season[\s-]+\d+|Disc[\s-]+\d+|Vol(?:ume)?[\s-]+\d+)"
     marker = re.search(tv_pat, spaced)
@@ -106,6 +133,38 @@ def infer_defaults(volume: str) -> tuple[str, str, str]:
     else:
         title = spaced.title()
     return "movie", "", title
+
+
+def disc_number_from_label(value: str) -> int | None:
+    """Extract a physical disc number without treating a season as a disc."""
+
+    match = re.search(
+        r"(?i)(?:^|[^a-z0-9])(?:disc|disk|d)[._\s-]*0*(\d{1,2})(?:$|[^\d])",
+        value,
+    )
+    return int(match.group(1)) if match else None
+
+
+def episode_contract(title: str, season: int, volume: str) -> dict[str, int] | None:
+    """Return the immutable physical-disc episode contract for a TV disc."""
+
+    season_contract = TV_EPISODE_CONTRACTS.get(_compact(title), {}).get(int(season))
+    disc = disc_number_from_label(volume)
+    if season_contract is None or disc is None:
+        return None
+    total, per_disc = season_contract
+    if disc < 1 or disc > len(per_disc):
+        return None
+    title_ids = [int(value) for value in per_disc[disc - 1]]
+    count = len(title_ids)
+    start = 1 + sum(len(value) for value in per_disc[: disc - 1])
+    return {
+        "disc": disc,
+        "episode_start": start,
+        "expected_disc_episodes": count,
+        "expected_episodes": int(total),
+        "expected_title_ids": title_ids,
+    }
 
 
 def parse_features(raw: str) -> list[dict[str, object]]:
@@ -156,6 +215,10 @@ def write_queue(
     media_format: str,
     notes: str,
     features_json: str = "",
+    expected_episodes: str = "",
+    expected_disc_episodes: str = "",
+    expected_title_ids: str = "",
+    expected_physical_disc: str = "",
 ) -> None:
     """Write one queue row with standards-compliant CSV and embedded JSON."""
 
@@ -174,6 +237,10 @@ def write_queue(
                 item_type,
                 season,
                 episode_start,
+                expected_episodes,
+                expected_disc_episodes,
+                expected_title_ids,
+                expected_physical_disc,
                 "1",
                 target_root,
                 media_format,
@@ -196,12 +263,21 @@ def main() -> int:
     has_year = subparsers.add_parser("has-year")
     has_year.add_argument("title")
 
+    contract = subparsers.add_parser("episode-contract")
+    contract.add_argument("--title", required=True)
+    contract.add_argument("--season", required=True, type=int)
+    contract.add_argument("--volume", required=True)
+
     queue = subparsers.add_parser("write-queue")
     queue.add_argument("--output", required=True, type=Path)
     queue.add_argument("--title", required=True)
     queue.add_argument("--type", dest="item_type", required=True)
     queue.add_argument("--season", default="")
     queue.add_argument("--episode-start", default="")
+    queue.add_argument("--expected-episodes", default="")
+    queue.add_argument("--expected-disc-episodes", default="")
+    queue.add_argument("--expected-title-ids", default="")
+    queue.add_argument("--expected-physical-disc", default="")
     queue.add_argument("--target-root", required=True)
     queue.add_argument("--format", dest="media_format", required=True)
     queue.add_argument("--notes", default="")
@@ -216,6 +292,12 @@ def main() -> int:
         return 0
     if args.command == "has-year":
         return 0 if movie_title_has_year(args.title) else 1
+    if args.command == "episode-contract":
+        value = episode_contract(args.title, args.season, args.volume)
+        if value is None:
+            return 2
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
     if args.command == "write-queue":
         write_queue(
             args.output,
@@ -223,6 +305,10 @@ def main() -> int:
             item_type=args.item_type,
             season=args.season,
             episode_start=args.episode_start,
+            expected_episodes=args.expected_episodes,
+            expected_disc_episodes=args.expected_disc_episodes,
+            expected_title_ids=args.expected_title_ids,
+            expected_physical_disc=args.expected_physical_disc,
             target_root=args.target_root,
             media_format=args.media_format,
             notes=args.notes,
