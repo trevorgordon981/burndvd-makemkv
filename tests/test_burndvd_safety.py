@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -594,15 +595,15 @@ class ReviewIsolationTests(unittest.TestCase):
             source = Path(tmp) / "private.partial"
             destination = Path(tmp) / "episode.mkv"
             source.write_bytes(b"complete-episode")
-            real_unlink = Path.unlink
+            real_unlink = os.unlink
 
             def fail_only_partial(path, *args, **kwargs):
-                if path == source:
+                if os.fspath(path) in {os.fspath(source), source.name}:
                     raise OSError(errno.EIO, "injected partial cleanup failure")
                 return real_unlink(path, *args, **kwargs)
 
             with mock.patch.object(ripqueue.sys, "platform", "unsupported"), \
-                    mock.patch.object(Path, "unlink", new=fail_only_partial):
+                    mock.patch.object(ripqueue.os, "unlink", new=fail_only_partial):
                 ripqueue._atomic_rename_noreplace(source, destination)
 
             self.assertEqual(destination.read_bytes(), b"complete-episode")
@@ -960,6 +961,855 @@ assert destination.read_bytes() == b"episode"
             self.assertEqual(destination.read_bytes(), b"existing-review-bytes")
 
 
+class HardeningRegressionTests(unittest.TestCase):
+    def _finalize_args(self, root: Path, *, verify=False, overwrite=False):
+        return SimpleNamespace(
+            verify=verify,
+            overwrite=overwrite,
+            disc_receipts=str(root / "receipts.jsonl"),
+            rerip_review=False,
+            no_subocr=True,
+            no_sound=True,
+            state=str(root / "state.json"),
+        )
+
+    def test_verify_uses_xerror_and_treats_error_stderr_as_failure(self):
+        completed = SimpleNamespace(returncode=0, stderr="decode corruption")
+        with mock.patch.object(
+            ripqueue.subprocess, "run", return_value=completed
+        ) as run:
+            ok, message = ripqueue.verify(["episode.mkv"])
+        self.assertFalse(ok)
+        self.assertIn("decode corruption", message)
+        self.assertIn("-xerror", run.call_args.args[0])
+
+    def test_sync_verify_movie_defers_transaction_and_preserves_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp) / "movie-staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"movie")
+            destination = Path(tmp) / "Movies" / "Movie.mkv"
+            jobs = [(source, destination, "movie")]
+            result = ripqueue._rip_publication_result(
+                SimpleNamespace(sync_move=True, verify=True),
+                3.0, [str(destination)], jobs, staging,
+            )
+            self.assertEqual(result["move_jobs"], jobs)
+            self.assertEqual(result["staging"], str(staging))
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+    def test_sync_verify_tv_extras_defers_transaction_and_preserves_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            staging = Path(tmp) / "tv-staging"
+            staging.mkdir()
+            source = staging / "disc_t09.mkv"
+            source.write_bytes(b"extra")
+            destination = Path(tmp) / "Season 01" / "Extras" / "extra.mkv"
+            jobs = [(source, destination, "extra")]
+            result = ripqueue._rip_publication_result(
+                SimpleNamespace(sync_move=True, verify=True),
+                2.0, [str(destination)], jobs, staging,
+            )
+            self.assertEqual(result["move_jobs"], jobs)
+            self.assertEqual(result["staging"], str(staging))
+            self.assertTrue(source.exists())
+            self.assertFalse(destination.exists())
+
+    def test_contractless_unknown_tv_keeps_zero_friction_classification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            item = ripqueue.QueueItem(
+                title="Unknown Show", type="tv-season", discs=2,
+                target_root=tmp, format="BD", season=1, episode_start=4,
+                contract_source="none",
+            )
+            ripqueue.validate_queue_item(item)
+            paths = [Path("disc_t01.mkv"), Path("disc_t02.mkv")]
+            self.assertEqual(
+                ripqueue.partition_episode_contract(paths, item),
+                (paths, [], []),
+            )
+            self.assertEqual(
+                ripqueue.tv_contract_output_mode(
+                    item, ripqueue.compute_target_dir(item)
+                ),
+                ("normal", None, []),
+            )
+
+    def test_contract_requires_exact_ids_and_one_row_per_disc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "exact expected_title_ids"):
+                ripqueue.validate_queue_item(
+                    tv_item(Path(tmp), expected_title_ids=[])
+                )
+            with self.assertRaisesRegex(ValueError, "one queue row"):
+                ripqueue.validate_queue_item(tv_item(Path(tmp), discs=4))
+
+    def test_stale_state_version_and_changed_live_contract_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = tv_item(root)
+            state_path = root / "state.json"
+            state = ripqueue.default_state([item])
+            state["version"] = ripqueue.STATE_VERSION - 1
+            state_path.write_text(json.dumps(state))
+            args = SimpleNamespace(state=str(state_path))
+            with self.assertRaisesRegex(ValueError, "schema version"):
+                ripqueue.load_or_init(args, [item])
+
+            state = ripqueue.default_state([item])
+            state_path.write_text(json.dumps(state))
+            corrected = tv_item(root, expected_title_ids=[4, 5, 6])
+            with self.assertRaisesRegex(ValueError, "stale state contract"):
+                ripqueue.load_or_init(args, [corrected])
+
+    def test_manual_generic_label_allowed_but_registry_binding_stays_strict(self):
+        manual = tv_item(Path("/tmp"), contract_source="manual")
+        generic = {"cinfo": {2: "DISC_2"}, "titles": {}}
+        self.assertEqual(ripqueue.bound_physical_disc(manual, generic, 1), 2)
+        registry = tv_item(Path("/tmp"), contract_source="registry")
+        with self.assertRaisesRegex(ValueError, "title mismatch"):
+            ripqueue.bound_physical_disc(registry, generic, 1)
+
+    def test_short_title_must_match_complete_label_token(self):
+        item = tv_item(
+            Path("/tmp"), title="Up", contract_source="manual"
+        )
+        info = {"cinfo": {2: "CUP_SEASON_4_DISC_2"}, "titles": {}}
+        with self.assertRaisesRegex(ValueError, "title mismatch"):
+            ripqueue.bound_physical_disc(item, info, 1)
+
+    def test_probe_retry_exhaustion_is_nonzero_policy(self):
+        self.assertEqual(ripqueue.probe_exhaustion_action("retry"), "abort")
+        self.assertEqual(ripqueue.probe_exhaustion_action("abort"), "abort")
+        self.assertEqual(ripqueue.probe_exhaustion_action("skip"), "skip")
+
+    def test_dead_owner_claim_is_reclaimed_before_review_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            item = tv_item(Path(tmp))
+            season = ripqueue.compute_target_dir(item)
+            season.mkdir()
+            destination = season / "Game of Thrones - S04E03.mkv"
+            claim = ripqueue.tv_slot_claim_path(destination)
+            claim.write_text(json.dumps({
+                "version": 1,
+                "pid": 999_999_999,
+                "host": os.uname().nodename,
+                "boot_id": ripqueue._host_boot_id(),
+                "created_at": time.time() - 10,
+                "lease_expires_at": time.time() + 3600,
+                "token": "dead",
+            }))
+            with ripqueue.season_dir_lock(season, what="test stale claim"):
+                mode = ripqueue.tv_contract_output_mode(
+                    item, season, auto_rerip_review=True
+                )
+            self.assertEqual(mode, ("normal", None, []))
+            self.assertFalse(claim.exists())
+
+    def test_review_root_swap_to_library_symlink_cannot_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = root / "Media" / "TV Shows"
+            show = library / "Show"
+            target = show / "Season 01"
+            target.mkdir(parents=True)
+            review_root = root / "review"
+            review_root.mkdir()
+            item = ripqueue.QueueItem(
+                title="Show", type="tv-season", discs=1,
+                target_root=str(show), format="BD", season=1,
+                episode_start=1, expected_episodes=1,
+                expected_disc_episodes=1, expected_title_ids=[1],
+                expected_physical_disc=1, contract_source="manual",
+            )
+            capture = ripqueue.tv_review_capture_dir(
+                item, target, "a" * 64, review_root
+            )
+            original = root / "review-original"
+            review_root.rename(original)
+            review_root.symlink_to(library, target_is_directory=True)
+            source = root / "episode.mkv"
+            source.write_bytes(b"episode")
+            with self.assertRaises(OSError):
+                ripqueue.move_with_progress_noclobber(
+                    source, capture / "title-t01.mkv",
+                    partial_root=capture / ".partials",
+                    interval=0.001,
+                )
+            self.assertEqual(source.read_bytes(), b"episode")
+            self.assertFalse((library / "Show" / "Season 01" / "title-t01.mkv").exists())
+
+    def test_multi_job_second_publish_failure_rolls_back_entire_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            sources = [staging / "one.mkv", staging / "two.mkv"]
+            for index, source in enumerate(sources, start=1):
+                source.write_bytes(f"episode-{index}".encode())
+            destinations = [root / "out" / "one.mkv", root / "out" / "two.mkv"]
+            result = {
+                "files": [str(path) for path in destinations],
+                "move_jobs": [
+                    (source, destination, "move")
+                    for source, destination in zip(sources, destinations)
+                ],
+                "staging": str(staging),
+            }
+            real_publish = ripqueue._publish_prepared
+            calls = 0
+
+            def fail_second(prepared):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected second publish failure")
+                return real_publish(prepared)
+
+            with mock.patch.object(
+                ripqueue, "_publish_prepared", side_effect=fail_second
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root), result,
+                    ripqueue.QueueItem(
+                        "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("second publish", message)
+            self.assertTrue(all(source.exists() for source in sources))
+            self.assertTrue(all(not path.exists() for path in destinations))
+            self.assertTrue(staging.exists())
+
+    def test_receipt_failure_rolls_media_back_and_preserves_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            sources = [staging / "movie-a.mkv", staging / "movie-b.mkv"]
+            for index, source in enumerate(sources):
+                source.write_bytes(f"movie-{index}".encode())
+            destinations = [
+                root / "out" / "movie-a.mkv",
+                root / "out" / "movie-b.mkv",
+            ]
+            result = {
+                "files": [str(destination) for destination in destinations],
+                "move_jobs": [
+                    (source, destination, "move")
+                    for source, destination in zip(sources, destinations)
+                ],
+                "staging": str(staging),
+                "disc_fingerprint": "f" * 64,
+            }
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue, "append_disc_receipt",
+                side_effect=OSError("receipt unavailable"),
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result,
+                    ripqueue.QueueItem(
+                        "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("receipt unavailable", message)
+            self.assertTrue(all(source.exists() for source in sources))
+            self.assertTrue(all(not destination.exists()
+                                for destination in destinations))
+            self.assertTrue(staging.exists())
+
+    def test_corrupt_prepared_movie_never_reaches_visible_destination(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"corrupt movie")
+            destination = root / "out" / "movie.mkv"
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+            }
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(False, "decode corruption")
+            ), mock.patch.object(
+                ripqueue, "_publish_prepared", wraps=ripqueue._publish_prepared
+            ) as publish:
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result,
+                    ripqueue.QueueItem(
+                        "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("before publication", message)
+            publish.assert_not_called()
+            self.assertFalse(destination.exists())
+            self.assertTrue(source.exists())
+
+    def test_replaced_verified_partial_is_rejected_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"GOOD")
+            destination = root / "out" / "movie.mkv"
+            item = ripqueue.QueueItem(
+                "Movie", "movie", 1, str(root / "out"), "BD"
+            )
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ):
+                prepared = ripqueue._prepare_publication(
+                    self._finalize_args(root, verify=True), item,
+                    (source, destination, "move"),
+                )
+            partial = prepared.partial_root / prepared.partial_name
+            partial.unlink()
+            partial.write_bytes(b"EVIL")
+            try:
+                with self.assertRaisesRegex(OSError, "identity changed"):
+                    ripqueue._publish_prepared(prepared)
+                self.assertFalse(destination.exists())
+                self.assertEqual(source.read_bytes(), b"GOOD")
+            finally:
+                ripqueue._close_prepared(prepared)
+
+    def test_partial_swap_between_precheck_and_rename_is_rolled_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"GOOD")
+            destination = root / "out" / "movie.mkv"
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+            }
+            real_publish = ripqueue._atomic_rename_noreplace_at
+            swapped = False
+
+            def swap_then_publish(source_name, source_fd,
+                                  destination_name, destination_fd):
+                nonlocal swapped
+                if not swapped and source_name.endswith(".partial"):
+                    swapped = True
+                    os.unlink(source_name, dir_fd=source_fd)
+                    replacement = os.open(
+                        source_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600, dir_fd=source_fd,
+                    )
+                    os.write(replacement, b"EVIL")
+                    os.close(replacement)
+                return real_publish(
+                    source_name, source_fd, destination_name, destination_fd
+                )
+
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue, "_atomic_rename_noreplace_at",
+                side_effect=swap_then_publish,
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result,
+                    ripqueue.QueueItem(
+                        "Movie", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("differs from verified partial", message)
+            self.assertFalse(destination.exists())
+            self.assertEqual(source.read_bytes(), b"GOOD")
+
+    def test_legacy_noclobber_rejects_swap_during_atomic_publish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mkv"
+            source.write_bytes(b"GOOD")
+            destination = root / "out" / "episode.mkv"
+            partial_root = root / "partials"
+            real_publish = ripqueue._atomic_rename_noreplace_at
+            swapped = False
+
+            def swap_then_publish(source_name, source_fd,
+                                  destination_name, destination_fd):
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    os.unlink(source_name, dir_fd=source_fd)
+                    replacement = os.open(
+                        source_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600, dir_fd=source_fd,
+                    )
+                    os.write(replacement, b"EVIL")
+                    os.close(replacement)
+                return real_publish(
+                    source_name, source_fd, destination_name, destination_fd
+                )
+
+            with mock.patch.object(
+                ripqueue, "_atomic_rename_noreplace_at",
+                side_effect=swap_then_publish,
+            ), self.assertRaisesRegex(OSError, "differs from copied partial"):
+                ripqueue.move_with_progress_noclobber(
+                    source, destination, partial_root=partial_root,
+                    interval=0.001,
+                )
+            self.assertFalse(destination.exists())
+            self.assertEqual(source.read_bytes(), b"GOOD")
+
+    def test_movie_late_collision_preserves_foreign_file_and_staging(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"NEW")
+            destination = root / "out" / "movie.mkv"
+            destination.parent.mkdir()
+            destination.write_bytes(b"FOREIGN")
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+            }
+            ok, message = ripqueue._run_finalize(
+                self._finalize_args(root), result,
+                ripqueue.QueueItem(
+                    "Movie", "movie", 1, str(root / "out"), "BD"
+                ), 1,
+            )
+            self.assertFalse(ok)
+            self.assertIn("destination exists", message)
+            self.assertEqual(destination.read_bytes(), b"FOREIGN")
+            self.assertEqual(source.read_bytes(), b"NEW")
+
+    def test_explicit_movie_overwrite_uses_transactional_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mkv"
+            source.write_bytes(b"NEW")
+            destination = root / "out" / "movie.mkv"
+            destination.parent.mkdir()
+            destination.write_bytes(b"OLD")
+            ripqueue.move_with_progress(
+                source, destination, overwrite=True, interval=0.001
+            )
+            self.assertEqual(destination.read_bytes(), b"NEW")
+            self.assertFalse(source.exists())
+
+    def test_receipt_error_after_replace_reconciles_as_committed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "receipts.jsonl"
+            item = tv_item(root)
+            real_replace = os.replace
+
+            def replace_then_raise(source, destination):
+                real_replace(source, destination)
+                raise OSError("ambiguous post-replace failure")
+
+            with mock.patch.object(
+                ripqueue.os, "replace", side_effect=replace_then_raise
+            ):
+                transaction = ripqueue.append_disc_receipt(
+                    ledger, item, 2, "a" * 64, ["episode.mkv"],
+                    run_id="receipt-test-run",
+                )
+            self.assertTrue(
+                ripqueue._receipt_transaction_seen(ledger, transaction)
+            )
+            self.assertEqual(len(ledger.read_text().splitlines()), 1)
+
+    def test_staging_cleanup_failure_after_receipt_keeps_published_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"movie")
+            destination = root / "out" / "movie.mkv"
+            item = ripqueue.QueueItem(
+                "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+            )
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+                "disc_fingerprint": "f" * 64,
+                "queue_index": 0,
+                "run_id": "cleanup-test-run",
+                "elapsed_s": 12.0,
+            }
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue.shutil, "rmtree",
+                side_effect=OSError("injected staging cleanup failure"),
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result, item, 1
+                )
+            self.assertTrue(ok, message)
+            self.assertEqual(destination.read_bytes(), b"movie")
+            self.assertTrue(source.exists())
+            self.assertTrue(ripqueue.disc_receipt_seen(
+                root / "receipts.jsonl", "f" * 64
+            ))
+
+    def test_post_receipt_batch_cleanup_failure_keeps_published_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"movie")
+            destination = root / "out" / "movie.mkv"
+            item = ripqueue.QueueItem(
+                "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+            )
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+                "disc_fingerprint": "e" * 64,
+                "queue_index": 0,
+                "run_id": "cleanup-test-run",
+            }
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue, "_finish_prepared_batch",
+                side_effect=OSError("injected post-receipt cleanup failure"),
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result, item, 1
+                )
+            self.assertTrue(ok, message)
+            self.assertEqual(destination.read_bytes(), b"movie")
+            self.assertTrue(ripqueue.disc_receipt_seen(
+                root / "receipts.jsonl", "e" * 64
+            ))
+
+    def test_crash_after_receipt_before_state_save_reconciles_pending_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "out"
+            output.mkdir()
+            final = output / "Movie (2000).mkv"
+            final.write_bytes(b"verified movie")
+            item = ripqueue.QueueItem(
+                "Movie (2000)", "movie", 1, str(output), "BD"
+            )
+            state = ripqueue.default_state([item])
+            ledger = root / "receipts.jsonl"
+            transaction = ripqueue.append_disc_receipt(
+                ledger, item, 1, "d" * 64, [str(final)],
+                queue_index=0, run_id=state["run_id"], elapsed_s=42.0,
+            )
+            args = SimpleNamespace(disc_receipts=str(ledger))
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ) as verify:
+                recovered = ripqueue.reconcile_committed_receipts(state, args)
+            self.assertEqual(recovered, 1)
+            self.assertEqual(state["current_index"], 1)
+            self.assertEqual(state["disc_index_in_item"], 0)
+            self.assertEqual(state["completed"][0]["files"], [str(final)])
+            self.assertEqual(
+                state["completed"][0]["recovered_from_receipt"], transaction
+            )
+            verify.assert_called_once_with([str(final)])
+
+    def test_crash_recovery_matches_contracted_physical_disc_not_row_ordinal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = tv_item(root, contract_source="manual")
+            state = ripqueue.default_state([item])
+            season = ripqueue.compute_target_dir(item)
+            season.mkdir(parents=True)
+            final = season / "Game of Thrones - S04E03.mkv"
+            final.write_bytes(b"episode")
+            ledger = root / "receipts.jsonl"
+            ripqueue.append_disc_receipt(
+                ledger, item, 2, "8" * 64, [str(final)],
+                queue_index=0, run_id=state["run_id"], queue_disc_n=1,
+                disc_episode_count=1,
+            )
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ):
+                recovered = ripqueue.reconcile_committed_receipts(
+                    state, SimpleNamespace(disc_receipts=str(ledger))
+                )
+            self.assertEqual(recovered, 1)
+            self.assertEqual(state["current_index"], 1)
+            self.assertEqual(state["completed"][0]["disc_n"], 2)
+
+    def test_fresh_run_does_not_recover_an_old_runs_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "out"
+            output.mkdir()
+            final = output / "Movie.mkv"
+            final.write_bytes(b"movie")
+            item = ripqueue.QueueItem("Movie", "movie", 1, str(output), "BD")
+            old_state = ripqueue.default_state([item])
+            ledger = root / "receipts.jsonl"
+            ripqueue.append_disc_receipt(
+                ledger, item, 1, "c" * 64, [str(final)], queue_index=0,
+                run_id=old_state["run_id"],
+            )
+            fresh_state = ripqueue.default_state([item])
+            with mock.patch.object(ripqueue, "verify") as verify:
+                recovered = ripqueue.reconcile_committed_receipts(
+                    fresh_state, SimpleNamespace(disc_receipts=str(ledger))
+                )
+            self.assertEqual(recovered, 0)
+            self.assertEqual(fresh_state["current_index"], 0)
+            verify.assert_not_called()
+
+    def test_receipt_recovery_restores_contractless_multidisc_episode_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            item = ripqueue.QueueItem(
+                "Unknown Show", "tv-season", 3, str(root / "Unknown Show"),
+                "BD", season=1, episode_start=1, contract_source="none",
+            )
+            state = ripqueue.default_state([item])
+            ripqueue.record_episode_count(item, 1, 4, state)
+            state["disc_index_in_item"] = 1  # disc 2 was pending at crash
+            season = ripqueue.compute_target_dir(item)
+            season.mkdir(parents=True)
+            finals = []
+            for episode in range(5, 8):
+                final = season / f"Unknown Show - S01E{episode:02d}.mkv"
+                final.write_bytes(f"episode-{episode}".encode())
+                finals.append(str(final))
+            ledger = root / "receipts.jsonl"
+            ripqueue.append_disc_receipt(
+                ledger, item, 2, "9" * 64, finals,
+                queue_index=0, run_id=state["run_id"],
+                disc_episode_count=3,
+            )
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ):
+                recovered = ripqueue.reconcile_committed_receipts(
+                    state, SimpleNamespace(disc_receipts=str(ledger))
+                )
+            self.assertEqual(recovered, 1)
+            self.assertEqual(
+                state["disc_episode_counts"][ripqueue.ep_key(item)],
+                {"1": 4, "2": 3},
+            )
+            self.assertEqual(state["disc_index_in_item"], 2)
+            self.assertEqual(ripqueue.starting_ep(item, 3, state), 8)
+
+    def test_receipt_recovery_resolves_path_before_target_containment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            target.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            escaped = outside / "Movie.mkv"
+            escaped.write_bytes(b"movie")
+            link = target / "redirect"
+            link.symlink_to(outside, target_is_directory=True)
+            item = ripqueue.QueueItem("Movie", "movie", 1, str(target), "BD")
+            state = ripqueue.default_state([item])
+            ledger = root / "receipts.jsonl"
+            ripqueue.append_disc_receipt(
+                ledger, item, 1, "b" * 64, [str(link / escaped.name)],
+                queue_index=0, run_id=state["run_id"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "escapes target root"):
+                ripqueue.reconcile_committed_receipts(
+                    state, SimpleNamespace(disc_receipts=str(ledger))
+                )
+
+    def test_save_state_preserves_old_file_on_pre_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            old = {"version": 1, "value": "old"}
+            new = {"version": 1, "value": "new"}
+            ripqueue.save_state(old, str(path))
+            with mock.patch.object(
+                ripqueue.os, "replace", side_effect=OSError("replace denied")
+            ), self.assertRaisesRegex(OSError, "replace denied"):
+                ripqueue.save_state(new, str(path))
+            self.assertEqual(json.loads(path.read_text()), old)
+            self.assertEqual(list(path.parent.glob(".state.json.*.tmp")), [])
+
+    def test_save_state_reconciles_error_after_replace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            ripqueue.save_state({"value": "old"}, str(path))
+            real_replace = os.replace
+
+            def replace_then_raise(source, destination):
+                real_replace(source, destination)
+                raise OSError("ambiguous replace result")
+
+            with mock.patch.object(
+                ripqueue.os, "replace", side_effect=replace_then_raise
+            ):
+                ripqueue.save_state({"value": "new"}, str(path))
+            self.assertEqual(json.loads(path.read_text()), {"value": "new"})
+
+    def test_noverify_overwrite_cleanup_failure_never_loses_final_media(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            sources = [staging / "one.mkv", staging / "two.mkv"]
+            destinations = [root / "out" / "one.mkv", root / "out" / "two.mkv"]
+            for index, (source, destination) in enumerate(
+                zip(sources, destinations), start=1
+            ):
+                source.write_bytes(f"NEW-{index}".encode())
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(f"OLD-{index}".encode())
+            result = {
+                "files": [str(path) for path in destinations],
+                "move_jobs": [
+                    (source, destination, "move")
+                    for source, destination in zip(sources, destinations)
+                ],
+                "staging": str(staging),
+            }
+            real_unlink = os.unlink
+            backup_unlinks = 0
+
+            def fail_second_backup_cleanup(path, *args, **kwargs):
+                nonlocal backup_unlinks
+                if "burndvd-backup" in os.fspath(path):
+                    backup_unlinks += 1
+                    if backup_unlinks == 2:
+                        raise OSError("injected second backup cleanup failure")
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                ripqueue.os, "unlink", side_effect=fail_second_backup_cleanup
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, overwrite=True), result,
+                    ripqueue.QueueItem(
+                        "Movie", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertTrue(ok, message)
+            self.assertEqual(destinations[0].read_bytes(), b"NEW-1")
+            self.assertEqual(destinations[1].read_bytes(), b"NEW-2")
+
+    def test_backup_restore_collision_preserves_foreign_and_old_backup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"NEW")
+            destination = root / "out" / "movie.mkv"
+            destination.parent.mkdir()
+            destination.write_bytes(b"OLD")
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+                "disc_fingerprint": "7" * 64,
+            }
+            real_publish = ripqueue._atomic_rename_noreplace_at
+
+            def collide_with_backup_restore(source_name, source_fd,
+                                            destination_name, destination_fd):
+                if "burndvd-backup" in source_name:
+                    foreign = os.open(
+                        destination_name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600, dir_fd=destination_fd,
+                    )
+                    os.write(foreign, b"FOREIGN")
+                    os.close(foreign)
+                return real_publish(
+                    source_name, source_fd, destination_name, destination_fd
+                )
+
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue, "append_disc_receipt",
+                side_effect=OSError("receipt failed"),
+            ), mock.patch.object(
+                ripqueue, "_atomic_rename_noreplace_at",
+                side_effect=collide_with_backup_restore,
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True, overwrite=True),
+                    result,
+                    ripqueue.QueueItem(
+                        "Movie", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("ROLLBACK INCOMPLETE", message)
+            self.assertEqual(destination.read_bytes(), b"FOREIGN")
+            backups = list(destination.parent.glob(
+                ".movie.mkv.burndvd-backup-*"
+            ))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), b"OLD")
+
+    def test_rollback_failure_is_reported_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / "staging"
+            staging.mkdir()
+            source = staging / "movie.mkv"
+            source.write_bytes(b"movie")
+            destination = root / "out" / "movie.mkv"
+            result = {
+                "files": [str(destination)],
+                "move_jobs": [(source, destination, "move")],
+                "staging": str(staging),
+                "disc_fingerprint": "f" * 64,
+            }
+            real_unlink = os.unlink
+
+            def refuse_destination_unlink(path, *args, **kwargs):
+                if os.fspath(path) == destination.name and kwargs.get("dir_fd"):
+                    raise OSError("injected rollback denial")
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                ripqueue, "verify", return_value=(True, "")
+            ), mock.patch.object(
+                ripqueue, "append_disc_receipt",
+                side_effect=OSError("receipt unavailable"),
+            ), mock.patch.object(
+                ripqueue.os, "unlink", side_effect=refuse_destination_unlink
+            ):
+                ok, message = ripqueue._run_finalize(
+                    self._finalize_args(root, verify=True), result,
+                    ripqueue.QueueItem(
+                        "Movie (2000)", "movie", 1, str(root / "out"), "BD"
+                    ), 1,
+                )
+            self.assertFalse(ok)
+            self.assertIn("ROLLBACK INCOMPLETE", message)
+            self.assertTrue(destination.exists())
+
+
 class DiscIdentityTests(unittest.TestCase):
     def test_wrong_physical_disc_is_rejected_before_rip(self):
         item = tv_item(Path("/tmp"), expected_physical_disc=2)
@@ -1013,7 +1863,9 @@ class DiscIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ledger = Path(tmp) / "receipts.jsonl"
             item = tv_item(Path(tmp))
-            ripqueue.append_disc_receipt(ledger, item, 2, "abc", ["episode.mkv"])
+            ripqueue.append_disc_receipt(
+                ledger, item, 2, "abc", ["episode.mkv"], run_id="ledger-test"
+            )
             self.assertTrue(ripqueue.disc_receipt_seen(ledger, "abc"))
             self.assertFalse(ripqueue.disc_receipt_seen(ledger, "def"))
 

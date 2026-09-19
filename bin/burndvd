@@ -512,6 +512,7 @@ EXPECTED_DISC_EPISODES=""
 EXPECTED_TITLE_IDS=""
 EXPECTED_PHYSICAL_DISC=""
 CONTRACT_RECOGNIZED=0
+CONTRACT_SOURCE="none"
 FEATURES_JSON=""   # populated only when the user confirms a double feature
 case "$TYPE" in
     tv-season)
@@ -532,6 +533,7 @@ case "$TYPE" in
             --title "$TITLE" --season "$SEASON" --volume "$VOLUME" 2>/dev/null || true)
         if [ -n "$CONTRACT_JSON" ]; then
             CONTRACT_RECOGNIZED=1
+            CONTRACT_SOURCE="registry"
             read -r DEFAULT_EP EXPECTED_DISC_EPISODES EXPECTED_EPISODES CONTRACT_DISC EXPECTED_TITLE_IDS \
                 < <(printf '%s' "$CONTRACT_JSON" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
@@ -539,39 +541,45 @@ print(d["episode_start"], d["expected_disc_episodes"], d["expected_episodes"], d
             END_EP=$((DEFAULT_EP + EXPECTED_DISC_EPISODES - 1))
             EXPECTED_PHYSICAL_DISC="$CONTRACT_DISC"
             echo "Episode contract: disc $CONTRACT_DISC -> S$(printf '%02d' "$SEASON")E$(printf '%02d' "$DEFAULT_EP")-E$(printf '%02d' "$END_EP") (${EXPECTED_EPISODES} total)."
-        else
-            echo "burndvd: no verified episode contract for '$TITLE' S$SEASON / '$VOLUME'." >&2
-            prompt_value EXPECTED_EPISODES "Expected total season episodes: " "" 1
-            prompt_value DEFAULT_EP "First episode on this physical disc: " "" 1
-            prompt_value EXPECTED_DISC_EPISODES "Episodes on this physical disc: " "" 1
-            prompt_value EXPECTED_TITLE_IDS "Episode title IDs as JSON (example [1,2,3]): " "" 1
-            prompt_value EXPECTED_PHYSICAL_DISC "Physical disc number: " "" 1
-        fi
-        for numeric in "$EXPECTED_EPISODES" "$DEFAULT_EP" "$EXPECTED_DISC_EPISODES" "$EXPECTED_PHYSICAL_DISC"; do
-            [[ "$numeric" =~ ^[0-9]+$ ]] && [ "$numeric" -gt 0 ] || {
-                echo "burndvd: episode contract values must be positive integers." >&2
+            for numeric in "$EXPECTED_EPISODES" "$DEFAULT_EP" "$EXPECTED_DISC_EPISODES" "$EXPECTED_PHYSICAL_DISC"; do
+                [[ "$numeric" =~ ^[0-9]+$ ]] && [ "$numeric" -gt 0 ] || {
+                    echo "burndvd: episode contract values must be positive integers." >&2
+                    exit 64
+                }
+            done
+            if [ "$END_EP" -gt "$EXPECTED_EPISODES" ]; then
+                echo "burndvd: disc range E$DEFAULT_EP-E$END_EP exceeds season total $EXPECTED_EPISODES." >&2
                 exit 64
-            }
-        done
-        END_EP=$((DEFAULT_EP + EXPECTED_DISC_EPISODES - 1))
-        if [ "$END_EP" -gt "$EXPECTED_EPISODES" ]; then
-            echo "burndvd: disc range E$DEFAULT_EP-E$END_EP exceeds season total $EXPECTED_EPISODES." >&2
-            exit 64
-        fi
+            fi
 
-        select_tv_output_mode_for_range \
-            "$SEASON_DIR" "$TITLE" "$SEASON" \
-            "$DEFAULT_EP" "$END_EP" "$EXPECTED_EPISODES" \
-            "$CONTRACT_RECOGNIZED" || exit $?
-        if [ "$CONTRACT_RECOGNIZED" = "1" ]; then
+            select_tv_output_mode_for_range \
+                "$SEASON_DIR" "$TITLE" "$SEASON" \
+                "$DEFAULT_EP" "$END_EP" "$EXPECTED_EPISODES" \
+                "$CONTRACT_RECOGNIZED" || exit $?
             # The wrapper's scan is advisory.  The backend rechecks under the
             # season lock and safely switches to review if a slot appears
             # between this scan and the optical read.
             append_ripqueue_mode_arg_once "--auto-rerip-review"
+        else
+            # Registry misses retain the zero-friction legacy flow. The
+            # backend infers episode-length titles and starts after the highest
+            # nonempty landed episode. A queue operator who wants a manual
+            # immutable contract can still provide one in CSV.
+            DEFAULT_EP=1
+            if [ -d "$SEASON_DIR" ]; then
+                HIGHEST_EP=$( (find "$SEASON_DIR" -maxdepth 1 -type f -size +0 \
+                    -name '*.mkv' -print 2>/dev/null \
+                    | grep -oE "S0*${SEASON}E[0-9]+" \
+                    | grep -oE 'E[0-9]+' | tr -d 'E' \
+                    | sort -n | tail -1) || true )
+                if [ -n "$HIGHEST_EP" ]; then
+                    DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
+                fi
+            fi
         fi
 
         prompt_value EP_START "Episode start [$DEFAULT_EP]: " "$DEFAULT_EP" 1
-        if [ "$EP_START" != "$DEFAULT_EP" ]; then
+        if [ "$CONTRACT_RECOGNIZED" = "1" ] && [ "$EP_START" != "$DEFAULT_EP" ]; then
             echo "burndvd: episode start is contract-bound to $DEFAULT_EP; refusing $EP_START." >&2
             exit 65
         fi
@@ -656,6 +664,7 @@ python3 "$METADATA_PY" write-queue \
     --expected-disc-episodes "$EXPECTED_DISC_EPISODES" \
     --expected-title-ids "$EXPECTED_TITLE_IDS" \
     --expected-physical-disc "$EXPECTED_PHYSICAL_DISC" \
+    --contract-source "$CONTRACT_SOURCE" \
     --target-root "$ROOT" \
     --format "$FORMAT" \
     --notes "auto-built from $VOLUME" \

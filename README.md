@@ -21,11 +21,13 @@ Episode contract: disc 4 -> S04E09-E10 (10 total).
 
 ## Safety model
 
-TV publication is contract-driven. It does not infer the next episode by
-scanning for the highest existing filename.
+Registry-recognized TV publication is contract-driven. Unknown series retain
+a zero-friction contractless mode that classifies episode-length titles and
+starts after the highest existing nonempty episode.
 
-- A TV queue row binds the show, season, physical-disc number, season total,
-  episode range, and MakeMKV title IDs.
+- A contracted TV queue row binds the show, season, physical-disc number,
+  season total, episode range, and exact MakeMKV title IDs. Contracted TV uses
+  one queue row per physical disc (`discs=1`).
 - The backend rechecks the observed disc label and content fingerprint before
   reading or publishing it.
 - A recognized physical disc whose contracted slots are vacant publishes to
@@ -56,8 +58,15 @@ media library as well.
 
 Completed TV files are copied to a same-filesystem quarantine path, flushed,
 then published with an atomic no-clobber operation. Hidden per-episode claims
-reserve the contracted range without creating zero-byte media files. A
+carry a durable owner, boot identity, and lease. Dead same-host owners and
+expired remote or legacy claims are reclaimed under the season lock. A
 collision preserves the staged rip and the pre-existing destination.
+
+Every selected file is first copied to a private same-filesystem partial and
+decoded there. The complete batch is published only after all partials pass.
+Destination verification and the fsynced receipt must also succeed before
+queue state advances; later failure rolls back only files created by that
+transaction and leaves staging retryable.
 
 On the standard macOS layout, `/Volumes/Media` is the SMB view used by the
 library and `/private/nas/media` is the equivalent NFS view used for TV
@@ -116,6 +125,8 @@ fail closed. Review captures never masquerade as published discs.
   `--makemkvcon`.
 - Python 3.10+. `ripqueue.py` uses only the standard library; `subocr.py`
   requires PyObjC.
+- `ffmpeg` and `ffprobe` (Homebrew `ffmpeg`) for decode verification.
+- `mkvmerge` and `mkvextract` (Homebrew `mkvtoolnix`) for subtitle OCR.
 - An optical drive. The project has been exercised with the LG BU40N.
 - For the standard NAS layout, equivalent writable SMB `/Volumes/Media` and
   NFS `/private/nas/media` mounts.
@@ -144,14 +155,12 @@ Per-show OCR overrides go in `~/.config/subocr/shows.json`; see
 ## Single-disc mode
 
 Run `burndvd`. It detects the disc and prompts for metadata. Recognized TV
-labels receive a built-in immutable contract; unknown TV labels require these
-values explicitly:
-
-- authoritative season episode count;
-- first episode on this physical disc;
-- number of episodes on the disc;
-- episode-bearing MakeMKV title IDs as JSON; and
-- physical-disc number.
+labels receive a built-in immutable contract. Unknown TV labels ask only for
+the season and proposed first episode; the backend classifies episode-length
+titles automatically. Advanced queue users can instead provide a complete
+manual contract with exact title IDs. Generic mastering labels such as
+`DISC_2` are allowed for manual contracts; registry contracts retain strict
+title/season/disc label binding.
 
 Prompt input may come from a terminal or a pipe. Headless EOF uses a safe
 default where one exists and fails explicitly for required values.
@@ -174,9 +183,10 @@ Alternatively, set `BURNDVD_SLACK_ENV` to an env file containing
 Drive `ripqueue.py` directly with a CSV:
 
 ```csv
-title,type,season,episode_start,expected_episodes,expected_disc_episodes,expected_title_ids,expected_physical_disc,discs,target_root,format,notes,features
-Game of Thrones,tv-season,4,3,10,3,"[1,2,3]",2,1,/Volumes/Media/TV Shows/Game of Thrones,BD,,
-Mean Streets (1973),movie,,,,,,,1,/Volumes/Media/Movies/Mean Streets (1973),BD,,
+title,type,season,episode_start,expected_episodes,expected_disc_episodes,expected_title_ids,expected_physical_disc,contract_source,discs,target_root,format,notes,features
+Game of Thrones,tv-season,4,3,10,3,"[1,2,3]",2,registry,1,/Volumes/Media/TV Shows/Game of Thrones,BD,,
+Unknown Show,tv-season,1,1,,,,,none,1,/Volumes/Media/TV Shows/Unknown Show,BD,,
+Mean Streets (1973),movie,,,,,,,,1,/Volumes/Media/Movies/Mean Streets (1973),BD,,
 ```
 
 ```sh

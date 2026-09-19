@@ -23,6 +23,7 @@ QUEUE_FIELDS = (
     "expected_disc_episodes",
     "expected_title_ids",
     "expected_physical_disc",
+    "contract_source",
     "discs",
     "target_root",
     "format",
@@ -219,6 +220,7 @@ def write_queue(
     expected_disc_episodes: str = "",
     expected_title_ids: str = "",
     expected_physical_disc: str = "",
+    contract_source: str = "",
 ) -> None:
     """Write one queue row with standards-compliant CSV and embedded JSON."""
 
@@ -241,6 +243,7 @@ def write_queue(
                 expected_disc_episodes,
                 expected_title_ids,
                 expected_physical_disc,
+                contract_source,
                 "1",
                 target_root,
                 media_format,
@@ -278,6 +281,7 @@ def main() -> int:
     queue.add_argument("--expected-disc-episodes", default="")
     queue.add_argument("--expected-title-ids", default="")
     queue.add_argument("--expected-physical-disc", default="")
+    queue.add_argument("--contract-source", default="")
     queue.add_argument("--target-root", required=True)
     queue.add_argument("--format", dest="media_format", required=True)
     queue.add_argument("--notes", default="")
@@ -309,6 +313,7 @@ def main() -> int:
             expected_disc_episodes=args.expected_disc_episodes,
             expected_title_ids=args.expected_title_ids,
             expected_physical_disc=args.expected_physical_disc,
+            contract_source=args.contract_source,
             target_root=args.target_root,
             media_format=args.media_format,
             notes=args.notes,

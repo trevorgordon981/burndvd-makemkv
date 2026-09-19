@@ -77,76 +77,163 @@ def noninteractive_failure_action(on_fail: str, retries_used: int,
         return "abort"
     return "skip"
 
+
+def probe_exhaustion_action(on_fail: str) -> str:
+    """Only an explicit skip may turn exhausted probing into queue progress."""
+
+    return "skip" if on_fail == "skip" else "abort"
+
 def csv_int(row: dict, key: str, default: int) -> int:
     raw = (row.get(key) or "").strip()
     return int(raw) if raw else default
 
 def move_with_progress(src: Path, dst: Path, label: str = "moving",
-                       interval: float = 5.0) -> None:
-    """shutil.move with periodic progress lines.
+                       interval: float = 5.0, *,
+                       retain_source: bool = False,
+                       overwrite: bool = False) -> None:
+    """Publish one generic file through the transactional movie path."""
 
-    Cross-filesystem moves copy then delete; on a gigabit NAS that means
-    multi-minute silence with no feedback. We run the move in a worker
-    thread and poll dst size from the main thread.
-    """
-    # Legacy movie transfers may encounter an owned zero-byte reservation.
-    # Protected TV publication never uses this mover or a final-path
-    # placeholder; it publishes via move_with_progress_noclobber instead.
+    src, dst = Path(src), Path(dst)
+    item = QueueItem(dst.stem, "movie", 1, str(dst.parent), "BD")
+    args = argparse.Namespace(verify=False, overwrite=overwrite)
+    prepared = None
+    committed = False
     try:
-        if dst.is_file() and dst.stat().st_size == 0:
-            dst.unlink()
-    except OSError:
-        pass
-    total = src.stat().st_size
-    done_evt = threading.Event()
-    err_box: list[BaseException] = []
-
-    def worker():
+        prepared = _prepare_publication(args, item, (src, dst, label))
+        _publish_prepared(prepared)
+        committed = True
         try:
-            shutil.move(str(src), str(dst))
-        except BaseException as e:
-            err_box.append(e)
-        finally:
-            done_evt.set()
+            _finish_prepared_batch([prepared])
+        except Exception as cleanup_error:
+            print(
+                f"{C.YLW}Publication committed, but cleanup needs attention: "
+                f"{cleanup_error}{C.R}", flush=True,
+            )
+        if not retain_source:
+            current = os.lstat(src)
+            if (current.st_dev, current.st_ino) != prepared.source_identity:
+                raise OSError(
+                    f"source identity changed after publication; destination "
+                    f"retained at {dst}"
+                )
+            os.unlink(src)
+    except BaseException:
+        if prepared is not None and not committed:
+            rollback_errors = _rollback_prepared_batch([prepared])
+            if rollback_errors:
+                raise RuntimeError(
+                    "publication failed; ROLLBACK INCOMPLETE: "
+                    + " | ".join(rollback_errors)
+                )
+        raise
+    finally:
+        if prepared is not None:
+            _close_prepared(prepared)
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
 
-    start = time.time()
-    last_size = 0
-    last_t = start
-    print(f"{C.D}{label}: {src.name} -> {dst}{C.R}", flush=True)
+def _open_directory_tree_nofollow(path: Path, *, create: bool = False,
+                                  mode: int = 0o700) -> int:
+    """Open an absolute directory through bound, no-symlink ancestry.
 
-    while not done_evt.wait(timeout=interval):
+    Each component is opened relative to the already-bound parent descriptor.
+    A later pathname/symlink swap therefore cannot redirect callers that keep
+    the returned fd. This is used for both review and canonical publication.
+    """
+
+    path = Path(path).expanduser()
+    # macOS exposes /var and /tmp as root-owned compatibility symlinks. Treat
+    # only those two fixed OS aliases as canonical; arbitrary/user-controlled
+    # symlinks remain forbidden.
+    raw = os.fspath(path)
+    if os.path.islink("/var") and (raw == "/var" or raw.startswith("/var/")):
+        path = Path("/private" + raw)
+    elif os.path.islink("/tmp") and (raw == "/tmp" or raw.startswith("/tmp/")):
+        path = Path("/private" + raw)
+    if not path.is_absolute():
+        raise ValueError(f"secure directory path must be absolute: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.sep, flags)
+    try:
+        for component in path.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise ValueError(f"unsafe directory component in {path}")
+            try:
+                child = os.open(
+                    component, flags | nofollow, dir_fd=descriptor
+                )
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, mode=mode, dir_fd=descriptor)
+                child = os.open(
+                    component, flags | nofollow, dir_fd=descriptor
+                )
+            opened = os.fstat(child)
+            if not stat.S_ISDIR(opened.st_mode):
+                os.close(child)
+                raise NotADirectoryError(f"unsafe non-directory ancestor: {path}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _assert_no_symlink_ancestry(path: Path) -> None:
+    """Reject every existing non-system symlink on an absolute path."""
+
+    path = Path(path).expanduser()
+    raw = os.fspath(path)
+    if os.path.islink("/var") and (raw == "/var" or raw.startswith("/var/")):
+        path = Path("/private" + raw)
+    elif os.path.islink("/tmp") and (raw == "/tmp" or raw.startswith("/tmp/")):
+        path = Path("/private" + raw)
+    current = Path(os.sep)
+    for component in path.parts[1:]:
+        current /= component
         try:
-            cur = dst.stat().st_size if dst.exists() else 0
+            opened = os.lstat(current)
         except FileNotFoundError:
-            cur = 0
-        now = time.time()
-        frac = cur / total if total > 0 else 0.0
-        dt = now - last_t
-        delta = cur - last_size
-        mbps = delta / dt / (1024 * 1024) if dt > 0 else 0.0
-        eta = (total - cur) / (delta / dt) if delta > 0 and dt > 0 else 0
-        bar = render_bar(frac)
-        elapsed = fmt_dur(now - start)
-        print(f"  {bar} {frac*100:5.1f}%  {cur/1e9:5.2f}/{total/1e9:5.2f} GB"
-              f"  {mbps:5.1f} MB/s  eta {fmt_dur(eta)}  elapsed {elapsed}",
-              flush=True)
-        last_size = cur
-        last_t = now
-
-    t.join()
-    if err_box:
-        raise err_box[0]
-    elapsed = time.time() - start
-    avg_mbps = total / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
-    print(f"  {C.GRN}done{C.R}  {total/1e9:.2f} GB in {fmt_dur(elapsed)}"
-          f"  ({avg_mbps:.1f} MB/s avg)", flush=True)
+            return
+        if stat.S_ISLNK(opened.st_mode):
+            raise ValueError(f"unsafe symlink ancestry in {path}: {current}")
 
 
-def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
-    """Atomically rename on one filesystem, failing if destination exists."""
+def _secure_mkdirs(path: Path, mode: int = 0o700) -> None:
+    descriptor = _open_directory_tree_nofollow(path, create=True, mode=mode)
+    os.close(descriptor)
+
+
+def _secure_dir_writable(path: Path) -> bool:
+    descriptor = None
+    name = f".writeprobe-{os.getpid()}-{time.time_ns()}"
+    try:
+        descriptor = _open_directory_tree_nofollow(path, create=True)
+        probe_fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=descriptor,
+        )
+        os.write(probe_fd, b"ok")
+        os.fsync(probe_fd)
+        os.close(probe_fd)
+        os.unlink(name, dir_fd=descriptor)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+
+
+def _atomic_rename_noreplace_at(
+    source_name: str, source_dir_fd: int,
+    destination_name: str, destination_dir_fd: int,
+) -> None:
+    """Atomic no-replace publication between already-bound directories."""
 
     libc = ctypes.CDLL(None, use_errno=True)
     if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
@@ -154,13 +241,15 @@ def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
         fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                        ctypes.c_char_p, ctypes.c_uint]
         fn.restype = ctypes.c_int
-        rc = fn(-2, os.fsencode(source), -2, os.fsencode(destination), 0x4)
+        rc = fn(source_dir_fd, os.fsencode(source_name), destination_dir_fd,
+                os.fsencode(destination_name), 0x4)
     elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
         fn = libc.renameat2
         fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                        ctypes.c_char_p, ctypes.c_uint]
         fn.restype = ctypes.c_int
-        rc = fn(-100, os.fsencode(source), -100, os.fsencode(destination), 0x1)
+        rc = fn(source_dir_fd, os.fsencode(source_name), destination_dir_fd,
+                os.fsencode(destination_name), 0x1)
     else:
         rc = -1
         ctypes.set_errno(errno.ENOTSUP)
@@ -168,13 +257,19 @@ def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
         return
     native_errno = ctypes.get_errno()
     if native_errno == errno.EEXIST:
-        raise FileExistsError(native_errno, os.strerror(native_errno), destination)
+        raise FileExistsError(
+            native_errno, os.strerror(native_errno), destination_name
+        )
 
     # Portable same-filesystem fallback. link() itself is no-clobber; if the
     # filesystem cannot hard-link (notably SMB), fail closed rather than use a
     # rename operation that could overwrite.
     try:
-        os.link(source, destination, follow_symlinks=False)
+        os.link(
+            source_name, destination_name,
+            src_dir_fd=source_dir_fd, dst_dir_fd=destination_dir_fd,
+            follow_symlinks=False,
+        )
     except FileExistsError:
         raise
     except OSError as fallback_error:
@@ -182,15 +277,30 @@ def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
             native_errno,
             f"atomic no-replace rename unsupported ({os.strerror(native_errno)}); "
             f"hard-link fallback failed: {fallback_error}",
-            destination,
+            destination_name,
         ) from fallback_error
     # Publication is complete once link() succeeds.  Failure to retire the
     # private partial must not be reported as a failed publish: the final file
     # is already durable and the partial lives outside the media library.
     try:
-        source.unlink()
+        os.unlink(source_name, dir_fd=source_dir_fd)
     except OSError:
         pass
+
+
+def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename using bound no-symlink directory descriptors."""
+
+    source, destination = Path(source), Path(destination)
+    source_fd = _open_directory_tree_nofollow(source.parent)
+    destination_fd = _open_directory_tree_nofollow(destination.parent)
+    try:
+        _atomic_rename_noreplace_at(
+            source.name, source_fd, destination.name, destination_fd
+        )
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
 
 
 def move_with_progress_noclobber(
@@ -200,6 +310,8 @@ def move_with_progress_noclobber(
     partial_root: Path | None = None,
     lock_dir: Path | None = None,
     publish_lock_held: bool = False,
+    retain_source: bool = False,
+    verify_before_publish: bool = False,
 ) -> None:
     """Copy in quarantine, atomically publish without overwrite, retire source.
 
@@ -214,8 +326,11 @@ def move_with_progress_noclobber(
     if partial_root is None:
         raise ValueError("protected TV move requires an out-of-library partial_root")
     partial_root = Path(partial_root)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    partial_root.mkdir(parents=True, exist_ok=True)
+    # Bind both directory trees one component at a time with O_NOFOLLOW. The
+    # descriptors remain open through publication, eliminating the prior gap
+    # where a validated review root could be swapped to a library symlink.
+    dst_parent_fd = _open_directory_tree_nofollow(dst.parent, create=True)
+    partial_root_fd = _open_directory_tree_nofollow(partial_root, create=True)
 
     source_fd = os.open(
         str(src), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -237,10 +352,11 @@ def move_with_progress_noclobber(
     partial_fd = None
     try:
         partial_fd = os.open(
-            str(partial),
+            token,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL
             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
             0o644,
+            dir_fd=partial_root_fd,
         )
         partial_stat = os.fstat(partial_fd)
         if not stat.S_ISREG(partial_stat.st_mode):
@@ -296,7 +412,7 @@ def move_with_progress_noclobber(
         os.close(monitor_fd)
         if err_box:
             raise err_box[0]
-        copied = os.lstat(partial)
+        copied = os.stat(token, dir_fd=partial_root_fd, follow_symlinks=False)
         guarded_source = os.fstat(source_guard_fd)
         if ((copied.st_dev, copied.st_ino) != partial_identity
                 or copied.st_size != total):
@@ -304,6 +420,12 @@ def move_with_progress_noclobber(
         if ((guarded_source.st_dev, guarded_source.st_ino) != source_identity
                 or guarded_source.st_size != total):
             raise OSError(f"protected TV source identity/size changed: {src}")
+        if verify_before_publish:
+            verified, verification_error = verify([str(partial)])
+            if not verified:
+                raise OSError(
+                    f"verification failed before publication: {verification_error}"
+                )
 
         publish_lock = (
             contextlib.nullcontext()
@@ -311,47 +433,103 @@ def move_with_progress_noclobber(
             season_dir_lock(lock_dir, what="protected TV publish")
         )
         with publish_lock:
+            current_partial = os.stat(
+                token, dir_fd=partial_root_fd, follow_symlinks=False
+            )
+            if (not stat.S_ISREG(current_partial.st_mode)
+                    or (current_partial.st_dev, current_partial.st_ino)
+                    != partial_identity
+                    or current_partial.st_size != total):
+                raise OSError(
+                    f"protected partial identity/size changed immediately "
+                    f"before publication: {partial}"
+                )
             if claim_path is not None:
-                claim = os.lstat(claim_path)
-                if (not stat.S_ISREG(claim.st_mode) or claim.st_size != 0
+                claim_path = Path(claim_path)
+                if claim_path.parent != dst.parent:
+                    raise ValueError(
+                        f"TV slot claim is outside destination directory: {claim_path}"
+                    )
+                claim = os.stat(
+                    claim_path.name, dir_fd=dst_parent_fd,
+                    follow_symlinks=False,
+                )
+                if (not stat.S_ISREG(claim.st_mode)
                         or (claim.st_dev, claim.st_ino) != placeholder_identity):
                     raise FileExistsError(
                         f"TV slot claim ownership changed: {claim_path}"
                     )
-            _atomic_rename_noreplace(partial, dst)
+            _atomic_rename_noreplace_at(
+                token, partial_root_fd, dst.name, dst_parent_fd
+            )
+            landed = os.stat(
+                dst.name, dir_fd=dst_parent_fd, follow_symlinks=False
+            )
+            landed_identity = (landed.st_dev, landed.st_ino)
+            if (not stat.S_ISREG(landed.st_mode)
+                    or landed_identity != partial_identity
+                    or landed.st_size != total):
+                cleanup_error = None
+                try:
+                    current = os.stat(
+                        dst.name, dir_fd=dst_parent_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) == landed_identity:
+                        os.unlink(dst.name, dir_fd=dst_parent_fd)
+                except OSError as exc:
+                    cleanup_error = exc
+                detail = (
+                    f"; exact bad destination could not be removed: "
+                    f"{cleanup_error}" if cleanup_error else ""
+                )
+                raise OSError(
+                    f"published destination differs from copied partial: "
+                    f"{dst}{detail}"
+                )
             published = True
             if claim_path is not None:
-                _remove_zero_placeholder(claim_path, placeholder_identity)
+                try:
+                    current = os.stat(
+                        claim_path.name, dir_fd=dst_parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if (stat.S_ISREG(current.st_mode)
+                            and (current.st_dev, current.st_ino)
+                            == placeholder_identity):
+                        os.unlink(claim_path.name, dir_fd=dst_parent_fd)
+                except OSError:
+                    pass
 
         # Never blindly unlink a pathname after copying. Move whatever is at
         # the source path to an unpredictable private name, verify its inode,
         # and delete only when it is the exact source we copied.
-        retired = src.with_name(
-            f".{src.name}.burndvd-consumed-{os.getpid()}-"
-            f"{time.time_ns()}-{os.urandom(8).hex()}"
-        )
-        try:
-            os.rename(src, retired)
-        except OSError as exc:
-            raise OSError(
-                f"source path changed after publication; destination retained "
-                f"at {dst}: {exc}"
-            ) from exc
-        retired_stat = os.lstat(retired)
-        if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
-            retained_at = retired
-            if not src.exists():
-                try:
-                    os.rename(retired, src)
-                    retained_at = src
-                except OSError:
-                    pass
-            raise OSError(
-                f"source path was replaced during protected copy; completed "
-                f"destination retained at {dst}; foreign source retained at "
-                f"{retained_at}"
+        if not retain_source:
+            retired = src.with_name(
+                f".{src.name}.burndvd-consumed-{os.getpid()}-"
+                f"{time.time_ns()}-{os.urandom(8).hex()}"
             )
-        retired.unlink()
+            try:
+                os.rename(src, retired)
+            except OSError as exc:
+                raise OSError(
+                    f"source path changed after publication; destination retained "
+                    f"at {dst}: {exc}"
+                ) from exc
+            retired_stat = os.lstat(retired)
+            if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
+                retained_at = retired
+                if not src.exists():
+                    try:
+                        os.rename(retired, src)
+                        retained_at = src
+                    except OSError:
+                        pass
+                raise OSError(
+                    f"source path was replaced during protected copy; completed "
+                    f"destination retained at {dst}; foreign source retained at "
+                    f"{retained_at}"
+                )
+            retired.unlink()
     except BaseException:
         try: os.close(monitor_fd)
         except OSError: pass
@@ -359,14 +537,20 @@ def move_with_progress_noclobber(
         # source. Never roll it back merely because source retirement raced.
         if not published:
             try:
-                current = os.lstat(partial)
+                current = os.stat(
+                    token, dir_fd=partial_root_fd, follow_symlinks=False
+                )
                 if (current.st_dev, current.st_ino) == partial_identity:
-                    partial.unlink()
+                    os.unlink(token, dir_fd=partial_root_fd)
             except OSError:
                 pass
         raise
     finally:
         try: os.close(source_guard_fd)
+        except OSError: pass
+        try: os.close(dst_parent_fd)
+        except OSError: pass
+        try: os.close(partial_root_fd)
         except OSError: pass
 
     elapsed = time.time() - start
@@ -388,6 +572,11 @@ class QueueItem:
     expected_disc_episodes: int = 0
     expected_title_ids: list = field(default_factory=list)
     expected_physical_disc: int = 0
+    # ``registry`` means the wrapper resolved this row from the immutable
+    # built-in physical-disc registry. ``manual`` means an operator supplied
+    # a complete contract. An empty value is retained for backwards-compatible
+    # queue files and is interpreted as manual when contract fields are set.
+    contract_source: str = ""
     notes: str = ""
     # Double-feature only: list of {"title_id": int, "name": str}. One physical
     # disc holding two (or more) distinct movies, each pinned to a specific
@@ -473,27 +662,55 @@ def validate_queue_item(item: QueueItem) -> None:
     if item.episode_start < 1:
         raise ValueError("episode_start must be at least 1")
     if item.type == "tv-season":
-        if item.expected_episodes < 1:
-            raise ValueError("tv-season rows require expected_episodes >= 1")
-        if item.expected_disc_episodes < 1:
+        contract_fields = (
+            item.expected_episodes,
+            item.expected_disc_episodes,
+            item.expected_physical_disc,
+        )
+        has_contract = any(value != 0 for value in contract_fields) \
+            or bool(item.expected_title_ids)
+        if item.contract_source not in {"", "manual", "registry", "none"}:
             raise ValueError(
-                "tv-season rows require expected_disc_episodes >= 1"
+                "contract_source must be registry, manual, none, or empty"
             )
-        if item.expected_physical_disc < 1:
+        if not has_contract:
+            if item.contract_source not in {"", "none"}:
+                raise ValueError(
+                    "contractless tv-season rows require contract_source=none"
+                )
+        elif item.contract_source == "none":
+            raise ValueError("contract_source=none cannot carry contract fields")
+        if has_contract and item.expected_episodes < 1:
             raise ValueError(
-                "tv-season rows require expected_physical_disc >= 1"
+                "contracted tv-season rows require expected_episodes >= 1"
             )
-        final_ep = item.episode_start + item.expected_disc_episodes - 1
-        if final_ep > item.expected_episodes:
+        if has_contract and item.expected_disc_episodes < 1:
             raise ValueError(
-                "disc episode range exceeds expected_episodes "
-                f"({item.episode_start}-{final_ep} > {item.expected_episodes})"
+                "contracted tv-season rows require expected_disc_episodes >= 1"
             )
-        if (item.expected_title_ids
-                and len(item.expected_title_ids) != item.expected_disc_episodes):
+        if has_contract and item.expected_physical_disc < 1:
             raise ValueError(
-                "expected_title_ids length must equal expected_disc_episodes"
+                "contracted tv-season rows require expected_physical_disc >= 1"
             )
+        if has_contract:
+            if item.discs != 1:
+                raise ValueError(
+                    "contracted TV uses one queue row per physical disc; discs must be 1"
+                )
+            final_ep = item.episode_start + item.expected_disc_episodes - 1
+            if final_ep > item.expected_episodes:
+                raise ValueError(
+                    "disc episode range exceeds expected_episodes "
+                    f"({item.episode_start}-{final_ep} > {item.expected_episodes})"
+                )
+            if not item.expected_title_ids:
+                raise ValueError(
+                    "contracted tv-season rows require exact expected_title_ids"
+                )
+            if len(item.expected_title_ids) != item.expected_disc_episodes:
+                raise ValueError(
+                    "expected_title_ids length must equal expected_disc_episodes"
+                )
     if item.type == "double-feature" and len(item.features) < 2:
         raise ValueError("double-feature rows require at least two features")
     if item.type != "double-feature" and item.features:
@@ -556,6 +773,7 @@ def load_queue(path: Path) -> list[QueueItem]:
                     expected_physical_disc=csv_int(
                         row, "expected_physical_disc", 0
                     ),
+                    contract_source=(row.get("contract_source") or "").strip().lower(),
                     notes=(row.get("notes") or "").strip(),
                     features=_parse_features(row.get("features", "")),
                 )
@@ -568,10 +786,11 @@ def load_queue(path: Path) -> list[QueueItem]:
     return items
 
 # -------- state --------
-STATE_VERSION = 3
+STATE_VERSION = 5
 def default_state(items: list[QueueItem]) -> dict:
     return {
         "version": STATE_VERSION,
+        "run_id": os.urandom(16).hex(),
         "queue": [asdict(i) for i in items],
         "current_index": 0,
         "disc_index_in_item": 0,
@@ -582,10 +801,51 @@ def default_state(items: list[QueueItem]) -> dict:
     }
 
 def save_state(state: dict, path: str) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, path)
+    destination = Path(path)
+    payload = (json.dumps(state, indent=2) + "\n").encode()
+    temp = destination.with_name(
+        f".{destination.name}.{os.getpid()}-{time.time_ns()}-"
+        f"{os.urandom(8).hex()}.tmp"
+    )
+    temp_fd = None
+    replaced = False
+    try:
+        temp_fd = os.open(
+            str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        with os.fdopen(temp_fd, "wb") as stream:
+            temp_fd = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, destination)
+        replaced = True
+        parent_fd = os.open(
+            str(destination.parent),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        # replace(2) or the directory fsync can report an ambiguous error after
+        # the new state is visible. Exact bytes at the destination reconcile
+        # that boundary; otherwise preserve/propagate the failure.
+        try:
+            if destination.read_bytes() == payload:
+                return
+        except OSError:
+            pass
+        raise
+    finally:
+        if temp_fd is not None:
+            try: os.close(temp_fd)
+            except OSError: pass
+        if not replaced:
+            try: temp.unlink()
+            except OSError: pass
 
 def warn_state_location(state_path: str):
     abs_path = os.path.abspath(state_path)
@@ -653,9 +913,26 @@ def load_or_init(args, items) -> dict:
             print(f"{C.YLW}Prior state was fully complete and queue.csv changed; "
                   f"starting fresh.{C.R}")
             return default_state(items)
+        version = state.get("version")
+        if version != STATE_VERSION:
+            raise ValueError(
+                f"state file {p} uses schema version {version!r}; expected "
+                f"{STATE_VERSION}. Refusing an unsafe resume; archive the old "
+                "state and start a fresh run after checking staged files"
+            )
+        if (not isinstance(state.get("run_id"), str)
+                or not state["run_id"]):
+            raise ValueError(
+                f"state file {p} has invalid or missing 'run_id'"
+            )
+        if not same_queue:
+            raise ValueError(
+                f"queue.csv differs from incomplete state file {p}; refusing "
+                "to let the stale state contract override the corrected queue. "
+                "Archive the state and start fresh after checking staged files"
+            )
         print(f"{C.CYA}Resumed{C.R}: position {state['current_index']+1}/{len(state['queue'])}, "
               f"{len(state['completed'])} rips already done.")
-        warn_queue_divergence(state, items)
         return state
     print(f"{C.CYA}New run{C.R}: loaded {len(items)} queue items.")
     return default_state(items)
@@ -693,9 +970,12 @@ def partition_episode_contract(paths: list[Path], item: QueueItem
                                ) -> tuple[list[Path], list[Path], list[int]]:
     """Apply exact physical title identity while retaining disc order."""
 
+    if item.expected_disc_episodes == 0:
+        return paths, [], []
     if not item.expected_title_ids:
-        selected = paths[: item.expected_disc_episodes]
-        return selected, paths[item.expected_disc_episodes :], []
+        # validate_queue_item rejects this for every contracted row. Keep this
+        # boundary fail-closed for direct callers that bypass queue loading.
+        return [], paths, list(range(item.expected_disc_episodes))
     by_title = {title_num_from_filename(path.name): path for path in paths}
     missing = [title_id for title_id in item.expected_title_ids
                if title_id not in by_title]
@@ -1201,6 +1481,7 @@ def disc_label(info: dict) -> str:
 
 
 DISC_RECEIPT_DEFAULT = Path.home() / ".local" / "state" / "burndvd" / "disc-receipts.jsonl"
+TV_CLAIM_LEASE_S = 24 * 60 * 60
 
 
 def require_free_extra_destination(source: Path, destination: Path,
@@ -1252,30 +1533,310 @@ def disc_receipt_seen(path: Path, fingerprint: str) -> bool:
     return False
 
 
+def _queue_item_identity(item: QueueItem) -> str:
+    """Return the immutable identity used to bind a receipt to queue state."""
+
+    return hashlib.sha256(json.dumps(
+        asdict(item), sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+
+def _receipt_transaction_id(item: QueueItem, disc_n: int, fingerprint: str,
+                            files: list[str], queue_index: int | None = None,
+                            run_id: str | None = None,
+                            disc_episode_count: int | None = None,
+                            queue_disc_n: int | None = None) -> str:
+    payload = {
+        "run_id": run_id,
+        "fingerprint": fingerprint,
+        "queue_item_identity": _queue_item_identity(item),
+        "queue_index": queue_index,
+        "disc": int(disc_n),
+        "queue_disc_n": queue_disc_n,
+        "disc_episode_count": disc_episode_count,
+        "files": list(files),
+    }
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+
+
+def _receipt_transaction_seen(path: Path, transaction_id: str) -> bool:
+    if not path.exists():
+        return False
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"corrupt disc receipt ledger {path}: line {line_number}"
+                    ) from exc
+                if (row.get("transaction_id") == transaction_id
+                        and row.get("status") == "published"):
+                    return True
+    except OSError as exc:
+        raise RuntimeError(f"cannot read disc receipt ledger: {path}") from exc
+    return False
+
+
 def append_disc_receipt(path: Path, item: QueueItem, disc_n: int,
-                        fingerprint: str, files: list[str]) -> None:
+                        fingerprint: str, files: list[str], *,
+                        queue_index: int | None = None,
+                        run_id: str | None = None,
+                        disc_episode_count: int | None = None,
+                        queue_disc_n: int | None = None,
+                        elapsed_s: float = 0.0) -> str:
+    """Atomically and idempotently commit one publication receipt.
+
+    If an exception occurs after ``os.replace`` or directory fsync, reread the
+    ledger by deterministic transaction ID. A present row is a committed
+    success, avoiding the unsafe state where media is rolled back while a
+    permanent published fingerprint remains.
+    """
+
+    if not run_id:
+        raise ValueError("publication receipt requires the durable state run_id")
+    if queue_disc_n is None:
+        queue_disc_n = disc_n
     path.parent.mkdir(parents=True, exist_ok=True)
+    transaction_id = _receipt_transaction_id(
+        item, disc_n, fingerprint, files, queue_index, run_id,
+        disc_episode_count,
+        queue_disc_n,
+    )
     row = {
-        "version": 1,
+        "version": 3,
         "status": "published",
+        "transaction_id": transaction_id,
+        "run_id": run_id,
+        "queue_item_identity": _queue_item_identity(item),
+        "queue_index": queue_index,
         "fingerprint": fingerprint,
         "title": item.title,
         "season": item.season,
         "disc": int(disc_n),
+        "queue_disc_n": int(queue_disc_n),
+        "disc_episode_count": disc_episode_count,
         "expected_physical_disc": item.expected_physical_disc,
         "episode_start": item.episode_start,
         "expected_disc_episodes": item.expected_disc_episodes,
         "expected_title_ids": list(item.expected_title_ids),
+        "contract_source": item.contract_source,
         "expected_episodes": item.expected_episodes,
         "files": list(files),
+        "elapsed_s": float(elapsed_s),
         "ts": time.time(),
     }
-    with path.open("a", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    lock_path = path.with_name(f".{path.name}.lock")
+    temp_path = path.with_name(
+        f".{path.name}.{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.tmp"
+    )
+    lock_fd = os.open(
+        str(lock_path), os.O_RDWR | os.O_CREAT
+        | getattr(os, "O_NOFOLLOW", 0), 0o600,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        if _receipt_transaction_seen(path, transaction_id):
+            return transaction_id
+        existing = path.read_bytes() if path.exists() else b""
+        # Validate all existing rows before preserving them in the replacement.
+        if existing:
+            for line_number, line in enumerate(existing.splitlines(), start=1):
+                try:
+                    json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"corrupt disc receipt ledger {path}: line {line_number}"
+                    ) from exc
+        serialized = (
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode()
+        temp_fd = os.open(
+            str(temp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0), 0o600,
+        )
+        try:
+            with os.fdopen(temp_fd, "wb") as stream:
+                stream.write(existing)
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temp_fd = None
+            os.replace(temp_path, path)
+            parent_fd = os.open(
+                str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except BaseException:
+            if temp_fd is not None:
+                try: os.close(temp_fd)
+                except OSError: pass
+            # The replace/fsync boundary can report an error after durable
+            # commit. Reconcile by transaction identity before propagating.
+            if _receipt_transaction_seen(path, transaction_id):
+                return transaction_id
+            raise
+        finally:
+            try: temp_path.unlink()
+            except OSError: pass
+        return transaction_id
+    finally:
+        try: fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError: pass
+        os.close(lock_fd)
+
+
+def _read_disc_receipts(path: Path) -> list[dict]:
+    """Read a receipt ledger without treating unreadable data as absence."""
+
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        with path.open(encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"corrupt disc receipt ledger {path}: line {line_number}"
+                    ) from exc
+                if not isinstance(row, dict):
+                    raise RuntimeError(
+                        f"corrupt disc receipt ledger {path}: line {line_number}"
+                    )
+                rows.append(row)
+    except OSError as exc:
+        raise RuntimeError(f"cannot read disc receipt ledger: {path}") from exc
+    return rows
+
+
+def reconcile_committed_receipts(state: dict, args) -> int:
+    """Advance pending state after a crash beyond the receipt commit point.
+
+    Recovery is deliberately narrow: a v3 receipt must bind the exact queue
+    index, full queue-row identity, and pending disc. Every recorded final must
+    still be a regular file beneath that item's target root and decode cleanly.
+    """
+
+    rows = _read_disc_receipts(Path(args.disc_receipts))
+    recovered = 0
+    while state["current_index"] < len(state["queue"]):
+        queue_index = state["current_index"]
+        item = QueueItem(**state["queue"][queue_index])
+        queue_disc_n = state.get("disc_index_in_item", 0) + 1
+        # Contracted wrapper rows are one-row-per-physical-disc (`discs=1`),
+        # so their queue ordinal is always 1 even when the bound disc is D2+.
+        # Receipts carry physical identity; state progression uses the ordinal.
+        disc_n = (
+            item.expected_physical_disc
+            if item.type == "tv-season" and item.expected_disc_episodes > 0
+            else queue_disc_n
+        )
+        identity = _queue_item_identity(item)
+        matches = [
+            row for row in rows
+            if row.get("version") == 3
+            and row.get("status") == "published"
+            and row.get("run_id") == state["run_id"]
+            and row.get("queue_index") == queue_index
+            and row.get("queue_item_identity") == identity
+            and row.get("disc") == disc_n
+            and row.get("queue_disc_n") == queue_disc_n
+        ]
+        if not matches:
+            break
+        transaction_ids = {row.get("transaction_id") for row in matches}
+        if len(transaction_ids) != 1 or None in transaction_ids:
+            raise RuntimeError(
+                f"ambiguous committed receipts for queue row {queue_index + 1} "
+                f"disc {disc_n}; refusing state recovery"
+            )
+        row = matches[-1]
+        files = row.get("files")
+        if (not isinstance(files, list) or not files
+                or any(not isinstance(value, str) or not value
+                       for value in files)):
+            raise RuntimeError(
+                f"committed receipt for queue row {queue_index + 1} disc "
+                f"{disc_n} has no valid final-file list"
+            )
+        target_roots = [
+            Path(item.target_root).expanduser().resolve(strict=False)
+        ]
+        if item.target_root.startswith("/Volumes/Media/"):
+            target_roots.append(Path(item.target_root.replace(
+                "/Volumes/Media/", "/private/nas/media/", 1
+            )).resolve(strict=False))
+        for value in files:
+            final = Path(value)
+            try:
+                final_stat = os.lstat(final)
+                resolved_final = final.resolve(strict=True)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"committed receipt final is missing: {final}"
+                ) from exc
+            if not any(
+                resolved_final == root or resolved_final.is_relative_to(root)
+                for root in target_roots
+            ):
+                raise RuntimeError(
+                    f"committed receipt final escapes target root: {final}"
+                )
+            if not stat.S_ISREG(final_stat.st_mode):
+                raise RuntimeError(
+                    f"committed receipt final is not a regular file: {final}"
+                )
+        ok, error = verify(files)
+        if not ok:
+            raise RuntimeError(
+                f"committed receipt final verification failed: {error}"
+            )
+
+        elapsed_s = float(row.get("elapsed_s") or 0.0)
+        disc_episode_count = row.get("disc_episode_count")
+        if disc_episode_count is not None:
+            if (not isinstance(disc_episode_count, int)
+                    or disc_episode_count < 0):
+                raise RuntimeError(
+                    f"committed receipt for queue row {queue_index + 1} "
+                    f"disc {disc_n} has an invalid episode count"
+                )
+            record_episode_count(
+                item, disc_n, disc_episode_count, state
+            )
+        state["completed"].append({
+            "item": item.title,
+            "disc_n": disc_n,
+            "type": item.type,
+            "files": list(files),
+            "elapsed_s": elapsed_s,
+            "ts": float(row.get("ts") or time.time()),
+            "recovered_from_receipt": row["transaction_id"],
+        })
+        state.get("recent_stall_bytes", {}).pop(
+            f"{item.title}||disc{disc_n}", None
+        )
+        state.get("failure_retry_counts", {}).pop(
+            f"{item.title}||disc{disc_n}", None
+        )
+        if elapsed_s > 0:
+            state["rip_durations_s"].append(elapsed_s)
+            state["rip_durations_s"] = state["rip_durations_s"][-30:]
+        if queue_disc_n >= item.discs:
+            state["current_index"] += 1
+            state["disc_index_in_item"] = 0
+        else:
+            state["disc_index_in_item"] += 1
+        recovered += 1
+    return recovered
 
 
 def tv_slot_claim_path(destination: Path) -> Path:
@@ -1284,22 +1845,136 @@ def tv_slot_claim_path(destination: Path) -> Path:
     return destination.with_name(f".{destination.name}.burndvd-claim")
 
 
+def _host_boot_id() -> str:
+    """Best-effort boot identity used to distinguish a live owner from reboot."""
+
+    linux_boot_id = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        return linux_boot_id.read_text(encoding="ascii").strip()
+    except OSError:
+        pass
+    try:
+        completed = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if completed.returncode == 0 and completed.stdout.strip():
+            return hashlib.sha256(completed.stdout.encode()).hexdigest()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return "unknown"
+
+
+def _claim_owner_alive(payload: dict) -> bool:
+    if payload.get("host") != os.uname().nodename:
+        return False
+    if payload.get("boot_id") not in {_host_boot_id(), "unknown"}:
+        return False
+    try:
+        pid = int(payload["pid"])
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (KeyError, TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def reclaim_stale_tv_claim(path: Path, *, now: float | None = None) -> bool:
+    """Inode-safely reclaim a dead/expired durable claim.
+
+    Same-host claims become stale immediately after their owning process dies
+    (or after a reboot). Cross-host and legacy zero-byte claims age out only
+    after the lease, preventing an active writer on another machine from being
+    mistaken for an orphan.
+    """
+
+    now = time.time() if now is None else now
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(before.st_mode):
+        return False
+    payload = None
+    try:
+        descriptor = os.open(
+            str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                return False
+            raw = os.read(descriptor, 16 * 1024)
+        finally:
+            os.close(descriptor)
+        if raw:
+            value = json.loads(raw.decode("utf-8"))
+            if isinstance(value, dict) and value.get("version") == 1:
+                payload = value
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    if payload is None:
+        stale = before.st_mtime + TV_CLAIM_LEASE_S <= now
+    elif _claim_owner_alive(payload):
+        stale = False
+    elif payload.get("host") == os.uname().nodename:
+        stale = True
+    else:
+        try:
+            stale = float(payload["lease_expires_at"]) <= now
+        except (KeyError, TypeError, ValueError):
+            stale = False
+    if not stale:
+        return False
+    try:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            return False
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
 def _create_tv_slot_claim(path: Path) -> tuple[int, int]:
-    """Create one claim atomically and return its stable filesystem identity."""
+    """Create one durable owner/lease claim and return its inode identity."""
 
     descriptor = None
     identity = None
     try:
-        descriptor = os.open(
-            str(path),
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
-            0o644,
-        )
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+        try:
+            descriptor = os.open(str(path), flags, 0o644)
+        except FileExistsError:
+            if not reclaim_stale_tv_claim(path):
+                raise
+            descriptor = os.open(str(path), flags, 0o644)
         created = os.fstat(descriptor)
         identity = (created.st_dev, created.st_ino)
         if not stat.S_ISREG(created.st_mode) or created.st_size != 0:
             raise OSError(f"invalid TV slot claim created at {path}")
+        now = time.time()
+        payload = {
+            "version": 1,
+            "pid": os.getpid(),
+            "host": os.uname().nodename,
+            "boot_id": _host_boot_id(),
+            "created_at": now,
+            "lease_expires_at": now + TV_CLAIM_LEASE_S,
+            "token": os.urandom(16).hex(),
+        }
+        os.write(
+            descriptor,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+        )
+        os.fsync(descriptor)
         return identity
     except BaseException:
         if identity is not None:
@@ -1386,6 +2061,11 @@ def existing_episode_slots(item: QueueItem, target_dir: Path, *,
             is_claim = match is not None
         if not match:
             continue
+        if is_claim and reclaim_stale_tv_claim(entry):
+            # Production callers perform this inventory scan while holding the
+            # season lock. A dead-owner/expired claim is therefore reclaimed
+            # before it can divert a normal read into review mode.
+            continue
         try:
             if not is_claim and entry.stat().st_size <= 0 and not include_claims:
                 continue
@@ -1412,6 +2092,11 @@ def tv_contract_output_mode(item: QueueItem, target_dir: Path, *,
         return "normal", None, []
     if rerip_review:
         return "review", None, []
+    if item.expected_disc_episodes == 0:
+        # Fully contractless unknown series use filesystem-aware numbering and
+        # heuristic episode classification. There is no authoritative range
+        # or season total to compare here.
+        return "normal", None, []
     # Include 0-byte atomic slot reservations.  They represent an in-flight
     # publication and must make a recognized concurrent read choose review.
     slots = existing_episode_slots(item, target_dir, include_claims=True)
@@ -1505,11 +2190,41 @@ def bound_physical_disc(item: QueueItem, info: dict, queue_disc_n: int) -> int:
 
     detected = disc_n_from_label(info)
     if item.type != "tv-season":
-        return detected if detected is not None else queue_disc_n
+        return queue_disc_n
+    if item.expected_disc_episodes == 0:
+        return queue_disc_n
     label = disc_label(info)
-    normalized_label = re.sub(r"[^a-z0-9]+", "", label.casefold())
-    normalized_title = re.sub(r"[^a-z0-9]+", "", item.title.casefold())
-    if not normalized_title or normalized_title not in normalized_label:
+    source = item.contract_source or "manual"
+
+    def label_has_title() -> bool:
+        title_tokens = re.findall(r"[a-z0-9]+", item.title.casefold())
+        label_tokens = re.findall(r"[a-z0-9]+", label.casefold())
+        if not title_tokens:
+            return False
+        if len(title_tokens) == 1 and len(title_tokens[0]) <= 3:
+            # Short titles such as "Up" must match a complete label token;
+            # compact substring matching accepted unrelated labels like CUP.
+            return title_tokens[0] in label_tokens
+        return "".join(title_tokens) in "".join(label_tokens)
+
+    generic = bool(re.fullmatch(
+        r"(?:disc|disk|dvd|bd|bluray|blu-ray|volume|vol|untitled|movie)"
+        r"(?:[\s_.:-]*0*\d{1,2})?",
+        label.strip(), re.IGNORECASE,
+    ))
+    if source == "manual" and generic:
+        # Generic mastering labels contain no title/season identity. A complete
+        # operator-authored contract remains usable, but a visible disc number
+        # must agree whenever the label provides one.
+        if detected is not None and detected != item.expected_physical_disc:
+            raise ValueError(
+                "physical TV disc mismatch: "
+                f"manual contract expects disc {item.expected_physical_disc}, "
+                f"label reports {detected}"
+            )
+        return item.expected_physical_disc
+
+    if not label_has_title():
         raise ValueError(
             f"physical TV title mismatch: expected {item.title!r}, label reports {label!r}"
         )
@@ -1533,6 +2248,10 @@ def bound_physical_disc(item: QueueItem, info: dict, queue_disc_n: int) -> int:
             f"contract expects disc {item.expected_physical_disc}, "
             f"label reports {detected}"
         )
+    if source == "registry":
+        registry_error = automatic_review_contract_error(item, info)
+        if registry_error:
+            raise ValueError(registry_error.replace("automatic-review ", ""))
     return item.expected_physical_disc
 
 
@@ -1741,6 +2460,11 @@ def select_titles(item: QueueItem, info: dict) -> list[int]:
                       f"-- higher bitrate wins on a same-feature alternate")
             return [best_tid]
         return [longest_tid]
+    if item.expected_disc_episodes > 0:
+        # Contracted TV identity is exact and overrides all duration/play-all
+        # heuristics. Missing IDs are detected after the optical read and fail
+        # closed with staging preserved.
+        return list(item.expected_title_ids)
     play_all = play_all_title_ids(info)
     cand = [(tid, dur) for tid, dur in durs
             if dur >= TV_MIN_DUR_S and tid not in play_all]
@@ -1965,6 +2689,21 @@ def compute_target_dir(item: QueueItem) -> Path:
     return root / f"Season {item.season:02d}"
 
 
+def _rip_publication_result(args, elapsed: float, finals: list[str],
+                            move_jobs: list, staging: Path) -> dict:
+    """Return a rip result without dropping deferred verified publications."""
+
+    # Every mode, including legacy --sync-move, uses the same bound two-phase
+    # publisher. The caller already waits for finalization before state/eject,
+    # which preserves sync semantics without any plain-shutil.move race.
+    return {
+        "elapsed_s": elapsed,
+        "files": finals,
+        "move_jobs": move_jobs,
+        "staging": str(staging),
+    }
+
+
 def _validated_tv_review_root(
     item: QueueItem, effective_target_dir: Path,
     review_root: str | Path | None = None,
@@ -1997,7 +2736,7 @@ def _validated_tv_review_root(
     # Normalize ``..`` and resolve every existing symlinked ancestor before
     # containment checks.  A lexical check alone can be walked or symlinked
     # straight back into Jellyfin's tree.
-    quarantine_root = quarantine_root.resolve(strict=False)
+    quarantine_root = Path(os.path.abspath(os.fspath(quarantine_root)))
     if any(
         candidate.name.casefold() in {"tv shows", "tv shows 4k"}
         for candidate in (quarantine_root, *quarantine_root.parents)
@@ -2013,6 +2752,13 @@ def _validated_tv_review_root(
         except ValueError:
             continue
         raise ValueError("review destination must be outside the media library")
+    try:
+        _assert_no_symlink_ancestry(quarantine_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"review destination must be outside the media library and have "
+            f"safe ancestry: {exc}"
+        ) from exc
     return quarantine_root, forbidden_roots
 
 
@@ -2025,7 +2771,9 @@ def tv_partial_capture_root(
     quarantine_root, forbidden_roots = _validated_tv_review_root(
         item, effective_target_dir, review_root
     )
-    partial_root = (quarantine_root / ".burndvd-partials").resolve(strict=False)
+    partial_root = Path(os.path.abspath(
+        os.fspath(quarantine_root / ".burndvd-partials")
+    ))
     try:
         partial_root.relative_to(quarantine_root)
     except ValueError as exc:
@@ -2047,8 +2795,8 @@ def tv_partial_capture_root(
 def protected_quarantine_child(parent: Path, name: str) -> Path:
     """Resolve one quarantine child and reject symlink/path escapes."""
 
-    parent = Path(parent).resolve(strict=False)
-    child = (parent / name).resolve(strict=False)
+    parent = Path(os.path.abspath(os.fspath(Path(parent))))
+    child = Path(os.path.abspath(os.fspath(parent / name)))
     try:
         child.relative_to(parent)
     except ValueError as exc:
@@ -2058,6 +2806,7 @@ def protected_quarantine_child(parent: Path, name: str) -> Path:
         for candidate in (child, *child.parents)
     ):
         raise ValueError("quarantine child must be outside every TV library")
+    _assert_no_symlink_ancestry(child)
     return child
 
 
@@ -2075,10 +2824,10 @@ def tv_review_capture_dir(item: QueueItem, effective_target_dir: Path,
     quarantine_root, forbidden_roots = _validated_tv_review_root(
         item, effective_target_dir, review_root
     )
-    capture = (
+    capture = Path(os.path.abspath(os.fspath(
         quarantine_root / safe_title /
         f"Season {item.season:02d}" / compact_fingerprint[:16]
-    ).resolve(strict=False)
+    )))
     try:
         capture.relative_to(quarantine_root)
     except ValueError as exc:
@@ -2089,6 +2838,13 @@ def tv_review_capture_dir(item: QueueItem, effective_target_dir: Path,
         except ValueError:
             continue
         raise ValueError("review destination must be outside the media library")
+
+    try:
+        _assert_no_symlink_ancestry(capture)
+    except ValueError as exc:
+        raise ValueError(
+            f"review destination escaped safe quarantine ancestry: {exc}"
+        ) from exc
 
     return capture
 
@@ -2547,7 +3303,10 @@ def _salvage_and_fail(args, item: QueueItem, info: dict, disc_n: int,
         partial_dir = target_dir / "_partial"
     saved_names = []
     try:
-        partial_dir.mkdir(parents=True, exist_ok=True)
+        if item.type == "tv-season":
+            _secure_mkdirs(partial_dir)
+        else:
+            partial_dir.mkdir(parents=True, exist_ok=True)
         planned = []
         for p in complete:
             tnum = title_num_from_filename(p.name)
@@ -2572,7 +3331,10 @@ def _salvage_and_fail(args, item: QueueItem, info: dict, disc_n: int,
                     lock_dir=target_dir,
                 )
             else:
-                move_with_progress(p, dest, label=f"salvaging {tag}")
+                move_with_progress(
+                    p, dest, label=f"salvaging {tag}",
+                    overwrite=bool(args.overwrite),
+                )
             saved_names.append(dest.name)
     except OSError as e:
         # Quarantine itself failed (mount drop): keep staging so nothing is lost.
@@ -2634,7 +3396,10 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                 return False, str(exc)
         else:
             output_dir = target_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if item.type == "tv-season":
+            _secure_mkdirs(output_dir)
+        else:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
     free_gb = _free_gb(output_dir)
     if free_gb < args.min_free_gb:
@@ -2863,7 +3628,7 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                 )
             except ValueError as exc:
                 return False, f"{exc}; RIP PRESERVED at {staging}"
-            output_dir.mkdir(parents=True, exist_ok=True)
+            _secure_mkdirs(output_dir)
 
     # Deferred NAS moves: collect (src, dst, label) jobs instead of copying
     # inline, so the caller can eject + free the drive the moment staging is
@@ -2876,23 +3641,10 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                    publish_lock_held: bool = False):
         protected = item.type == "tv-season"
         protected_lock_dir = dst.parent if protected else None
-        if getattr(args, "sync_move", False):
-            if protected:
-                move_with_progress_noclobber(
-                    src, dst, label=label,
-                    placeholder_identity=placeholder_identity,
-                    claim_path=claim_path,
-                    partial_root=protected_partial_root,
-                    lock_dir=protected_lock_dir,
-                    publish_lock_held=publish_lock_held,
-                )
-            else:
-                move_with_progress(src, dst, label=label)
-        else:
-            move_jobs.append(
-                (src, dst, label, protected, placeholder_identity, claim_path,
-                 protected_partial_root, protected_lock_dir)
-            )
+        move_jobs.append(
+            (src, dst, label, protected, placeholder_identity, claim_path,
+             protected_partial_root, protected_lock_dir)
+        )
 
     _dur_cache: dict = {}
     def _src_dur_s(src: Path) -> int:
@@ -2913,7 +3665,10 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
     def _move_extras(extra_srcs: list, extras_dir: Path, name_for):
         """Route short titles to Extras/. name_for(src, tnum) → final filename."""
         if not extra_srcs: return
-        extras_dir.mkdir(parents=True, exist_ok=True)
+        if item.type == "tv-season":
+            _secure_mkdirs(extras_dir)
+        else:
+            extras_dir.mkdir(parents=True, exist_ok=True)
         for src in extra_srcs:
             tnum = title_num_from_filename(src.name)
             dest = extras_dir / name_for(src, tnum)
@@ -2935,6 +3690,8 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
     # stranded the staged files. Verify writability, retry (~10 min; mounts
     # recover), and on persistent failure PRESERVE staging and bail cleanly.
     def _dest_writable() -> bool:
+        if item.type == "tv-season":
+            return _secure_dir_writable(output_dir)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             probe = output_dir / f".writeprobe-{os.getpid()}"
@@ -3057,18 +3814,34 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         # shove every later episode up one (S2D1/S2D2/S3D1, 2026-05-29). Drop the
         # play-all title ids here so select_titles' decision actually takes effect
         # on the TV path; the blob is left in staging and cleaned up below.
-        play_all = play_all_title_ids(info)
-        episode_rips = [p for p in rips
-                        if _src_dur_s(p) >= TV_MIN_DUR_S
-                        and title_num_from_filename(p.name) not in play_all]
-        extras_rips  = [p for p in rips if _src_dur_s(p) <  TV_MIN_DUR_S]
+        contracted_ids = (
+            set(item.expected_title_ids)
+            if item.expected_disc_episodes > 0 else set()
+        )
+        play_all = set() if contracted_ids else play_all_title_ids(info)
+        if contracted_ids:
+            # The audited title table is authoritative. Duration, play-all,
+            # and alternate-playlist heuristics must not demote a contracted
+            # episode to Extras or silently delete it.
+            episode_rips = [
+                path for path in rips
+                if title_num_from_filename(path.name) in contracted_ids
+            ]
+            extras_rips = [path for path in rips if path not in episode_rips]
+        else:
+            episode_rips = [p for p in rips
+                            if _src_dur_s(p) >= TV_MIN_DUR_S
+                            and title_num_from_filename(p.name) not in play_all]
+            extras_rips = [p for p in rips if _src_dur_s(p) < TV_MIN_DUR_S]
         # Relative-duration gate: an "episode" that clears the absolute TV
         # floor but runs far shorter than the disc's median episode is bonus
         # content (e.g. a 14-min featurette among 44-min episodes). Move it
         # into extras so it is SAVED as an extra, not numbered as a phantom
         # episode (which also shoved the next disc's episode-start up). The
         # play-all salvage below then runs on the cleaned episode list.
-        _gcand = [(title_num_from_filename(pp.name), _src_dur_s(pp)) for pp in episode_rips]
+        _gcand = ([] if contracted_ids else
+                  [(title_num_from_filename(pp.name), _src_dur_s(pp))
+                   for pp in episode_rips])
         _gkeep, _gbonus, _gthr = episode_bonus_split(_gcand)
         if _gbonus:
             _gbonus_set = set(_gbonus)
@@ -3178,7 +3951,7 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         # Alternate-playlist dedup: keep the lowest-numbered title of each
         # duplicate set, drop the rest so they never promote as phantom
         # duplicate episodes. Content-verified (see _alt_playlist_duplicate).
-        if len(episode_rips) > 1:
+        if len(episode_rips) > 1 and not contracted_ids:
             _by_tid = sorted(episode_rips,
                              key=lambda pp: title_num_from_filename(pp.name) or 0)
             _kept, _dups = [], []
@@ -3211,7 +3984,10 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
             episode_rips = []
         else:
             expected = item.expected_disc_episodes
-            if item.expected_title_ids:
+            if expected > 0:
+                # Every contracted TV row carries exact title IDs. Never fall
+                # back to "first N" selection: bonus/commentary titles can be
+                # episode-length and often sort before the actual episode.
                 selected, overflow, missing_ids = partition_episode_contract(
                     episode_rips, item
                 )
@@ -3229,21 +4005,6 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                         ),
                     )
                 episode_rips = selected
-            elif len(episode_rips) < expected:
-                return False, (
-                    f"physical disc yielded {len(episode_rips)} episode candidate(s), "
-                    f"but its contract requires {expected}; RIP PRESERVED at {staging}"
-                )
-            elif len(episode_rips) > expected:
-                overflow = episode_rips[expected:]
-                _move_extras(
-                    overflow, target_dir / "Extras",
-                    lambda src, tnum: (
-                        f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
-                        f"contract-overflow-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
-                    ),
-                )
-                episode_rips = episode_rips[:expected]
 
             # Old runs predate the durable disc ledger. Compare decoded frames
             # against every same-duration landed episode before publishing.
@@ -3265,11 +4026,9 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
         rips = episode_rips
         if not rips:
             print(f"{C.YLW}  No titles >= {TV_MIN_DUR_S}s — extras-only disc.{C.R}")
-            if getattr(args, "sync_move", False):
-                shutil.rmtree(staging, ignore_errors=True)
-                return True, {"elapsed_s": elapsed, "files": finals}
-            return True, {"elapsed_s": elapsed, "files": finals,
-                          "move_jobs": move_jobs, "staging": str(staging)}
+            return True, _rip_publication_result(
+                args, elapsed, finals, move_jobs, staging
+            )
         # Season-dir lock spans the start_ep computation + the file-naming
         # decisions + the placeholder claim. Once this block exits, parallel
         # rips of the same season can safely scan the dir and see our
@@ -3347,7 +4106,7 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                     manual_dir = protected_quarantine_child(
                         manual_dir, "_manual-order"
                     )
-                    manual_dir.mkdir(parents=True, exist_ok=True)
+                    _secure_mkdirs(manual_dir)
                 except (OSError, ValueError) as exc:
                     return False, (
                         f"cannot isolate manual-order TV output: {exc}; RIP "
@@ -3383,11 +4142,9 @@ def rip(args, item: QueueItem, info: dict, title_ids: list[int],
                     print(f"{C.YLW}  Counter not advanced; next disc → "
                           f"S{item.season:02d}E{starting_ep(item, disc_n+1, state):02d}.{C.R}")
 
-    if getattr(args, "sync_move", False):
-        shutil.rmtree(staging, ignore_errors=True)
-        return True, {"elapsed_s": elapsed, "files": finals}
-    return True, {"elapsed_s": elapsed, "files": finals,
-                  "move_jobs": move_jobs, "staging": str(staging)}
+    return True, _rip_publication_result(
+        args, elapsed, finals, move_jobs, staging
+    )
 
 def rip_double_feature(args, item: QueueItem, info: dict, state: dict, disc_n: int):
     """Rip a disc holding two (or more) distinct movies. Each feature was pinned
@@ -3402,6 +4159,8 @@ def rip_double_feature(args, item: QueueItem, info: dict, state: dict, disc_n: i
     all_files: list[str] = []
     total_elapsed = 0.0
     errors: list[str] = []
+    all_move_jobs: list = []
+    all_staging_dirs: list[str] = []
     for n, feat in enumerate(item.features, 1):
         tid, name = feat["title_id"], feat["name"]
         if tid not in present:
@@ -3423,17 +4182,29 @@ def rip_double_feature(args, item: QueueItem, info: dict, state: dict, disc_n: i
             continue
         all_files.extend(result["files"])
         total_elapsed += result["elapsed_s"]
+        all_move_jobs.extend(result.get("move_jobs") or [])
+        if result.get("staging"):
+            all_staging_dirs.append(result["staging"])
         append_log(args, f"OK    {item.title} :: {name} t{tid:02d}  "
                          f"{fmt_dur(result['elapsed_s'])}  {len(result['files'])} file(s)")
     if not all_files:
         return False, "all features failed: " + " | ".join(errors)
-    return True, {"elapsed_s": total_elapsed, "files": all_files}
+    final = {"elapsed_s": total_elapsed, "files": all_files}
+    if all_move_jobs:
+        final["move_jobs"] = all_move_jobs
+        final["staging_dirs"] = all_staging_dirs
+        final["staging"] = all_staging_dirs[0] if all_staging_dirs else None
+    return True, final
 
 def verify(paths: list[str]):
     for p in paths:
-        r = subprocess.run([FFMPEG_BIN, "-nostdin", "-v", "error", "-i", p, "-f", "null", "-"],
+        r = subprocess.run([FFMPEG_BIN, "-nostdin", "-v", "error", "-xerror",
+                            "-i", p, "-f", "null", "-"],
                            capture_output=True, text=True)
-        if r.returncode != 0:
+        # Some ffmpeg builds have returned zero while still emitting decode
+        # errors. With -v error stderr is itself failure evidence; -xerror asks
+        # ffmpeg to terminate at the first such decode error as well.
+        if r.returncode != 0 or r.stderr.strip():
             return False, f"{p}: exit {r.returncode}; {r.stderr.strip()[:240]}"
     return True, ""
 
@@ -3542,13 +4313,7 @@ def run_subocr_postrip(args, files: list[str]):
 #   - short-episode routing: sub-TV_MIN_DUR_S real episodes routed to Extras.
 #   - durable-log-in-tmp: append_log target under /tmp not persisted across reboot.
 def _dir_writable(dirpath: Path) -> bool:
-    try:
-        dirpath.mkdir(parents=True, exist_ok=True)
-        probe = dirpath / f".writeprobe-{os.getpid()}-{threading.get_ident()}"
-        probe.write_text("ok"); probe.unlink()
-        return True
-    except OSError:
-        return False
+    return _secure_dir_writable(dirpath)
 
 def _await_dir_writable(dirpath: Path, staging) -> bool:
     """Block until `dirpath` is writable, retrying ~10 min (12×50s). Mirrors the
@@ -3610,11 +4375,11 @@ def _unpack_move_job(job):
 def _remove_zero_placeholder(
     dst: Path, placeholder_identity: tuple[int, int] | None
 ) -> None:
-    """Remove only an unpopulated regular-file claim; never foreign bytes."""
+    """Remove only the exact regular-file claim inode; never a replacement."""
 
     try:
         current = os.lstat(dst)
-        if (stat.S_ISREG(current.st_mode) and current.st_size == 0
+        if (stat.S_ISREG(current.st_mode)
                 and (current.st_dev, current.st_ino) == placeholder_identity):
             dst.unlink()
     except OSError:
@@ -3629,87 +4394,498 @@ def _remove_claimed_placeholders(
     for destination in claimed:
         _remove_zero_placeholder(destination, identities.get(destination))
 
+
+@dataclass
+class PreparedPublication:
+    src: Path
+    dst: Path
+    label: str
+    protected: bool
+    placeholder_identity: tuple[int, int] | None
+    claim_path: Path | None
+    partial_root: Path
+    partial_name: str
+    partial_dir_fd: int
+    destination_dir_fd: int
+    partial_identity: tuple[int, int]
+    partial_size: int
+    source_identity: tuple[int, int]
+    allow_replace: bool = False
+    published_identity: tuple[int, int] | None = None
+    backup_name: str | None = None
+    backup_identity: tuple[int, int] | None = None
+
+
+def _close_prepared(prepared: PreparedPublication) -> None:
+    for descriptor in (prepared.partial_dir_fd, prepared.destination_dir_fd):
+        try: os.close(descriptor)
+        except OSError: pass
+
+
+def _prepare_publication(args, item: QueueItem, job) -> PreparedPublication:
+    """Copy and decode-verify one private partial without publishing it."""
+
+    (src, dst, label, protected, placeholder_identity, claim_path,
+     partial_root, _) = _unpack_move_job(job)
+    src, dst = Path(src), Path(dst)
+    if protected:
+        if partial_root is None:
+            raise ValueError("protected publication requires a quarantine root")
+        partial_root = Path(partial_root)
+    else:
+        partial_root = dst.parent / ".burndvd-partials"
+    destination_dir_fd = _open_directory_tree_nofollow(dst.parent, create=True)
+    try:
+        partial_dir_fd = _open_directory_tree_nofollow(
+            partial_root, create=True
+        )
+    except BaseException:
+        os.close(destination_dir_fd)
+        raise
+    partial_name = (
+        f".{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.partial"
+    )
+    source_fd = output_fd = None
+    partial_identity = source_identity = None
+    try:
+        source_fd = os.open(
+            str(src), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError(f"publication source is not a regular file: {src}")
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
+        output_fd = os.open(
+            partial_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+            0o644, dir_fd=partial_dir_fd,
+        )
+        partial_stat = os.fstat(output_fd)
+        partial_identity = (partial_stat.st_dev, partial_stat.st_ino)
+        print(
+            f"{C.D}{label}: {src.name} -> {dst} (prepare+verify){C.R}",
+            flush=True,
+        )
+        with os.fdopen(source_fd, "rb") as source_stream, \
+                os.fdopen(output_fd, "wb") as output_stream:
+            source_fd = output_fd = None
+            shutil.copyfileobj(
+                source_stream, output_stream, length=8 * 1024 * 1024
+            )
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        copied = os.stat(
+            partial_name, dir_fd=partial_dir_fd, follow_symlinks=False
+        )
+        current_source = os.lstat(src)
+        if ((copied.st_dev, copied.st_ino) != partial_identity
+                or copied.st_size != source_stat.st_size):
+            raise OSError(f"prepared partial identity/size changed for {dst}")
+        if ((current_source.st_dev, current_source.st_ino) != source_identity
+                or current_source.st_size != source_stat.st_size):
+            raise OSError(f"source changed while preparing publication: {src}")
+        partial_path = partial_root / partial_name
+        if getattr(args, "verify", False):
+            ok, error = verify([str(partial_path)])
+            if not ok:
+                raise OSError(
+                    f"prepared-copy verification failed before publication: {error}"
+                )
+        return PreparedPublication(
+            src=src, dst=dst, label=label, protected=protected,
+            placeholder_identity=placeholder_identity,
+            claim_path=Path(claim_path) if claim_path is not None else None,
+            partial_root=partial_root, partial_name=partial_name,
+            partial_dir_fd=partial_dir_fd,
+            destination_dir_fd=destination_dir_fd,
+            partial_identity=partial_identity,
+            partial_size=source_stat.st_size,
+            source_identity=source_identity,
+            allow_replace=bool(getattr(args, "overwrite", False)
+                               and item.type == "movie"),
+        )
+    except BaseException:
+        for descriptor in (source_fd, output_fd):
+            if descriptor is not None:
+                try: os.close(descriptor)
+                except OSError: pass
+        try:
+            current = os.stat(
+                partial_name, dir_fd=partial_dir_fd, follow_symlinks=False
+            )
+            if partial_identity is not None and (
+                current.st_dev, current.st_ino
+            ) == partial_identity:
+                os.unlink(partial_name, dir_fd=partial_dir_fd)
+        except OSError:
+            pass
+        os.close(partial_dir_fd)
+        os.close(destination_dir_fd)
+        raise
+
+
+def _publish_prepared(prepared: PreparedPublication) -> None:
+    """Commit one already-verified partial and record its exact inode."""
+
+    try:
+        partial = os.stat(
+            prepared.partial_name,
+            dir_fd=prepared.partial_dir_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise OSError(
+            f"verified private partial disappeared before publication: "
+            f"{prepared.dst}"
+        ) from exc
+    if (not stat.S_ISREG(partial.st_mode)
+            or (partial.st_dev, partial.st_ino) != prepared.partial_identity
+            or partial.st_size != prepared.partial_size):
+        raise OSError(
+            f"verified private partial identity changed before publication: "
+            f"{prepared.dst}"
+        )
+
+    if prepared.claim_path is not None:
+        if prepared.claim_path.parent != prepared.dst.parent:
+            raise ValueError("claim escaped its destination directory")
+        claim = os.stat(
+            prepared.claim_path.name,
+            dir_fd=prepared.destination_dir_fd, follow_symlinks=False,
+        )
+        if (not stat.S_ISREG(claim.st_mode)
+                or (claim.st_dev, claim.st_ino)
+                != prepared.placeholder_identity):
+            raise FileExistsError(
+                f"TV slot claim ownership changed: {prepared.claim_path}"
+            )
+
+    destination_exists = False
+    try:
+        existing = os.stat(
+            prepared.dst.name, dir_fd=prepared.destination_dir_fd,
+            follow_symlinks=False,
+        )
+        destination_exists = True
+    except FileNotFoundError:
+        existing = None
+    if destination_exists and not prepared.allow_replace:
+        raise FileExistsError(errno.EEXIST, "destination exists", prepared.dst)
+    if destination_exists:
+        prepared.backup_name = (
+            f".{prepared.dst.name}.burndvd-backup-{os.getpid()}-"
+            f"{time.time_ns()}-{os.urandom(8).hex()}"
+        )
+        os.rename(
+            prepared.dst.name, prepared.backup_name,
+            src_dir_fd=prepared.destination_dir_fd,
+            dst_dir_fd=prepared.destination_dir_fd,
+        )
+        backup = os.stat(
+            prepared.backup_name, dir_fd=prepared.destination_dir_fd,
+            follow_symlinks=False,
+        )
+        prepared.backup_identity = (backup.st_dev, backup.st_ino)
+    try:
+        _atomic_rename_noreplace_at(
+            prepared.partial_name, prepared.partial_dir_fd,
+            prepared.dst.name, prepared.destination_dir_fd,
+        )
+    except BaseException:
+        if prepared.backup_name is not None:
+            try:
+                _atomic_rename_noreplace_at(
+                    prepared.backup_name, prepared.destination_dir_fd,
+                    prepared.dst.name,
+                    prepared.destination_dir_fd,
+                )
+                prepared.backup_name = None
+                prepared.backup_identity = None
+            except OSError as restore_error:
+                raise RuntimeError(
+                    f"publication failed and backup restore was blocked for "
+                    f"{prepared.dst}; backup retained as "
+                    f"{prepared.backup_name}: {restore_error}"
+                )
+        raise
+    published = os.stat(
+        prepared.dst.name, dir_fd=prepared.destination_dir_fd,
+        follow_symlinks=False,
+    )
+    prepared.published_identity = (published.st_dev, published.st_ino)
+    if (not stat.S_ISREG(published.st_mode)
+            or prepared.published_identity != prepared.partial_identity
+            or published.st_size != prepared.partial_size):
+        raise OSError(
+            f"published destination identity/size differs from verified "
+            f"partial: {prepared.dst}"
+        )
+
+
+def _rollback_prepared_batch(
+    prepared_batch: list[PreparedPublication],
+) -> list[str]:
+    """Undo only exact destinations/partials created by this transaction."""
+
+    errors: list[str] = []
+    for prepared in reversed(prepared_batch):
+        if prepared.published_identity is not None:
+            try:
+                current = os.stat(
+                    prepared.dst.name, dir_fd=prepared.destination_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (current.st_dev, current.st_ino) == prepared.published_identity:
+                    os.unlink(
+                        prepared.dst.name, dir_fd=prepared.destination_dir_fd
+                    )
+                else:
+                    errors.append(
+                        f"published destination ownership changed: {prepared.dst}"
+                    )
+            except FileNotFoundError:
+                pass
+            except OSError:
+                errors.append(f"could not remove published destination {prepared.dst}")
+        if prepared.backup_name is not None:
+            try:
+                backup = os.stat(
+                    prepared.backup_name,
+                    dir_fd=prepared.destination_dir_fd,
+                    follow_symlinks=False,
+                )
+                if ((backup.st_dev, backup.st_ino)
+                        == prepared.backup_identity):
+                    _atomic_rename_noreplace_at(
+                        prepared.backup_name,
+                        prepared.destination_dir_fd,
+                        prepared.dst.name,
+                        prepared.destination_dir_fd,
+                    )
+                else:
+                    errors.append(f"backup ownership changed for {prepared.dst}")
+            except OSError as exc:
+                errors.append(f"could not restore backup for {prepared.dst}: {exc}")
+        try:
+            partial = os.stat(
+                prepared.partial_name, dir_fd=prepared.partial_dir_fd,
+                follow_symlinks=False,
+            )
+            if (partial.st_dev, partial.st_ino) == prepared.partial_identity:
+                os.unlink(prepared.partial_name, dir_fd=prepared.partial_dir_fd)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            errors.append(f"could not remove private partial for {prepared.dst}: {exc}")
+        claim_error = _remove_prepared_claim(prepared)
+        if claim_error:
+            errors.append(claim_error)
+    return errors
+
+
+def _remove_prepared_claim(prepared: PreparedPublication) -> str | None:
+    if (prepared.claim_path is None
+            or prepared.placeholder_identity is None):
+        return None
+    try:
+        current = os.stat(
+            prepared.claim_path.name,
+            dir_fd=prepared.destination_dir_fd,
+            follow_symlinks=False,
+        )
+        if (stat.S_ISREG(current.st_mode)
+                and (current.st_dev, current.st_ino)
+                == prepared.placeholder_identity):
+            os.unlink(
+                prepared.claim_path.name,
+                dir_fd=prepared.destination_dir_fd,
+            )
+            return None
+        return f"claim ownership changed for {prepared.claim_path}"
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"could not remove claim {prepared.claim_path}: {exc}"
+
+
+def _finish_prepared_batch(prepared_batch: list[PreparedPublication]) -> None:
+    errors: list[str] = []
+    for prepared in prepared_batch:
+        claim_error = _remove_prepared_claim(prepared)
+        if claim_error:
+            errors.append(claim_error)
+        if prepared.backup_name is not None:
+            try:
+                backup = os.stat(
+                    prepared.backup_name,
+                    dir_fd=prepared.destination_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (backup.st_dev, backup.st_ino) == prepared.backup_identity:
+                    os.unlink(
+                        prepared.backup_name,
+                        dir_fd=prepared.destination_dir_fd,
+                    )
+                else:
+                    errors.append(f"backup ownership changed for {prepared.dst}")
+            except OSError as exc:
+                errors.append(f"could not retire backup for {prepared.dst}: {exc}")
+    if errors:
+        raise RuntimeError("publication cleanup failed: " + " | ".join(errors))
+
 def _run_finalize(args, result, item, disc_n):
     """Execute the deferred NAS moves, clean staging, verify, and kick subocr.
     Runs on a worker thread after the disc is already ejected. On ANY move
     failure, PRESERVE staging and log loudly — a completed rip must never be
     lost to a transient mount drop. Serialized via _FINALIZE_LOCK."""
     staging = result.get("staging")
+    staging_dirs = [Path(value) for value in (
+        result.get("staging_dirs") or ([staging] if staging else [])
+    )]
     jobs = result.get("move_jobs") or []
     with _FINALIZE_LOCK:
-        done = 0
+        prepared_batch: list[PreparedPublication] = []
+        publication_committed = False
         try:
-            for i, job in enumerate(jobs):
-                (src, dst, label, protected, placeholder_identity, claim_path,
-                 partial_root, lock_dir) = (
-                    _unpack_move_job(job)
-                )
+            # Phase 1: copy and decode-check every private partial. Nothing is
+            # visible at a final media pathname during this phase.
+            for job in jobs:
+                (_, dst, _, _, _, _, _, _) = _unpack_move_job(job)
                 dst = Path(dst)
                 if not _await_dir_writable(dst.parent, staging):
                     raise OSError(f"target {dst.parent} not writable after retries")
-                if protected:
-                    move_with_progress_noclobber(
-                        Path(src), dst, label=label,
-                        placeholder_identity=placeholder_identity,
-                        claim_path=claim_path,
-                        partial_root=partial_root,
-                        lock_dir=lock_dir,
-                    )
-                else:
-                    move_with_progress(Path(src), dst, label=label)
-                done = i + 1
-            if staging:
-                shutil.rmtree(staging, ignore_errors=True)
-        except BaseException as e:
-            # Protected partial bytes live only in quarantine. Roll back every
-            # unattempted job's exact hidden slot claim; never delete a final
-            # media pathname. jobs[:done] already completed and remain intact.
-            for job in jobs[done:]:
-                (src, dst, _, protected, placeholder_identity, claim_path,
-                 _, _) = (
-                    _unpack_move_job(job)
+                prepared_batch.append(
+                    _prepare_publication(args, item, job)
                 )
+
+            # Phase 2: commit the fully prepared batch. Any later publication,
+            # destination verification, or receipt failure rolls back only the
+            # exact inodes created by this transaction, so a pending state can
+            # retry without collision/review diversion.
+            for prepared in prepared_batch:
+                _publish_prepared(prepared)
+            files = result.get("files", [])
+            if args.verify and files:
+                ok, error = verify(files)
+                if not ok:
+                    raise OSError(
+                        f"destination verification failed: {error}"
+                    )
+            fingerprint = result.get("disc_fingerprint")
+            if (args.verify and fingerprint and files
+                    and not getattr(args, "rerip_review", False)):
+                append_disc_receipt(
+                    Path(args.disc_receipts), item, disc_n,
+                    fingerprint, files,
+                    queue_index=result.get("queue_index"),
+                    run_id=result.get("run_id"),
+                    disc_episode_count=result.get("disc_episode_count"),
+                    queue_disc_n=result.get("queue_disc_n"),
+                    elapsed_s=result.get("elapsed_s", 0.0),
+                )
+            # Destination verification and any required receipt are complete.
+            # Backup retirement below is destructive and therefore begins the
+            # commit-cleanup phase even when --verify/receipts are disabled.
+            # A cleanup error must retain the published media, never attempt a
+            # rollback after an earlier old backup may already be gone.
+            publication_committed = True
+            try:
+                _finish_prepared_batch(prepared_batch)
+            except Exception as cleanup_error:
+                append_log(
+                    args,
+                    f"CLEANUP_FAIL {item.title} disc{disc_n} :: "
+                    f"{cleanup_error} (publication committed; media retained)",
+                )
+                print(
+                    f"{C.YLW}Publication committed, but cleanup needs attention: "
+                    f"{cleanup_error}{C.R}", flush=True,
+                )
+            for staging_dir in staging_dirs:
+                try:
+                    shutil.rmtree(staging_dir)
+                except OSError as cleanup_error:
+                    append_log(
+                        args,
+                        f"STAGING_CLEANUP_FAIL {item.title} disc{disc_n} :: "
+                        f"{cleanup_error} (publication retained)",
+                    )
+                    print(
+                        f"{C.YLW}Publication succeeded; redundant staging "
+                        f"remains at {staging_dir}: {cleanup_error}{C.R}",
+                        flush=True,
+                    )
+        except BaseException as e:
+            if publication_committed:
+                # Never roll back once destructive backup retirement can have
+                # started. At this boundary every required verification and
+                # receipt already succeeded.
+                append_log(
+                    args,
+                    f"POST_COMMIT_FAIL {item.title} disc{disc_n} :: {e} "
+                    f"(publication committed; media retained)",
+                )
+                return True, ""
+            rollback_errors = _rollback_prepared_batch(prepared_batch)
+            # Jobs that failed before preparation still own claims created by
+            # the planning phase. Remove only their exact recorded claim inode.
+            for job in jobs[len(prepared_batch):]:
+                (_, _, _, protected, placeholder_identity, claim_path,
+                 _, _) = _unpack_move_job(job)
                 if protected:
                     if placeholder_identity is not None and claim_path is not None:
                         _remove_zero_placeholder(
                             claim_path, placeholder_identity
                         )
-                else:
-                    _rollback_incomplete_dst(Path(src), Path(dst))
+            rollback_detail = (
+                "transaction rolled back"
+                if not rollback_errors else
+                "ROLLBACK INCOMPLETE: " + " | ".join(rollback_errors)
+            )
             append_log(args, f"MOVE_FAIL {item.title} disc{disc_n} :: {e} "
-                             f"(RIP PRESERVED at {staging}; "
-                             f"{len(jobs) - done} incomplete slot(s) rolled back)")
+                             f"(RIP PRESERVED at {staging}; {rollback_detail})")
             print(f"{C.RED}Background NAS move failed: {e}{C.R}", flush=True)
+            if rollback_errors:
+                print(
+                    f"{C.RED}Rollback incomplete: "
+                    f"{' | '.join(rollback_errors)}{C.R}", flush=True,
+                )
             print(f"{C.YLW}  Staged rip preserved at {staging}; fix the mount "
                   f"and move it manually.{C.R}", flush=True)
             beep(args, ok=False)
-            return
+            error = str(e)
+            if rollback_errors:
+                error += "; ROLLBACK INCOMPLETE: " + " | ".join(rollback_errors)
+            return False, error
+        finally:
+            for prepared in prepared_batch:
+                _close_prepared(prepared)
     files = result.get("files", [])
-    verified = True
-    if args.verify and files:
-        ok2, err = verify(files)
-        if not ok2:
-            verified = False
-            append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
-            print(f"{C.RED}Verify failed (background): {err}{C.R}", flush=True)
-            beep(args, ok=False)
-    fingerprint = result.get("disc_fingerprint")
-    if (args.verify and verified and fingerprint and files
-            and not getattr(args, "rerip_review", False)):
-        append_disc_receipt(
-            Path(args.disc_receipts), item, disc_n, fingerprint, files
-        )
-    run_subocr_postrip(args, files)
+    try:
+        run_subocr_postrip(args, files)
+    except Exception as exc:
+        # OCR is explicitly post-publication and optional. Record the failure,
+        # but do not invalidate a verified/fsycned media publication.
+        append_log(args, f"SUBOCR_FAIL {item.title} disc{disc_n} :: {exc}")
+        print(f"{C.YLW}Post-rip subtitle OCR did not start: {exc}{C.R}")
+    return True, ""
 
 def start_background_finalize(args, result, item, disc_n):
     """Hand the NAS move + verify + subocr to a worker thread so the caller can
     move straight to the next disc. Tracked in _FINALIZE_THREADS for join."""
-    t = threading.Thread(target=_run_finalize,
-                         args=(args, result, item, disc_n), daemon=False)
+    outcome: list[tuple[bool, str] | None] = [None]
+
+    def runner():
+        outcome[0] = _run_finalize(args, result, item, disc_n)
+
+    t = threading.Thread(target=runner, daemon=False)
+    t.finalize_outcome = outcome
     t.start()
     _FINALIZE_THREADS.append(t)
-    print(f"{C.D}  NAS transfer running in background; drive is free for the "
-          f"next disc.{C.R}", flush=True)
+    print(f"{C.D}  NAS transfer and verification running; queue progress waits "
+          f"for its durable outcome.{C.R}", flush=True)
 
 def join_finalizers():
     """Block until every background transfer has finished. Called before the
@@ -3718,8 +4894,19 @@ def join_finalizers():
     if pending:
         print(f"{C.D}Waiting for {len(pending)} background NAS transfer(s) "
               f"to finish before exit...{C.R}", flush=True)
+    failures = []
     for t in _FINALIZE_THREADS:
         t.join()
+        outcome = getattr(t, "finalize_outcome", [None])[0]
+        if outcome is None:
+            failures.append("finalizer exited without an outcome")
+        elif not outcome[0]:
+            failures.append(outcome[1])
+    _FINALIZE_THREADS.clear()
+    if failures:
+        raise RuntimeError(
+            "background finalization failed: " + " | ".join(failures)
+        )
 
 # Operators can handle failure notification in the wrapper or with an
 # out-of-process watcher that tails this log.
@@ -4097,6 +5284,13 @@ def main():
         print(f"{C.RED}{policy_error}{C.R}", file=sys.stderr)
         sys.exit(64)
     state = load_or_init(args, items)
+    recovered = reconcile_committed_receipts(state, args)
+    if recovered:
+        print(
+            f"{C.GRN}Recovered {recovered} completed disc(s) from durable "
+            f"publication receipts after an interrupted state commit.{C.R}"
+        )
+        append_log(args, f"RECEIPT_RECOVERY {recovered} disc(s)")
     save_state(state, args.state)
 
     while state["current_index"] < len(state["queue"]):
@@ -4157,10 +5351,14 @@ def main():
                   f"advancing per --on-fail={args.on_fail}.{C.R}")
             append_log(args, f"FAIL  {item.title} disc{disc_n} probe gave up "
                              f"({payload.get('reason')}); --on-fail={args.on_fail}")
-            if args.on_fail == "abort":
+            if probe_exhaustion_action(args.on_fail) == "abort":
+                # Exhausting the bounded probe/re-spin budget is a real
+                # failure. In particular, --on-fail=retry must never convert
+                # retry exhaustion into a green skipped queue item.
+                save_state(state, args.state)
                 sys.exit(2)
-            # skip or retry both advance the queue (retry would re-loop on the
-            # same wedged disc, defeating the point of giving up).
+            # Explicit skip is the sole policy that advances past an unreadable
+            # disc after probe exhaustion.
             state["current_index"] += 1
             state["disc_index_in_item"] = 0
             save_state(state, args.state)
@@ -4344,6 +5542,23 @@ def main():
                 print("Eject and try again."); continue
 
         title_ids = select_titles(item, info)
+        if item.type == "tv-season" and item.expected_disc_episodes > 0:
+            missing_contract_ids = [
+                title_id for title_id in item.expected_title_ids
+                if title_id not in info.get("titles", {})
+            ]
+            if missing_contract_ids:
+                print(
+                    f"{C.RED}Physical disc is missing contracted title IDs "
+                    f"{missing_contract_ids}; refusing optical read.{C.R}",
+                    file=sys.stderr,
+                )
+                append_log(
+                    args,
+                    f"DISC_CONTRACT_FAIL {item.title} missing title ids "
+                    f"{missing_contract_ids}",
+                )
+                sys.exit(4)
         log_title_audit(args, item, info, title_ids)
         if not title_ids:
             print(f"{C.RED}No suitable titles on disc (TV floor: {TV_MIN_DUR_S}s).{C.R}")
@@ -4434,16 +5649,71 @@ def main():
             save_state(state, args.state); continue
 
         result["disc_fingerprint"] = fingerprint
+        result["queue_index"] = state["current_index"]
+        result["run_id"] = state["run_id"]
+        result["queue_disc_n"] = state["disc_index_in_item"] + 1
+        result["disc_episode_count"] = (
+            state.get("disc_episode_counts", {})
+            .get(ep_key(item), {}).get(str(disc_n))
+        )
+
+        # Publication, destination verification, and the durable receipt must
+        # all succeed before queue progress is committed. The worker remains a
+        # thread so its failure-propagation contract is directly testable, but
+        # this queue item waits for the outcome; no optimistic completion.
+        if result.get("move_jobs") is not None:
+            start_background_finalize(disc_args, result, item, disc_n)
+            try:
+                join_finalizers()
+            except RuntimeError as exc:
+                append_log(
+                    args,
+                    f"FINALIZE_FAIL {item.title} disc{disc_n} :: {exc}",
+                )
+                print(
+                    f"{C.RED}Finalization failed; queue state was not advanced: "
+                    f"{exc}{C.R}", file=sys.stderr,
+                )
+                save_state(state, args.state)
+                sys.exit(5)
+        else:
+            # --sync-move / double-feature files have already published. The
+            # sync mover verified staged input before publication; this second
+            # pass verifies the destination before receipt/state completion.
+            try:
+                if disc_args.verify:
+                    print(f"{C.D}Verifying destination with ffmpeg...{C.R}")
+                    ok2, err = verify(result["files"])
+                    if not ok2:
+                        raise OSError(err)
+                if (disc_args.verify and result.get("disc_fingerprint")
+                        and result["files"] and not disc_args.rerip_review):
+                    append_disc_receipt(
+                        Path(disc_args.disc_receipts), item, disc_n,
+                        result["disc_fingerprint"], result["files"],
+                        queue_index=result.get("queue_index"),
+                        run_id=result.get("run_id"),
+                        disc_episode_count=result.get("disc_episode_count"),
+                        queue_disc_n=result.get("queue_disc_n"),
+                        elapsed_s=result.get("elapsed_s", 0.0),
+                    )
+            except Exception as exc:
+                append_log(
+                    args,
+                    f"FINALIZE_FAIL {item.title} disc{disc_n} :: {exc}",
+                )
+                print(
+                    f"{C.RED}Finalization failed; queue state was not advanced: "
+                    f"{exc}{C.R}", file=sys.stderr,
+                )
+                beep(args, ok=False)
+                save_state(state, args.state)
+                sys.exit(5)
+            run_subocr_postrip(disc_args, result["files"])
 
         log_final_durations(args, item, disc_n, result["files"])
 
-        # Record the rip and advance the queue now. The NAS move + verify +
-        # subocr run in the background (start_background_finalize) so the disc
-        # ejects and the drive is free for the next disc immediately, instead
-        # of being held for the multi-minute SMB copy. The optimistic advance
-        # means a hard kill mid-copy won't re-rip — acceptable because the
-        # staged file is preserved on any move failure (recoverable) and a
-        # normal exit joins all transfers (join_finalizers) before quitting.
+        # Commit completion only after durable finalization succeeds.
         state["completed"].append({
             "item": item.title, "disc_n": disc_n, "type": item.type,
             "files": result["files"], "elapsed_s": result["elapsed_s"],
@@ -4468,26 +5738,6 @@ def main():
             print(f"  {fp}")
         beep(args, ok=True)
         eject(args)
-        if result.get("move_jobs") is not None:
-            # Async path: copy to NAS + verify + subocr on a worker thread.
-            start_background_finalize(disc_args, result, item, disc_n)
-        else:
-            # --sync-move / double-feature: files are already on the NAS.
-            verified = True
-            if disc_args.verify:
-                print(f"{C.D}Verifying with ffmpeg...{C.R}")
-                ok2, err = verify(result["files"])
-                if not ok2:
-                    verified = False
-                    append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
-                    print(f"{C.RED}Verify failed: {err}{C.R}"); beep(args, ok=False)
-            if (disc_args.verify and verified and result.get("disc_fingerprint")
-                    and result["files"] and not disc_args.rerip_review):
-                append_disc_receipt(
-                    Path(disc_args.disc_receipts), item, disc_n,
-                    result["disc_fingerprint"], result["files"],
-                )
-            run_subocr_postrip(disc_args, result["files"])
 
     join_finalizers()
     print(f"\n{C.B}{C.GRN}Queue complete.{C.R}")

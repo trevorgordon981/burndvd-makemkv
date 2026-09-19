@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install media tools
+        run: brew install ffmpeg mkvtoolnix
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Static checks
+        run: |
+          bash -n bin/burndvd bin/ejectdisc bin/subocr
+          python -m compileall -q bin tests
+      - name: Tests
+        run: python -m pytest -q --timeout=30
