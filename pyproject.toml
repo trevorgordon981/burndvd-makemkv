@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "burndvd"
-version = "2.0.0"
+version = "2.0.1"
 description = "Decoupled macOS DVD/Blu-ray/UHD ripping, verification, unencrypted-BD fallback, and Apple Vision PGS subtitle OCR library and CLI toolkit."
 readme = "README.md"
 license = {text = "MIT"}

@@ -39,7 +39,7 @@ from burndvd.selection import (
 )
 from burndvd.subocr import ocr_mkv, parse_sup, probe_tracks, write_srt
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 
 __all__ = [
     "__version__",

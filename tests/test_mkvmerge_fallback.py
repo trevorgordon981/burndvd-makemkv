@@ -283,7 +283,10 @@ class TestRipperMkvmergeFallbackIntegration(unittest.TestCase):
             )
             info = {
                 "cinfo": {2: "FMA_DISC5"},
-                "titles": {0: {9: "0:24:00", 11: "1000"}, 1: {9: "0:24:00", 11: "1000"}},
+                "titles": {
+                    0: {9: "0:24:00", 11: "1000", 16: "00001.mpls"},
+                    1: {9: "0:24:00", 11: "1000", 16: "00002.mpls"},
+                },
             }
             args = SimpleNamespace(
                 makemkvcon="/fake/makemkvcon",
@@ -314,7 +317,13 @@ class TestRipperMkvmergeFallbackIntegration(unittest.TestCase):
                 f1 = fb_dir / "Fullmetal Alchemist_t01.mkv"
                 f0.write_bytes(b"episode-1-mkvmerge")
                 f1.write_bytes(b"episode-2-mkvmerge")
-                return models.FallbackResult(ok=True, files=[f0, f1], warnings=["rc=1 warning"], playlists_remuxed=2)
+                return models.FallbackResult(
+                    ok=True,
+                    files=[f0, f1],
+                    warnings=["rc=1 warning"],
+                    playlists_remuxed=2,
+                    file_playlists={str(f0): "00001.mpls", str(f1): "00002.mpls"},
+                )
 
             with mock.patch.object(ripper, "LOCAL_STAGING_BASE", root / "staging"), \
                  mock.patch.object(burndvd.nas, "LOCAL_LOCK_BASE", root / "locks"), \

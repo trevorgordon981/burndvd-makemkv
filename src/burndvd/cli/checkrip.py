@@ -59,7 +59,12 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def probe_duration(path: str) -> float | None:
-    """Return duration in seconds (float) or None if ffprobe fails."""
+    """Return positive duration in seconds (float) for a readable video file, or None."""
+    try:
+        if os.path.getsize(path) <= 0:
+            return None
+    except OSError:
+        return None
     try:
         out = subprocess.run(
             [
@@ -67,19 +72,38 @@ def probe_duration(path: str) -> float | None:
                 "-v",
                 "error",
                 "-show_entries",
-                "format=duration",
+                "format=duration:stream=codec_type,duration",
                 "-of",
-                "csv=p=0",
+                "json",
                 path,
             ],
             capture_output=True,
             text=True,
             timeout=120,
         )
-        return float(out.stdout.strip())
-    except (ValueError, OSError, subprocess.SubprocessError):
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout or "{}")
+        streams = data.get("streams") or []
+        video_streams = [s for s in streams if s.get("codec_type") == "video"]
+        if not video_streams:
+            return None
+        raw_dur = (data.get("format") or {}).get("duration")
+        if raw_dur in (None, "", "N/A"):
+            raw_dur = next(
+                (
+                    s.get("duration")
+                    for s in video_streams
+                    if s.get("duration") not in (None, "", "N/A")
+                ),
+                None,
+            )
+        if raw_dur is None:
+            return None
+        dur = float(raw_dur)
+        return dur if dur > 0 else None
+    except (ValueError, TypeError, OSError, subprocess.SubprocessError):
         return None
-
 
 def edge_hash(path: str, span: int = 8 << 20) -> str | None:
     """Hash first + last `span` bytes as a cheap content fingerprint."""
@@ -130,19 +154,32 @@ def scan(directory: str) -> list[dict]:
 
 
 def analyze(entries: list[dict], expected: int | None = None) -> dict:
-    durs = [e["duration"] for e in entries if e["duration"]]
+    unreadable: list[dict] = []
+    for e in entries:
+        reasons: list[str] = []
+        if not e.get("size") or e["size"] <= 0:
+            reasons.append("empty (0 bytes)")
+        if e.get("duration") is None or e["duration"] <= 0:
+            reasons.append("probe_failed (no valid duration/video stream)")
+        if reasons:
+            unreadable.append({**e, "reason": "; ".join(reasons)})
+
+    unreadable_paths = {u["path"] for u in unreadable}
+    healthy = [e for e in entries if e["path"] not in unreadable_paths]
+
+    durs = [e["duration"] for e in healthy if e["duration"]]
     median = statistics.median(durs) if durs else None
 
     blobs, dupes, gaps = [], [], []
     if median:
-        for e in entries:
+        for e in healthy:
             d = e["duration"]
             if d and d > median * BLOB_FACTOR:
                 est = round(d / median)
                 blobs.append({**e, "est_episodes": est})
 
     blob_paths = {b["path"] for b in blobs}
-    singles = [e for e in entries if e["path"] not in blob_paths]
+    singles = [e for e in healthy if e["path"] not in blob_paths]
 
     by_num: dict[int, list[dict]] = {}
     for e in singles:
@@ -174,6 +211,7 @@ def analyze(entries: list[dict], expected: int | None = None) -> dict:
 
     return {
         "median_min": round(median / 60, 1) if median else None,
+        "unreadable": unreadable,
         "blobs": blobs,
         "dupes": dupes,
         "gaps": gaps,
@@ -181,7 +219,6 @@ def analyze(entries: list[dict], expected: int | None = None) -> dict:
         "expected": expected,
         "missing_vs_expected": missing_vs_expected,
     }
-
 
 def inspect_rips(directory: str, expected: int | None = None) -> dict:
     """Library helper: scan and analyze a finished rip directory."""
@@ -678,6 +715,16 @@ def main() -> int:
 
     if args.json:
         out = {**result}
+        out["unreadable"] = [
+            {
+                "name": u["name"],
+                "episode": u["episode"],
+                "duration_s": u["duration"],
+                "size": u["size"],
+                "reason": u["reason"],
+            }
+            for u in result["unreadable"]
+        ]
         out["files"] = [
             {
                 "name": e["name"],
@@ -689,20 +736,24 @@ def main() -> int:
         ]
         print(json.dumps(out, indent=2))
         ok = not (
-            result["blobs"]
+            result["unreadable"]
+            or result["blobs"]
             or result["gaps"]
             or result["dupes"]
             or result["missing_vs_expected"]
         )
         return 0 if ok else 1
 
+    unreadable_by_path = {u["path"]: u["reason"] for u in result["unreadable"]}
     print(
-        f"\n{os.path.basename(args.directory.rstrip('/'))}  "
-        f"({len(entries)} files, median {result['median_min']} min)\n"
+        f"\n{os.path.basename(args.directory.rstrip("/"))}  "
+        f"({len(entries)} files, median {result["median_min"]} min)\n"
     )
     for e in entries:
         tag = ""
-        if any(b["path"] == e["path"] for b in result["blobs"]):
+        if e["path"] in unreadable_by_path:
+            tag = f"  <-- UNREADABLE ({unreadable_by_path[e["path"]]})"
+        elif any(b["path"] == e["path"] for b in result["blobs"]):
             est = next(
                 b["est_episodes"]
                 for b in result["blobs"]
@@ -710,11 +761,18 @@ def main() -> int:
             )
             tag = f"  <-- PLAY-ALL BLOB (~{est} episodes)"
         print(
-            f"  {human_min(e['duration'])}  {human_gb(e['size'])}  {e['name']}{tag}"
+            f"  {human_min(e["duration"])}  {human_gb(e["size"])}  {e["name"]}{tag}"
         )
 
     print()
     ok = True
+    if result["unreadable"]:
+        ok = False
+        print(
+            f"  UNREADABLE: {len(result["unreadable"])} empty or failed-probe file(s):"
+        )
+        for u in result["unreadable"]:
+            print(f"    - {u["name"]}: {u["reason"]}")
     if result["blobs"]:
         ok = False
         print(

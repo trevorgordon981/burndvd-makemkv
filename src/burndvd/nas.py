@@ -375,21 +375,87 @@ def _emit_claimed_tv_moves(
 
 
 def move_with_progress(
-    src: Path, dst: Path, label: str = "moving", interval: float = 5.0
+    src: Path,
+    dst: Path,
+    label: str = "moving",
+    interval: float = 5.0,
+    *,
+    allow_overwrite: bool = False,
 ) -> None:
-    """Move a file across filesystems while printing periodic throughput progress."""
+    """Atomically move a file across filesystems with progress and no-replace by default.
+
+    Copies into an exclusively owned sibling `.partial` file, fsyncs, verifies
+    size/identity, publishes via atomic no-replace rename (or `os.replace` only
+    when `allow_overwrite=True`), and unlinks `src` only after publication. On
+    any failure, cleans up only the owned `.partial` file and never touches a
+    pre-existing destination.
+    """
+    src, dst = Path(src), Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not allow_overwrite:
+        try:
+            os.lstat(dst)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                errno.EEXIST,
+                f"destination exists (refusing overwrite): {dst}",
+                str(dst),
+            )
+
+    source_fd = os.open(
+        str(src),
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0),
+    )
     try:
-        if dst.is_file() and dst.stat().st_size == 0:
-            dst.unlink()
-    except OSError:
-        pass
-    total = src.stat().st_size
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError(f"move source is not a regular file: {src}")
+        total = source_stat.st_size
+    except BaseException:
+        os.close(source_fd)
+        raise
+
+    token = f".burndvd-tmp-{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.partial"
+    partial = dst.parent / token
+    partial_fd = None
+    monitor_fd = None
+    try:
+        partial_fd = os.open(
+            str(partial),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o644,
+        )
+        partial_stat = os.fstat(partial_fd)
+        partial_identity = (partial_stat.st_dev, partial_stat.st_ino)
+        monitor_fd = os.dup(partial_fd)
+    except BaseException:
+        for fd in (monitor_fd, partial_fd, source_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        raise
+
     done_evt = threading.Event()
     err_box: list[BaseException] = []
 
     def worker():
         try:
-            shutil.move(str(src), str(dst))
+            with os.fdopen(source_fd, "rb") as source_stream, os.fdopen(
+                partial_fd, "wb"
+            ) as output:
+                shutil.copyfileobj(source_stream, output, length=8 * 1024 * 1024)
+                output.flush()
+                os.fsync(output.fileno())
         except BaseException as e:
             err_box.append(e)
         finally:
@@ -402,31 +468,62 @@ def move_with_progress(
     last_size = 0
     last_t = start
     print(f"{C.D}{label}: {src.name} -> {dst}{C.R}", flush=True)
+    published = False
+    try:
+        while not done_evt.wait(timeout=interval):
+            cur = os.fstat(monitor_fd).st_size
+            now = time.time()
+            frac = cur / total if total > 0 else 0.0
+            dt = now - last_t
+            delta = cur - last_size
+            mbps = delta / dt / (1024 * 1024) if dt > 0 else 0.0
+            eta = (total - cur) / (delta / dt) if delta > 0 and dt > 0 else 0
+            bar = render_bar(frac)
+            elapsed = fmt_dur(now - start)
+            print(
+                f"  {bar} {frac * 100:5.1f}%  {cur / 1e9:5.2f}/{total / 1e9:5.2f} GB"
+                f"  {mbps:5.1f} MB/s  eta {fmt_dur(eta)}  elapsed {elapsed}",
+                flush=True,
+            )
+            last_size = cur
+            last_t = now
 
-    while not done_evt.wait(timeout=interval):
+        t.join()
+        os.close(monitor_fd)
+        monitor_fd = None
+        if err_box:
+            raise err_box[0]
+
+        copied = os.lstat(partial)
+        if (copied.st_dev, copied.st_ino) != partial_identity or copied.st_size != total:
+            raise OSError(f"partial copy identity/size changed: {partial}")
+
+        if allow_overwrite:
+            os.replace(partial, dst)
+        else:
+            _atomic_rename_noreplace(partial, dst)
+        published = True
+
         try:
-            cur = dst.stat().st_size if dst.exists() else 0
+            src.unlink()
         except FileNotFoundError:
-            cur = 0
-        now = time.time()
-        frac = cur / total if total > 0 else 0.0
-        dt = now - last_t
-        delta = cur - last_size
-        mbps = delta / dt / (1024 * 1024) if dt > 0 else 0.0
-        eta = (total - cur) / (delta / dt) if delta > 0 and dt > 0 else 0
-        bar = render_bar(frac)
-        elapsed = fmt_dur(now - start)
-        print(
-            f"  {bar} {frac * 100:5.1f}%  {cur / 1e9:5.2f}/{total / 1e9:5.2f} GB"
-            f"  {mbps:5.1f} MB/s  eta {fmt_dur(eta)}  elapsed {elapsed}",
-            flush=True,
-        )
-        last_size = cur
-        last_t = now
+            pass
+    except BaseException:
+        if monitor_fd is not None:
+            try:
+                os.close(monitor_fd)
+            except OSError:
+                pass
+            monitor_fd = None
+        if not published:
+            try:
+                cur_stat = os.lstat(partial)
+                if (cur_stat.st_dev, cur_stat.st_ino) == partial_identity:
+                    partial.unlink()
+            except OSError:
+                pass
+        raise
 
-    t.join()
-    if err_box:
-        raise err_box[0]
     elapsed = time.time() - start
     avg_mbps = total / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
     print(
@@ -434,7 +531,6 @@ def move_with_progress(
         f"  ({avg_mbps:.1f} MB/s avg)",
         flush=True,
     )
-
 
 def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically publish on one filesystem without overwriting an existing target.

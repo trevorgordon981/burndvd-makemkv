@@ -292,6 +292,7 @@ def remux_playlists_with_mkvmerge(
     safe_prefix = sanitize(title_prefix) or "bdmv"
 
     out_files: list[Path] = []
+    file_playlists: dict[str, str] = {}
     warnings: list[str] = []
 
     for idx, pl in enumerate(playlists):
@@ -355,12 +356,14 @@ def remux_playlists_with_mkvmerge(
                 playlists_remuxed=len(out_files),
             )
         out_files.append(out_path)
+        file_playlists[str(out_path)] = mpls_path.name
 
     return FallbackResult(
         ok=True,
         files=out_files,
         warnings=warnings,
         playlists_remuxed=len(out_files),
+        file_playlists=file_playlists,
     )
 
 

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import shutil
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -232,7 +234,55 @@ def main() -> None:
         print(f"{C.RED}{policy_error}{C.R}", file=sys.stderr)
         sys.exit(64)
     state = load_or_init(args, items)
-    save_state(state, args.state)
+    state.setdefault("pending_finalize", [])
+    state.setdefault("failed_finalize", [])
+    state_lock = threading.Lock()
+    committed_cursor = {
+        "current_index": state["current_index"],
+        "disc_index_in_item": state["disc_index_in_item"],
+        "disc_episode_counts": copy.deepcopy(state.get("disc_episode_counts", {})),
+    }
+    committed_slots: set[tuple[int, int]] = set()
+
+    def _advance_committed_locked() -> None:
+        while committed_cursor["current_index"] < len(state["queue"]):
+            ci = committed_cursor["current_index"]
+            cd = committed_cursor["disc_index_in_item"]
+            if (ci, cd) not in committed_slots:
+                break
+            q_item_discs = int(state["queue"][ci].get("discs", 1) or 1)
+            if cd + 1 >= q_item_discs:
+                committed_cursor["current_index"] = ci + 1
+                committed_cursor["disc_index_in_item"] = 0
+            else:
+                committed_cursor["disc_index_in_item"] = cd + 1
+
+    def _persist_committed_state() -> None:
+        with state_lock:
+            _advance_committed_locked()
+            snapshot = copy.deepcopy(state)
+            snapshot["current_index"] = committed_cursor["current_index"]
+            snapshot["disc_index_in_item"] = committed_cursor["disc_index_in_item"]
+            snapshot["disc_episode_counts"] = copy.deepcopy(
+                committed_cursor["disc_episode_counts"]
+            )
+            save_state(snapshot, args.state)
+
+    def _sync_committed_on_skip() -> None:
+        with state_lock:
+            if not state.get("pending_finalize") and not state.get("failed_finalize"):
+                committed_cursor["current_index"] = state["current_index"]
+                committed_cursor["disc_index_in_item"] = state["disc_index_in_item"]
+            _advance_committed_locked()
+            snapshot = copy.deepcopy(state)
+            snapshot["current_index"] = committed_cursor["current_index"]
+            snapshot["disc_index_in_item"] = committed_cursor["disc_index_in_item"]
+            snapshot["disc_episode_counts"] = copy.deepcopy(
+                committed_cursor["disc_episode_counts"]
+            )
+            save_state(snapshot, args.state)
+
+    _persist_committed_state()
     clear_finalize_errors()
     _FINALIZE_THREADS.clear()
 
@@ -275,7 +325,7 @@ def main() -> None:
                 pass
             state["current_index"] += 1
             state["disc_index_in_item"] = 0
-            save_state(state, args.state)
+            _sync_committed_on_skip()
             continue
 
         item = QueueItem(**state["queue"][state["current_index"]])
@@ -301,7 +351,7 @@ def main() -> None:
                 sys.exit(2)
             state["current_index"] += 1
             state["disc_index_in_item"] = 0
-            save_state(state, args.state)
+            _sync_committed_on_skip()
             eject(args)
             continue
         info = payload
@@ -504,6 +554,9 @@ def main() -> None:
 
         print(f"  Selected {len(title_ids)} title(s): {title_ids}")
 
+        cur_item_idx = state["current_index"]
+        cur_disc_idx = state["disc_index_in_item"]
+        pre_rip_ep_counts = copy.deepcopy(state.get("disc_episode_counts", {}))
         if item.type == "double-feature":
             ok, result = rip_double_feature(disc_args, item, info, state, disc_n)
         else:
@@ -594,27 +647,100 @@ def main() -> None:
             continue
 
         result["disc_fingerprint"] = fingerprint
+        post_rip_ep_counts = copy.deepcopy(state.get("disc_episode_counts", {}))
+        ep_delta_counts = {
+            k: copy.deepcopy(v)
+            for k, v in post_rip_ep_counts.items()
+            if pre_rip_ep_counts.get(k) != v
+        }
 
-        state["completed"].append(
-            {
-                "item": item.title,
-                "disc_n": disc_n,
-                "type": item.type,
-                "files": result["files"],
-                "elapsed_s": result["elapsed_s"],
-                "ts": time.time(),
-            }
-        )
-        state.get("recent_stall_bytes", {}).pop(f"{item.title}||disc{disc_n}", None)
-        state.get("failure_retry_counts", {}).pop(f"{item.title}||disc{disc_n}", None)
-        state["rip_durations_s"].append(result["elapsed_s"])
-        state["rip_durations_s"] = state["rip_durations_s"][-30:]
+        pending_id = f"{cur_item_idx}:{cur_disc_idx}:{disc_n}:{time.time_ns()}"
+        pending_entry = {
+            "id": pending_id,
+            "item_index": cur_item_idx,
+            "disc_index_in_item": cur_disc_idx,
+            "queue_disc_n": queue_disc_n,
+            "item": item.title,
+            "disc_n": disc_n,
+            "type": item.type,
+            "files": list(result["files"]),
+            "staging": result.get("staging"),
+            "elapsed_s": result["elapsed_s"],
+            "status": "pending_finalize",
+            "ts": time.time(),
+        }
+        with state_lock:
+            state["pending_finalize"].append(pending_entry)
+        # Persist pending_finalize BEFORE transfer/verification; do NOT mark
+        # completed or advance persisted cursor yet.
+        _persist_committed_state()
+
+        # Advance only the in-memory loop cursor so the drive can proceed to the
+        # next disc while background finalization runs (persisted state waits for commit).
         if queue_disc_n >= item.discs:
             state["current_index"] += 1
             state["disc_index_in_item"] = 0
         else:
             state["disc_index_in_item"] += 1
-        save_state(state, args.state)
+
+        def _make_commit_callbacks(
+            *,
+            _pending_id=pending_id,
+            _pending_entry=pending_entry,
+            _slot=(cur_item_idx, cur_disc_idx),
+            _item_title=item.title,
+            _item_type=item.type,
+            _disc_n=disc_n,
+            _elapsed_s=result["elapsed_s"],
+            _ep_delta=ep_delta_counts,
+        ):
+            def _on_complete(final_result: dict) -> None:
+                with state_lock:
+                    state["pending_finalize"] = [
+                        e for e in state.get("pending_finalize", [])
+                        if e.get("id") != _pending_id
+                    ]
+                    state["completed"].append(
+                        {
+                            "item": _item_title,
+                            "disc_n": _disc_n,
+                            "type": _item_type,
+                            "files": list(final_result.get("files", [])),
+                            "elapsed_s": _elapsed_s,
+                            "ts": time.time(),
+                        }
+                    )
+                    state.get("recent_stall_bytes", {}).pop(
+                        f"{_item_title}||disc{_disc_n}", None
+                    )
+                    state.get("failure_retry_counts", {}).pop(
+                        f"{_item_title}||disc{_disc_n}", None
+                    )
+                    state["rip_durations_s"].append(_elapsed_s)
+                    state["rip_durations_s"] = state["rip_durations_s"][-30:]
+                    for ek, ev in _ep_delta.items():
+                        committed_cursor["disc_episode_counts"][ek] = copy.deepcopy(ev)
+                    committed_slots.add(_slot)
+                _persist_committed_state()
+
+            def _on_failure(err_msg: str) -> None:
+                with state_lock:
+                    state["pending_finalize"] = [
+                        e for e in state.get("pending_finalize", [])
+                        if e.get("id") != _pending_id
+                    ]
+                    failed_rec = {
+                        **_pending_entry,
+                        "status": "failed",
+                        "error": err_msg,
+                        "failed_ts": time.time(),
+                    }
+                    state.setdefault("failed_finalize", []).append(failed_rec)
+                _persist_committed_state()
+
+            return _on_complete, _on_failure
+
+        on_complete_cb, on_failure_cb = _make_commit_callbacks()
 
         append_log(
             args,
@@ -627,40 +753,64 @@ def main() -> None:
         beep(args, ok=True)
         eject(args)
         if result.get("move_jobs") is not None:
-            start_background_finalize(disc_args, result, item, disc_n)
+            start_background_finalize(
+                disc_args,
+                result,
+                item,
+                disc_n,
+                on_complete=on_complete_cb,
+                on_failure=on_failure_cb,
+            )
         else:
-            log_final_durations(disc_args, item, disc_n, result["files"])
-            verified = True
-            if disc_args.verify:
-                print(f"{C.D}Verifying with ffmpeg...{C.R}")
-                ok2, err = verify(result["files"])
-                if not ok2:
-                    verified = False
-                    _record_finalize_error(
-                        f"VERIFY_FAIL {item.title} disc{disc_n}: {err}"
-                    )
-                    append_log(
-                        args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}"
-                    )
-                    print(f"{C.RED}Verify failed: {err}{C.R}")
-                    beep(args, ok=False)
-            if (
-                disc_args.verify
-                and verified
-                and result.get("disc_fingerprint")
-                and result["files"]
-                and not disc_args.rerip_review
-            ):
-                append_disc_receipt(
-                    Path(disc_args.disc_receipts),
-                    item,
-                    disc_n,
-                    result["disc_fingerprint"],
-                    result["files"],
+            try:
+                log_final_durations(disc_args, item, disc_n, result["files"])
+                verified = True
+                if disc_args.verify:
+                    print(f"{C.D}Verifying with ffmpeg...{C.R}")
+                    ok2, err = verify(result["files"])
+                    if not ok2:
+                        verified = False
+                        err_msg = f"VERIFY_FAIL {item.title} disc{disc_n}: {err}"
+                        _record_finalize_error(err_msg)
+                        append_log(
+                            args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}"
+                        )
+                        print(f"{C.RED}Verify failed: {err}{C.R}")
+                        beep(args, ok=False)
+                        on_failure_cb(err_msg)
+                if verified:
+                    if (
+                        disc_args.verify
+                        and result.get("disc_fingerprint")
+                        and result["files"]
+                        and not disc_args.rerip_review
+                        and not result.get("routed_to_review", False)
+                    ):
+                        append_disc_receipt(
+                            Path(disc_args.disc_receipts),
+                            item,
+                            disc_n,
+                            result["disc_fingerprint"],
+                            result["files"],
+                        )
+                    on_complete_cb(result)
+                    run_subocr_postrip(disc_args, result["files"])
+            except Exception as exc:
+                err_msg = (
+                    f"FINALIZE_FAIL {item.title} disc{disc_n}: "
+                    f"{type(exc).__name__}: {exc}"
                 )
-            if verified:
-                run_subocr_postrip(disc_args, result["files"])
-
+                _record_finalize_error(err_msg)
+                append_log(
+                    args,
+                    f"FINALIZE_FAIL {item.title} disc{disc_n} :: "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                print(
+                    f"{C.RED}Finalize failed ({type(exc).__name__}): {exc}{C.R}"
+                )
+                beep(args, ok=False)
+                on_failure_cb(err_msg)
     join_finalizers()
     finalize_errors = get_finalize_errors()
     if finalize_errors:

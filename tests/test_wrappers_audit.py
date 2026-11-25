@@ -126,11 +126,18 @@ class TestStopripFixes(unittest.TestCase):
                 )
 
             season_dir = nas / "TV Shows" / "South Park" / "Season 08"
-            self.assertTrue((season_dir / "title_t00.mkv").is_file())
-            self.assertTrue((season_dir / "title_t01.mkv").is_file())
+            # Rescued unverified files must stay outside the live library.
+            self.assertFalse((season_dir / "title_t00.mkv").exists())
+            self.assertFalse((season_dir / "title_t01.mkv").exists())
             self.assertFalse((season_dir / "title_t02.mkv").exists())
+            quarantine_dir = nas / ".repair-quarantine" / "stoprip-rescue" / "South Park" / "Season 08" / "1700000-103"
+            self.assertTrue((quarantine_dir / "title_t00.mkv").is_file())
+            self.assertTrue((quarantine_dir / "title_t01.mkv").is_file())
+            self.assertFalse((quarantine_dir / "title_t02.mkv").exists())
             self.assertEqual(len(rescued), 2)
-            self.assertFalse(my_staging.exists())
+            # Staging must be preserved because title_t02.mkv remained unresolved/in-progress.
+            self.assertTrue(my_staging.exists())
+            self.assertTrue((my_staging / "title_t02.mkv").is_file())
 
 
 class TestBurndvdWrapperFixes(unittest.TestCase):

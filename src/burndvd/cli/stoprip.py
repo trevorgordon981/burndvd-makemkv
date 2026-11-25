@@ -394,9 +394,10 @@ def _open_write_paths(pids: list[int]) -> set[Path]:
     opened: set[Path] = set()
     if not pids:
         return opened
+    lsof_bin = shutil.which("lsof") or "/usr/sbin/lsof"
     try:
         out = subprocess.check_output(
-            ["lsof", "-Ffn", "-p", ",".join(str(p) for p in pids)],
+            [lsof_bin, "-Ffan", "-p", ",".join(str(p) for p in pids)],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -408,15 +409,20 @@ def _open_write_paths(pids: list[int]) -> set[Path]:
         if not line:
             continue
         tag, val = line[0], line[1:]
-        if tag == "f":
-            cur_write = "w" in val or "u" in val
+        if tag == "p":
+            cur_write = False
+        elif tag == "f":
+            # Linux lsof may append w/u to numeric fd; avoid false match on "cwd".
+            cur_write = bool(re.match(r"^\d+[wu]$", val))
+        elif tag == "a":
+            # macOS and Linux lsof emit explicit access mode in `a` (`r`, `w`, `u`).
+            cur_write = ("w" in val) or ("u" in val)
         elif tag == "n" and cur_write and val.startswith("/"):
             try:
                 opened.add(Path(val).resolve())
             except OSError:
                 opened.add(Path(val))
     return opened
-
 
 def _move_with_backup(src: Path, dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -429,6 +435,40 @@ def _move_with_backup(src: Path, dest: Path) -> Path:
     print(f"      →  {dest}")
     shutil.move(str(src), str(dest))
     return dest
+
+
+def _rescue_quarantine_dir(
+    item: dict,
+    staging: Path,
+    nas_root: Path = DEFAULT_NAS_ROOT,
+    vol_root: Path = DEFAULT_VOL_ROOT,
+) -> Path:
+    """Derive an out-of-library quarantine directory for rescued unverified files."""
+    base_dir = resolve_nas_path(
+        item["target_root"], nas_root=nas_root, vol_root=vol_root
+    )
+    quarantine_root: Path | None = None
+    for root in (nas_root, vol_root):
+        try:
+            base_dir.relative_to(root)
+            quarantine_root = root / ".repair-quarantine" / "stoprip-rescue"
+            break
+        except ValueError:
+            continue
+    if quarantine_root is None:
+        quarantine_root = base_dir.parent / ".repair-quarantine" / "stoprip-rescue"
+
+    title_part = sanitize(str(item.get("title") or "unknown")) or "unknown"
+    dest = quarantine_root / title_part
+    if item.get("type") == "tv-season":
+        season_raw = str(item.get("season") or "").strip()
+        try:
+            season_num = int(season_raw)
+        except ValueError:
+            season_num = 0
+        if season_num > 0:
+            dest = dest / f"Season {season_num:02d}"
+    return dest / staging.name
 
 
 def rescue_staging(
@@ -446,64 +486,51 @@ def rescue_staging(
     mkvs = sorted(
         (
             p
-            for p in staging.iterdir()
+            for p in staging.rglob("*")
             if p.is_file() and p.suffix.lower() == ".mkv" and p.stat().st_size > 0
         ),
-        key=lambda p: p.stat().st_size,
-        reverse=True,
+        key=lambda p: p.relative_to(staging).as_posix(),
     )
     if not mkvs:
         print(f"stoprip: no non-empty .mkv in {staging}; skipping rescue")
         return []
 
+    writer_pids: set[int] = set()
+    if session:
+        writer_pids.update(session.get("pids") or [])
+        roles = session.get("roles") or {}
+        for role_pids in roles.values():
+            if isinstance(role_pids, list):
+                writer_pids.update(role_pids)
+    in_progress = _open_write_paths(sorted(writer_pids))
+
+    completed = [p for p in mkvs if p.resolve() not in in_progress]
+    if not completed:
+        print(
+            f"stoprip: no completed .mkv in {staging} (all open for writing); preserving staging"
+        )
+        return []
+
     item = current_item(queue, state)
+    if not item:
+        print(
+            f"stoprip: queue/state unavailable; preserving {len(completed)} unverified "
+            f".mkv file(s) in staging {staging} (never published to live library)"
+        )
+        return []
+
+    quarantine_dir = _rescue_quarantine_dir(
+        item, staging, nas_root=nas_root, vol_root=vol_root
+    )
     rescued: list[Path] = []
-
-    if item and item.get("type") == "tv-season":
-        base_dir = resolve_nas_path(
-            item["target_root"], nas_root=nas_root, vol_root=vol_root
-        )
-        season_raw = str(item.get("season") or "").strip()
-        try:
-            season_num = int(season_raw)
-        except ValueError:
-            season_num = 0
-        dest_dir = base_dir / f"Season {season_num:02d}" if season_num > 0 else base_dir
-
-        mk_pids = (session or {}).get("roles", {}).get("makemkv", [])
-        in_progress = _open_write_paths(mk_pids)
-        completed = [
-            p
-            for p in sorted(mkvs, key=lambda x: x.name)
-            if p.resolve() not in in_progress
-        ]
-        if not completed:
-            print(
-                f"stoprip: no completed .mkv in {staging} (all open for writing); skipping rescue"
-            )
-            return []
-        for mkv in completed:
-            rescued.append(_move_with_backup(mkv, dest_dir / mkv.name))
-        return rescued
-
-    main_mkv = mkvs[0]
-    if item and item.get("type") == "movie":
-        dest_dir = resolve_nas_path(
-            item["target_root"], nas_root=nas_root, vol_root=vol_root
-        )
-        dest = dest_dir / f"{sanitize(item['title'])}.mkv"
-    elif item:
-        dest_dir = resolve_nas_path(
-            item["target_root"], nas_root=nas_root, vol_root=vol_root
-        )
-        dest = dest_dir / main_mkv.name
-    else:
-        dest_dir = Path.home() / "Desktop"
-        dest = dest_dir / main_mkv.name
-        print("stoprip: queue/state unparseable; saving to ~/Desktop")
-
-    rescued.append(_move_with_backup(main_mkv, dest))
+    for mkv in completed:
+        rel = mkv.relative_to(staging)
+        rescued.append(_move_with_backup(mkv, quarantine_dir / rel))
     return rescued
+
+
+def _staging_has_remaining_files(staging: Path) -> bool:
+    return any(p.is_file() for p in staging.rglob("*"))
 
 
 def stop_session(
@@ -545,13 +572,20 @@ def stop_session(
     sleep_fn(1.0)
 
     if rescue_completed and staging and staging.is_dir():
-        shutil.rmtree(staging, ignore_errors=True)
-        print(f"stoprip: removed staging {staging}")
+        if no_save:
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"stoprip: removed staging {staging} (--no-save)")
+        elif not _staging_has_remaining_files(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+            print(f"stoprip: removed empty staging {staging}")
+        else:
+            print(
+                f"stoprip: preserving staging {staging} (unresolved/in-progress files remain)"
+            )
 
     for r in rescued:
-        print(f"stoprip: rescued {r}")
+        print(f"stoprip: rescued (quarantine) {r}")
     return rescued
-
 
 def _select_sessions(sessions: list[dict], args) -> list[dict] | None:
     if args.all:

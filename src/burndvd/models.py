@@ -102,6 +102,7 @@ class FallbackResult:
     error: str = ""
     mount_path: Path | None = None
     playlists_remuxed: int = 0
+    file_playlists: dict[str, str] = field(default_factory=dict)
 
 
 def csv_int(row: dict, key: str, default: int) -> int:
@@ -300,6 +301,8 @@ def default_state(items: list[QueueItem]) -> dict:
         "disc_index_in_item": 0,
         "disc_episode_counts": {},
         "completed": [],
+        "pending_finalize": [],
+        "failed_finalize": [],
         "rip_durations_s": [],
         "started_at": time.time(),
     }
@@ -373,6 +376,8 @@ def load_or_init(args, items: list[QueueItem]) -> dict:
             if key not in state or not isinstance(state[key], expected_type):
                 raise ValueError(f"state file {p} has invalid or missing {key!r}")
         state.setdefault("disc_episode_counts", {})
+        state.setdefault("pending_finalize", [])
+        state.setdefault("failed_finalize", [])
         state.pop("next_episode", None)
         prior_done = state.get("current_index", 0) >= len(state.get("queue", []))
         same_queue = state.get("queue", []) == [asdict(i) for i in items]

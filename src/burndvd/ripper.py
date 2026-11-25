@@ -267,118 +267,199 @@ def _unpack_move_job(job):
     )
 
 
-def _run_finalize(args, result: dict, item: QueueItem, disc_n: int) -> None:
-    """Execute deferred NAS moves, clean staging, log durations, verify, receipt, and subocr."""
+def _run_finalize(
+    args,
+    result: dict,
+    item: QueueItem,
+    disc_n: int,
+    *,
+    on_complete=None,
+    on_failure=None,
+) -> bool:
+    """Execute deferred NAS moves, clean staging, log durations, verify, receipt, commit, and subocr."""
     staging = result.get("staging")
     jobs = result.get("move_jobs") or []
     files = list(result.get("files", []))
-    with _FINALIZE_LOCK:
-        done = 0
-        try:
-            for i, job in enumerate(jobs):
-                (
-                    src,
-                    dst,
-                    label,
-                    protected,
-                    placeholder_identity,
-                    claim_path,
-                    partial_root,
-                    lock_dir,
-                ) = _unpack_move_job(job)
-                orig_dst = Path(dst)
-                dst = orig_dst
-                writable_dir = _await_dir_writable(dst.parent, staging)
-                if not writable_dir:
-                    raise OSError(f"target {dst.parent} not writable after retries")
-                if writable_dir != dst.parent:
-                    dst = writable_dir / dst.name
-                    if claim_path is not None:
-                        claim_path = _to_nfs_path(claim_path) or claim_path
-                    if partial_root is not None:
-                        partial_root = _to_nfs_path(partial_root) or partial_root
-                    if lock_dir is not None:
-                        lock_dir = _to_nfs_path(lock_dir) or lock_dir
-                    files = [
-                        str(dst) if fp == str(orig_dst) else fp for fp in files
-                    ]
-                if protected:
-                    move_with_progress_noclobber(
-                        Path(src),
+    allow_movie_overwrite = bool(
+        getattr(args, "overwrite", False) and getattr(item, "type", None) == "movie"
+    )
+    try:
+        with _FINALIZE_LOCK:
+            done = 0
+            try:
+                for i, job in enumerate(jobs):
+                    (
+                        src,
                         dst,
-                        label=label,
-                        placeholder_identity=placeholder_identity,
-                        claim_path=claim_path,
-                        partial_root=partial_root,
-                        lock_dir=lock_dir,
-                    )
-                else:
-                    move_with_progress(Path(src), dst, label=label)
-                done = i + 1
-            if staging:
-                shutil.rmtree(staging, ignore_errors=True)
-        except BaseException as e:
-            for job in jobs[done:]:
-                (
-                    src,
-                    dst,
-                    _,
-                    protected,
-                    placeholder_identity,
-                    claim_path,
-                    _,
-                    _,
-                ) = _unpack_move_job(job)
-                if protected:
-                    if placeholder_identity is not None and claim_path is not None:
+                        label,
+                        protected,
+                        placeholder_identity,
+                        claim_path,
+                        partial_root,
+                        lock_dir,
+                    ) = _unpack_move_job(job)
+                    orig_dst = Path(dst)
+                    dst = orig_dst
+                    writable_dir = _await_dir_writable(dst.parent, staging)
+                    if not writable_dir:
+                        raise OSError(f"target {dst.parent} not writable after retries")
+                    if writable_dir != dst.parent:
+                        dst = writable_dir / dst.name
+                        if claim_path is not None:
+                            claim_path = _to_nfs_path(claim_path) or claim_path
+                        if partial_root is not None:
+                            partial_root = _to_nfs_path(partial_root) or partial_root
+                        if lock_dir is not None:
+                            lock_dir = _to_nfs_path(lock_dir) or lock_dir
+                        files = [
+                            str(dst) if fp == str(orig_dst) else fp for fp in files
+                        ]
+                    if protected:
+                        move_with_progress_noclobber(
+                            Path(src),
+                            dst,
+                            label=label,
+                            placeholder_identity=placeholder_identity,
+                            claim_path=claim_path,
+                            partial_root=partial_root,
+                            lock_dir=lock_dir,
+                        )
+                    elif allow_movie_overwrite:
+                        move_with_progress(
+                            Path(src), dst, label=label, allow_overwrite=True
+                        )
+                    else:
+                        move_with_progress(Path(src), dst, label=label)
+                    done = i + 1
+                if staging:
+                    shutil.rmtree(staging, ignore_errors=True)
+            except BaseException as e:
+                # Only clean owned zero-byte TV claim placeholders (verified by
+                # exact inode identity). Never touch pre-existing destinations or
+                # unstarted jobs; owned `.partial` artifacts are rolled back inside
+                # move_with_progress / move_with_progress_noclobber.
+                cleaned_claims = 0
+                for job in jobs[done:]:
+                    (
+                        _src,
+                        _dst,
+                        _,
+                        protected,
+                        placeholder_identity,
+                        claim_path,
+                        _,
+                        _,
+                    ) = _unpack_move_job(job)
+                    if (
+                        protected
+                        and placeholder_identity is not None
+                        and claim_path is not None
+                    ):
                         _remove_zero_placeholder(claim_path, placeholder_identity)
-                else:
-                    _rollback_incomplete_dst(Path(src), Path(dst))
-            _record_finalize_error(f"MOVE_FAIL {item.title} disc{disc_n}: {e}")
+                        cleaned_claims += 1
+                err_msg = f"MOVE_FAIL {item.title} disc{disc_n}: {e}"
+                _record_finalize_error(err_msg)
+                append_log(
+                    args,
+                    f"MOVE_FAIL {item.title} disc{disc_n} :: {e} "
+                    f"(RIP PRESERVED at {staging}; "
+                    f"{cleaned_claims} owned claim(s) cleaned)",
+                )
+                print(f"{C.RED}Background NAS move failed: {e}{C.R}", flush=True)
+                print(
+                    f"{C.YLW}  Staged rip preserved at {staging}; fix the mount "
+                    f"and move it manually.{C.R}",
+                    flush=True,
+                )
+                beep(args, ok=False)
+                if on_failure is not None:
+                    try:
+                        on_failure(err_msg)
+                    except Exception:
+                        pass
+                if not isinstance(e, Exception):
+                    raise
+                return False
+
+        result["files"] = files
+        if files and getattr(args, "state", None):
+            log_final_durations(args, item, disc_n, files)
+        verified = True
+        if getattr(args, "verify", False) and files:
+            ok2, err = verify(files)
+            if not ok2:
+                verified = False
+                err_msg = f"VERIFY_FAIL {item.title} disc{disc_n}: {err}"
+                _record_finalize_error(err_msg)
+                append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
+                print(f"{C.RED}Verify failed (background): {err}{C.R}", flush=True)
+                beep(args, ok=False)
+                if on_failure is not None:
+                    try:
+                        on_failure(err_msg)
+                    except Exception:
+                        pass
+        fingerprint = result.get("disc_fingerprint")
+        if (
+            getattr(args, "verify", False)
+            and verified
+            and fingerprint
+            and files
+            and not getattr(args, "rerip_review", False)
+            and not result.get("routed_to_review", False)
+        ):
+            append_disc_receipt(
+                Path(args.disc_receipts), item, disc_n, fingerprint, files
+            )
+        if verified:
+            if on_complete is not None:
+                on_complete(result)
+            run_subocr_postrip(args, files)
+        return verified
+    except Exception as exc:
+        err_msg = (
+            f"FINALIZE_FAIL {item.title} disc{disc_n}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        _record_finalize_error(err_msg)
+        try:
             append_log(
                 args,
-                f"MOVE_FAIL {item.title} disc{disc_n} :: {e} "
-                f"(RIP PRESERVED at {staging}; "
-                f"{len(jobs) - done} incomplete slot(s) rolled back)",
+                f"FINALIZE_FAIL {item.title} disc{disc_n} :: "
+                f"{type(exc).__name__}: {exc}",
             )
-            print(f"{C.RED}Background NAS move failed: {e}{C.R}", flush=True)
-            print(
-                f"{C.YLW}  Staged rip preserved at {staging}; fix the mount "
-                f"and move it manually.{C.R}",
-                flush=True,
-            )
-            beep(args, ok=False)
-            return
-    result["files"] = files
-    if files and getattr(args, "state", None):
-        log_final_durations(args, item, disc_n, files)
-    verified = True
-    if getattr(args, "verify", False) and files:
-        ok2, err = verify(files)
-        if not ok2:
-            verified = False
-            _record_finalize_error(f"VERIFY_FAIL {item.title} disc{disc_n}: {err}")
-            append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
-            print(f"{C.RED}Verify failed (background): {err}{C.R}", flush=True)
-            beep(args, ok=False)
-    fingerprint = result.get("disc_fingerprint")
-    if (
-        getattr(args, "verify", False)
-        and verified
-        and fingerprint
-        and files
-        and not getattr(args, "rerip_review", False)
-    ):
-        append_disc_receipt(
-            Path(args.disc_receipts), item, disc_n, fingerprint, files
+        except Exception:
+            pass
+        print(
+            f"{C.RED}Background finalize failed ({type(exc).__name__}): {exc}{C.R}",
+            flush=True,
         )
-    if verified:
-        run_subocr_postrip(args, files)
+        try:
+            beep(args, ok=False)
+        except Exception:
+            pass
+        if on_failure is not None:
+            try:
+                on_failure(err_msg)
+            except Exception:
+                pass
+        return False
 
 
-def start_background_finalize(args, result: dict, item: QueueItem, disc_n: int) -> None:
+def start_background_finalize(
+    args,
+    result: dict,
+    item: QueueItem,
+    disc_n: int,
+    *,
+    on_complete=None,
+    on_failure=None,
+) -> None:
     t = threading.Thread(
-        target=_run_finalize, args=(args, result, item, disc_n), daemon=False
+        target=_run_finalize,
+        args=(args, result, item, disc_n),
+        kwargs={"on_complete": on_complete, "on_failure": on_failure},
+        daemon=False,
     )
     t.start()
     _FINALIZE_THREADS.append(t)
@@ -387,7 +468,6 @@ def start_background_finalize(args, result: dict, item: QueueItem, disc_n: int) 
         f"next disc.{C.R}",
         flush=True,
     )
-
 
 def join_finalizers() -> None:
     pending = [t for t in _FINALIZE_THREADS if t.is_alive()]
@@ -399,6 +479,38 @@ def join_finalizers() -> None:
         )
     for t in _FINALIZE_THREADS:
         t.join()
+
+
+def resolve_fallback_title_mapping(
+    rips: list[Path], info: dict, file_playlists: dict[str, str]
+) -> dict[Path, int]:
+    """Map fallback `.mkv` files to proven MakeMKV title IDs via TINFO[16] `.mpls` names.
+
+    Only returns unambiguous 1-to-1 mappings where an output's source `.mpls`
+    playlist matches exactly one MakeMKV title in `info['titles']`.
+    """
+    if not file_playlists:
+        return {}
+    mpls_to_tids: dict[str, list[int]] = {}
+    for tid, attrs in (info.get("titles") or {}).items():
+        if not isinstance(attrs, dict):
+            continue
+        raw_src = str(attrs.get(16, "") or "").strip()
+        if raw_src.lower().endswith(".mpls"):
+            key = Path(raw_src).name.casefold()
+            mpls_to_tids.setdefault(key, []).append(int(tid))
+    proven: dict[Path, int] = {}
+    used_tids: set[int] = set()
+    for src in rips:
+        raw_pl = file_playlists.get(str(src)) or file_playlists.get(src.name)
+        if not raw_pl:
+            continue
+        key = Path(raw_pl).name.casefold()
+        tids = mpls_to_tids.get(key) or []
+        if len(tids) == 1 and tids[0] not in used_tids:
+            proven[src] = tids[0]
+            used_tids.add(tids[0])
+    return proven
 
 
 def rip(
@@ -702,6 +814,7 @@ def rip(
 
     elapsed = time.time() - start
     used_fallback = False
+    fallback_file_playlists: dict[str, str] = {}
     rips: list[Path] = []
 
     if fail_reason is not None:
@@ -718,6 +831,7 @@ def rip(
             fb = mkvmerge_fallback_rip(args, item, staging)
             if fb.ok and fb.files:
                 used_fallback = True
+                fallback_file_playlists = dict(getattr(fb, "file_playlists", None) or {})
                 rips = sorted(fb.files)
                 elapsed = time.time() - start
                 append_log(
@@ -793,6 +907,8 @@ def rip(
                     lock_dir=protected_lock_dir,
                     publish_lock_held=publish_lock_held,
                 )
+            elif bool(getattr(args, "overwrite", False) and item.type == "movie"):
+                move_with_progress(src, dst, label=label, allow_overwrite=True)
             else:
                 move_with_progress(src, dst, label=label)
         else:
@@ -1010,17 +1126,8 @@ def rip(
         _emit_move(main, target_path, "moving main title")
         finals.insert(0, str(target_path))
     else:
-        _review_dir = None
-        if getattr(args, "rerip_review", False):
-            try:
-                _review_dir = reserve_tv_review_attempt_dir(output_dir, staging)
-            except (OSError, ValueError) as exc:
-                return (
-                    False,
-                    f"cannot reserve isolated review attempt: {exc}; RIP "
-                    f"PRESERVED at {staging}",
-                )
-            print(f"{C.D}  review attempt: {_review_dir}{C.R}")
+        route_to_review = bool(getattr(args, "rerip_review", False))
+        proven_fallback_map: dict[Path, int] = {}
 
         rips = split_chaptered_playall(args, rips, staging)
         play_all = set() if used_fallback else play_all_title_ids(info)
@@ -1031,6 +1138,67 @@ def rip(
             and title_num_from_filename(p.name) not in play_all
         ]
         extras_rips = [p for p in rips if _src_dur_s(p) < TV_MIN_DUR_S]
+
+        if used_fallback and not route_to_review and episode_rips:
+            proven_fallback_map = resolve_fallback_title_mapping(
+                episode_rips, info, fallback_file_playlists
+            )
+            unverified_reason: str | None = None
+            if item.expected_title_ids:
+                tid_to_src = {tid: src for src, tid in proven_fallback_map.items()}
+                missing_fb = [
+                    tid for tid in item.expected_title_ids if tid not in tid_to_src
+                ]
+                if missing_fb:
+                    unverified_reason = (
+                        f"mkvmerge fallback has unverified episode identities for "
+                        f"contracted title ids {item.expected_title_ids} "
+                        f"(unmapped: {missing_fb})"
+                    )
+            else:
+                unmapped = [p.name for p in episode_rips if p not in proven_fallback_map]
+                if unmapped:
+                    unverified_reason = (
+                        f"mkvmerge fallback playlist-to-title mapping is unverified "
+                        f"for {unmapped}"
+                    )
+            if unverified_reason:
+                try:
+                    output_dir = tv_review_capture_dir(
+                        item,
+                        target_dir,
+                        getattr(args, "current_disc_fingerprint", ""),
+                        getattr(args, "review_root", None),
+                    )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                except (OSError, ValueError) as exc:
+                    return (
+                        False,
+                        f"{unverified_reason}; cannot isolate to review ({exc}); "
+                        f"RIP PRESERVED at {staging}",
+                    )
+                route_to_review = True
+                print(
+                    f"{C.YLW}  {unverified_reason} — routing fallback outputs to "
+                    f"isolated review quarantine (not Season {item.season:02d}).{C.R}"
+                )
+                append_log(
+                    args,
+                    f"FALLBACK_UNVERIFIED_REVIEW {item.title} S{item.season:02d} "
+                    f"disc{disc_n} :: {unverified_reason}",
+                )
+
+        _review_dir = None
+        if route_to_review:
+            try:
+                _review_dir = reserve_tv_review_attempt_dir(output_dir, staging)
+            except (OSError, ValueError) as exc:
+                return (
+                    False,
+                    f"cannot reserve isolated review attempt: {exc}; RIP "
+                    f"PRESERVED at {staging}",
+                )
+            print(f"{C.D}  review attempt: {_review_dir}{C.R}")
 
         _gcand = [(title_num_from_filename(pp.name), _src_dur_s(pp)) for pp in episode_rips]
         _gkeep, _gbonus, _gthr = episode_bonus_split(_gcand)
@@ -1179,7 +1347,7 @@ def rip(
                 )
             episode_rips = _kept
 
-        if getattr(args, "rerip_review", False):
+        if route_to_review:
             try:
                 _move_extras(
                     episode_rips,
@@ -1200,7 +1368,38 @@ def rip(
         else:
             expected = item.expected_disc_episodes
             if expected > 0:
-                if item.expected_title_ids and not used_fallback:
+                if item.expected_title_ids and used_fallback:
+                    tid_to_src = {tid: src for src, tid in proven_fallback_map.items()}
+                    missing_ids = [
+                        tid for tid in item.expected_title_ids if tid not in tid_to_src
+                    ]
+                    if missing_ids:
+                        return (
+                            False,
+                            f"fallback disc is missing proven contracted title ids {missing_ids}; "
+                            f"RIP PRESERVED at {staging}",
+                        )
+                    selected = [tid_to_src[tid] for tid in item.expected_title_ids]
+                    selected_set = set(selected)
+                    overflow = [p for p in episode_rips if p not in selected_set]
+                    if overflow:
+                        try:
+                            _move_extras(
+                                overflow,
+                                normal_tv_extras_dir,
+                                lambda src, tnum: (
+                                    f"{sanitize(item.title)} - S{item.season:02d}D{disc_n} - "
+                                    f"contract-extra-{('t%02d' % tnum) if tnum is not None else src.stem}.mkv"
+                                ),
+                            )
+                        except FileExistsError as exc:
+                            return (
+                                False,
+                                f"extras collision: {exc} — RIP PRESERVED at "
+                                f"{staging} (not deleted; resolve manually)",
+                            )
+                    episode_rips = selected
+                elif item.expected_title_ids and not used_fallback:
                     selected, overflow, missing_ids = partition_episode_contract(
                         episode_rips, item
                     )
@@ -1273,15 +1472,17 @@ def rip(
         rips = episode_rips
         if not rips:
             print(f"{C.YLW}  No titles >= {TV_MIN_DUR_S}s — extras-only disc.{C.R}")
+            early_payload: dict = {"elapsed_s": elapsed, "files": finals}
+            if used_fallback:
+                early_payload["used_fallback"] = True
+            if route_to_review:
+                early_payload["routed_to_review"] = True
             if getattr(args, "sync_move", False):
                 shutil.rmtree(staging, ignore_errors=True)
-                return True, {"elapsed_s": elapsed, "files": finals}
-            return True, {
-                "elapsed_s": elapsed,
-                "files": finals,
-                "move_jobs": move_jobs,
-                "staging": str(staging),
-            }
+                return True, early_payload
+            early_payload["move_jobs"] = move_jobs
+            early_payload["staging"] = str(staging)
+            return True, early_payload
 
         with season_dir_lock(target_dir, what="rename"):
             start_ep = starting_ep(item, disc_n, state, target_dir=target_dir)
@@ -1429,6 +1630,8 @@ def rip(
     payload: dict = {"elapsed_s": elapsed, "files": finals}
     if used_fallback:
         payload["used_fallback"] = True
+    if item.type == "tv-season" and route_to_review:
+        payload["routed_to_review"] = True
     if getattr(args, "sync_move", False):
         shutil.rmtree(staging, ignore_errors=True)
         return True, payload
