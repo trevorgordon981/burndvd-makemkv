@@ -46,6 +46,7 @@ from burndvd.nas import (
     _dir_writable,
     _emit_claimed_tv_moves,
     _free_gb,
+    _rebind_claim_identity,
     _remove_zero_placeholder,
     _rollback_incomplete_dst,
     _salvage_and_fail,
@@ -617,11 +618,26 @@ def _run_finalize(
                     if writable_dir != dst.parent:
                         dst = writable_dir / dst.name
                         if claim_path is not None:
-                            claim_path = _to_nfs_path(claim_path) or claim_path
+                            nfs_claim = _to_nfs_path(claim_path)
+                            if nfs_claim is not None:
+                                claim_path = nfs_claim
+                                placeholder_identity = _rebind_claim_identity(
+                                    claim_path, placeholder_identity
+                                )
                         if partial_root is not None:
                             partial_root = _to_nfs_path(partial_root) or partial_root
                         if lock_dir is not None:
                             lock_dir = _to_nfs_path(lock_dir) or lock_dir
+                        unpacked_jobs[i] = (
+                            src,
+                            dst,
+                            label,
+                            protected,
+                            placeholder_identity,
+                            claim_path,
+                            partial_root,
+                            lock_dir,
+                        )
                         files = [
                             str(dst) if fp == str(orig_dst) else fp for fp in files
                         ]
@@ -1417,22 +1433,21 @@ def rip(
                 f"(staging was NOT deleted)",
             )
 
-    if item.type == "tv-season" and str(output_dir).startswith(SMB_MEDIA_PREFIX + "/"):
-        nfs_output = Path(
-            str(output_dir).replace(SMB_MEDIA_PREFIX + "/", NFS_MEDIA_PREFIX + "/", 1)
-        )
-        nfs_target = Path(
-            str(target_dir).replace(SMB_MEDIA_PREFIX + "/", NFS_MEDIA_PREFIX + "/", 1)
-        )
-        if not _dir_writable(nfs_output) or not _dir_writable(nfs_target):
-            return (
-                False,
-                f"atomic TV publication backend (NFS) is unavailable; RIP "
-                f"PRESERVED at {staging}",
-            )
-        output_dir = nfs_output
-        target_dir = nfs_target
-        print(f"{C.D}  TV publication routed through atomic NFS view: {output_dir}{C.R}")
+    if item.type == "tv-season":
+        nfs_output = _to_nfs_path(output_dir)
+        nfs_target = _to_nfs_path(target_dir)
+        if nfs_output is not None or nfs_target is not None:
+            cand_output = nfs_output or output_dir
+            cand_target = nfs_target or target_dir
+            if not _dir_writable(cand_output) or not _dir_writable(cand_target):
+                return (
+                    False,
+                    f"atomic TV publication backend (NFS) is unavailable; RIP "
+                    f"PRESERVED at {staging}",
+                )
+            output_dir = cand_output
+            target_dir = cand_target
+            print(f"{C.D}  TV publication routed through atomic NFS view: {output_dir}{C.R}")
 
     protected_partial_root = None
     normal_tv_extras_dir = None
@@ -1859,6 +1874,7 @@ def rip(
             accept = ans in ("", "y", "yes")
 
             if accept:
+                target_dir = resolve_nas_path(target_dir, prefer_nfs=True)
                 planned = [
                     (
                         src,

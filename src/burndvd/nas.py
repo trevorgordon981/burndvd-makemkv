@@ -390,19 +390,82 @@ def _claim_pid_is_dead(path: Path, st: os.stat_result) -> bool:
         return False
 
 
+def _claim_owned_by_pid(
+    path: Path, st: os.stat_result, pid: int | None = None
+) -> bool:
+    """Return True when `path` is a regular PID-tagged claim written by `pid`."""
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0 or st.st_size > 64:
+        return False
+    data = _read_claim_bytes(path, st)
+    if not data or not re.fullmatch(rb"\d+\n?", data):
+        return False
+    try:
+        claim_pid = int(data.strip())
+    except ValueError:
+        return False
+    target_pid = os.getpid() if pid is None else pid
+    return claim_pid == target_pid
+
+
+def _claim_identity_matches(
+    path: Path,
+    st: os.stat_result,
+    placeholder_identity: tuple[int, int] | None,
+) -> bool:
+    """Verify `st` represents our owned claim, allowing SMB<->NFS `st_dev` change
+    only on a verified NAS mount when both `st_ino` and current-PID payload match."""
+    if placeholder_identity is None or not _is_valid_claim_stat(path, st):
+        return False
+    expected_dev, expected_ino = placeholder_identity
+    if (st.st_dev, st.st_ino) == (expected_dev, expected_ino):
+        return True
+    return (
+        st.st_ino == expected_ino
+        and _nas_root_for(path) is not None
+        and _verify_nas_mount_identity(path)
+        and _claim_owned_by_pid(path, st)
+    )
+
+
+def _rebind_claim_identity(
+    claim_path: Path,
+    placeholder_identity: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    """Rebind `(st_dev, st_ino)` to `claim_path`'s current mount after verifying
+    exact `st_ino` and current-PID ownership; otherwise preserve original identity
+    so downstream ownership checks fail closed."""
+    if placeholder_identity is None:
+        return None
+    try:
+        current = os.lstat(claim_path)
+    except OSError:
+        return placeholder_identity
+    if _claim_identity_matches(claim_path, current, placeholder_identity):
+        return (current.st_dev, current.st_ino)
+    return placeholder_identity
+
+
 def _remove_zero_placeholder(
     dst: Path, placeholder_identity: tuple[int, int] | None
 ) -> None:
-    """Remove only an owned claim file matching its exact `(st_dev, st_ino)`."""
-    try:
-        current = os.lstat(dst)
-        if (
-            _is_valid_claim_stat(dst, current)
-            and (current.st_dev, current.st_ino) == placeholder_identity
-        ):
-            dst.unlink()
-    except OSError:
-        pass
+    """Remove only an owned claim file verified by exact `(st_dev, st_ino)` or
+    same-NAS-inode + current-PID across an SMB->NFS failover."""
+    dst_path = Path(dst)
+    candidates = [dst_path]
+    nfs_alt = _to_nfs_path(dst_path)
+    if nfs_alt is not None and nfs_alt != dst_path:
+        candidates.append(nfs_alt)
+    for candidate in candidates:
+        try:
+            current = os.lstat(candidate)
+        except OSError:
+            continue
+        if _claim_identity_matches(candidate, current, placeholder_identity):
+            try:
+                candidate.unlink()
+            except OSError:
+                continue
+            return
 
 
 def _remove_claimed_placeholders(
@@ -454,7 +517,16 @@ def _claim_tv_destinations(
     claims: dict[Path, tuple[Path, tuple[int, int]]] = {}
     try:
         for destination in destinations:
-            claim_path = tv_slot_claim_path(destination)
+            claim_dest = Path(destination)
+            nfs_dest = _to_nfs_path(claim_dest)
+            if (
+                nfs_dest is not None
+                and _nfs_mount_available()
+                and _verify_nas_mount_identity(nfs_dest.parent)
+                and nfs_dest.parent.is_dir()
+            ):
+                claim_dest = nfs_dest
+            claim_path = tv_slot_claim_path(claim_dest)
             claims[destination] = (claim_path, _create_tv_slot_claim(claim_path))
     except BaseException:
         _remove_claimed_placeholders(
@@ -936,10 +1008,7 @@ def move_with_progress_noclobber(
         with publish_lock:
             if claim_path is not None:
                 claim = os.lstat(claim_path)
-                if (
-                    not _is_valid_claim_stat(claim_path, claim)
-                    or (claim.st_dev, claim.st_ino) != placeholder_identity
-                ):
+                if not _claim_identity_matches(claim_path, claim, placeholder_identity):
                     raise FileExistsError(
                         f"TV slot claim ownership changed: {claim_path}"
                     )
