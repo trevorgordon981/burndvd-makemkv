@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "burndvd"
+version = "2.0.0"
+description = "Decoupled macOS DVD/Blu-ray/UHD ripping, verification, unencrypted-BD fallback, and Apple Vision PGS subtitle OCR library and CLI toolkit."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = []
+
+[project.optional-dependencies]
+ocr = [
+    "pillow>=10.0",
+    "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+burndvd-queue = "burndvd.cli.ripqueue:cli_main"
+burndvd-metadata = "burndvd.cli.metadata:main"
+checkrip = "burndvd.cli.checkrip:cli_main"
+stoprip = "burndvd.cli.stoprip:cli_main"
+rip-progress = "burndvd.cli.rip_progress:cli_main"
+subocr = "burndvd.cli.subocr:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

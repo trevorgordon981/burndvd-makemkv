@@ -1,6 +1,15 @@
 .DS_Store
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.swp
 *~
+*.bak
+*.bak-*
+*.bak.*
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

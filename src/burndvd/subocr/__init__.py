@@ -1,0 +1,86 @@
+"""Decoupled HDMV PGS subtitle OCR library using Apple Vision."""
+
+from __future__ import annotations
+
+from burndvd.models import TrackInfo
+from burndvd.subocr.pgs import (
+    PGS_MAGIC,
+    PTS_HZ,
+    SEG_END,
+    SEG_ODS,
+    SEG_PCS,
+    SEG_PDS,
+    SEG_WDS,
+    PgsComposition,
+    PgsDisplay,
+    PgsObject,
+    PgsPalette,
+    _decode_rle,
+    _ycrcb_to_rgb,
+    parse_sup,
+)
+from burndvd.subocr.pipeline import (
+    LOCK_PATH,
+    acquire_lock,
+    find_mkvs,
+    ocr_mkv,
+    ocr_pgs_track,
+    process_mkv,
+)
+from burndvd.subocr.srt import _ms_to_srt_ts, write_srt
+from burndvd.subocr.tracks import (
+    CONFIG_PATH,
+    DEFAULT_CONFIG,
+    LANG_639_1,
+    SHOW_RE,
+    VISION_LANG,
+    _to_iso639_2,
+    load_config,
+    pick_audio_default,
+    pick_sub_track,
+    probe_tracks,
+    set_track_defaults,
+    show_for_path,
+    show_settings,
+)
+from burndvd.subocr.vision import ocr_image
+
+__all__ = [
+    "CONFIG_PATH",
+    "DEFAULT_CONFIG",
+    "LANG_639_1",
+    "LOCK_PATH",
+    "PGS_MAGIC",
+    "PTS_HZ",
+    "SEG_END",
+    "SEG_ODS",
+    "SEG_PCS",
+    "SEG_PDS",
+    "SEG_WDS",
+    "SHOW_RE",
+    "TrackInfo",
+    "VISION_LANG",
+    "PgsComposition",
+    "PgsDisplay",
+    "PgsObject",
+    "PgsPalette",
+    "_decode_rle",
+    "_ms_to_srt_ts",
+    "_to_iso639_2",
+    "_ycrcb_to_rgb",
+    "acquire_lock",
+    "find_mkvs",
+    "load_config",
+    "ocr_image",
+    "ocr_mkv",
+    "ocr_pgs_track",
+    "parse_sup",
+    "pick_audio_default",
+    "pick_sub_track",
+    "probe_tracks",
+    "process_mkv",
+    "set_track_defaults",
+    "show_for_path",
+    "show_settings",
+    "write_srt",
+]

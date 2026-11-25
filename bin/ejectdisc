@@ -1,8 +1,48 @@
 #!/bin/bash
-# Open the tray on the external DVD/BD drive (LG BU40N).
-# Usage: ejectdisc [close]
-case "${1:-eject}" in
-  close) exec drutil tray close ;;
-  eject|open|"") exec drutil tray eject ;;
-  *) echo "usage: ejectdisc [eject|close]" >&2; exit 2 ;;
-esac
+# Open or close the tray on an optical drive (macOS drutil).
+# Usage: ejectdisc [drive_idx] [eject|open|close]
+#        ejectdisc [-drive drive_idx] [eject|open|close]
+#        ejectdisc [eject|open|close] [drive_idx]
+set -euo pipefail
+
+DRIVE=""
+ACTION=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -drive)
+      [ "$#" -ge 2 ] && [[ "$2" =~ ^[0-9]+$ ]] || {
+        echo "usage: ejectdisc [drive_idx] [eject|open|close]" >&2
+        exit 2
+      }
+      DRIVE="$2"
+      shift 2
+      ;;
+    close)
+      [ -z "$ACTION" ] || { echo "usage: ejectdisc [drive_idx] [eject|open|close]" >&2; exit 2; }
+      ACTION="close"
+      shift
+      ;;
+    eject|open)
+      [ -z "$ACTION" ] || { echo "usage: ejectdisc [drive_idx] [eject|open|close]" >&2; exit 2; }
+      ACTION="eject"
+      shift
+      ;;
+    *[!0-9]*|"")
+      echo "usage: ejectdisc [drive_idx] [eject|open|close]" >&2
+      exit 2
+      ;;
+    *)
+      [ -z "$DRIVE" ] || { echo "usage: ejectdisc [drive_idx] [eject|open|close]" >&2; exit 2; }
+      DRIVE="$1"
+      shift
+      ;;
+  esac
+done
+
+ACTION="${ACTION:-eject}"
+if [ -n "$DRIVE" ]; then
+  exec drutil -drive "$DRIVE" tray "$ACTION"
+else
+  exec drutil tray "$ACTION"
+fi

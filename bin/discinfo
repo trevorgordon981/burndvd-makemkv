@@ -1,0 +1,120 @@
+#!/bin/bash
+# discinfo — list titles on the disc currently in the drive without ripping.
+# Wraps `makemkvcon info disc:N` and prints id, duration, size, chapters per title.
+
+set -u
+
+BOLD=$'\033[1m'; DIM=$'\033[2m'; GRN=$'\033[32m'; YLW=$'\033[33m'; RED=$'\033[31m'; R=$'\033[0m'
+
+MAKEMKV=$(command -v makemkvcon 2>/dev/null || echo /Applications/MakeMKV.app/Contents/MacOS/makemkvcon)
+if [ ! -x "$MAKEMKV" ]; then
+    printf "%sdiscinfo: makemkvcon not found (%s)%s\n" "$RED" "$MAKEMKV" "$R" >&2
+    exit 1
+fi
+
+if pgrep -f 'makemkvcon.*disc:' >/dev/null 2>&1; then
+    printf '%sdiscinfo: drive is busy with an active rip — try `checkrip` instead%s\n' "$YLW" "$R" >&2
+    exit 1
+fi
+
+REQ_DRIVE=""
+if [ "${1:-}" = "-drive" ] && [ -n "${2:-}" ]; then
+    REQ_DRIVE="$2"
+elif [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    REQ_DRIVE="$1"
+fi
+
+DRUTIL_IDX=""
+DEV=""
+VOL=""
+DISC_INDEX="0"
+
+SORTED_NUMS=$( { drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]' | while read -r _l; do
+    _ix=$(printf '%s\n' "$_l" | awk '{print $1}')
+    _inf=$(drutil status -drive "$_ix" 2>/dev/null || true)
+    printf '%s' "$_inf" | grep -q "No Media Inserted" && continue
+    printf '%s' "$_inf" | sed -n 's|.*Name: */dev/disk\([0-9]*\).*|\1|p' | head -1
+done | sort -n; } || true )
+
+while read -r line; do
+    idx=$(printf '%s\n' "$line" | awk '/^[[:space:]]*[0-9]+/ {print $1}')
+    [ -z "$idx" ] && continue
+    if [ -n "$REQ_DRIVE" ] && [ "$idx" != "$REQ_DRIVE" ]; then
+        continue
+    fi
+    info=$(drutil status -drive "$idx" 2>/dev/null) || continue
+    printf '%s' "$info" | grep -q "No Media Inserted" && continue
+    dev=$(printf '%s' "$info" | sed -n 's|.*Name: */dev/\(disk[0-9]*\).*|\1|p' | head -1)
+    [ -z "$dev" ] && continue
+    DRUTIL_IDX="$idx"
+    DEV="$dev"
+    dnum=$(printf '%s' "$dev" | grep -oE '[0-9]+' || true)
+    if [ -n "$dnum" ] && [ -n "$SORTED_NUMS" ]; then
+        rank=$(printf '%s\n' "$SORTED_NUMS" | grep -nxF "$dnum" | head -1 | cut -d: -f1 || true)
+        DISC_INDEX=$(( ${rank:-1} - 1 ))
+    fi
+    VOL=$(diskutil info "/dev/$DEV" 2>/dev/null | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}' || true)
+    if [ -z "${VOL:-}" ]; then
+        VOL=$(printf '%s' "$info" | awk -F: '/Name:/{sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+    fi
+    break
+done < <(drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]' || true)
+
+if [ -z "${VOL:-}" ] && [ -z "$REQ_DRIVE" ]; then
+    VOL=$(drutil status 2>/dev/null | awk -F: '/Name:/{sub(/^[[:space:]]+/,"",$2); print $2; exit}')
+fi
+
+if [ -z "${VOL:-}" ]; then
+    printf "%sdiscinfo: no disc detected%s\n" "$RED" "$R" >&2
+    exit 1
+fi
+
+printf "%sdiscinfo%s  %s\n" "$BOLD" "$R" "$(date '+%Y-%m-%d %H:%M:%S')"
+printf "  disc:  %s%s%s (disc:%s%s)\n" "$BOLD" "${VOL##* }" "$R" "$DISC_INDEX" "${DRUTIL_IDX:+, drive $DRUTIL_IDX}"
+printf "  ${DIM}scanning (~15s)...${R}\n"
+
+TMP=$(mktemp -t discinfo.XXXX)
+trap 'rm -f "$TMP"' EXIT
+
+rc=0
+"$MAKEMKV" -r --noscan --minlength=0 info "disc:$DISC_INDEX" > "$TMP" 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    printf "%sdiscinfo: makemkvcon failed (rc=%d)%s\n" "$RED" "$rc" "$R" >&2
+    tail -5 "$TMP" >&2
+    exit 1
+fi
+
+awk -v BOLD="$BOLD" -v DIM="$DIM" -v GRN="$GRN" -v R="$R" '
+function strip(s) {
+    gsub(/^"/, "", s); gsub(/"$/, "", s); return s
+}
+/^TINFO:/ {
+    n = split($0, p, ",")
+    tid = substr(p[1], 7) + 0
+    aid = p[2] + 0
+    val = p[4]
+    for (i = 5; i <= n; i++) val = val "," p[i]
+    val = strip(val)
+    if (aid == 8)  chap[tid] = val
+    if (aid == 9)  dur[tid]  = val
+    if (aid == 11) size[tid] = val
+    if (aid == 27) fname[tid] = val
+    if (aid == 30) name[tid] = val
+    if (!(tid in seen)) { seen[tid] = 1; order[++count] = tid }
+}
+/^CINFO:32,/ { gsub(/^CINFO:32,0,/, "", $0); discname = strip($0) }
+END {
+    if (count == 0) { print "  no titles found"; exit 1 }
+    printf "  total titles: %s%d%s\n\n", BOLD, count, R
+    printf "  %-3s  %-9s  %-8s  %-3s  %s\n", "id", "duration", "size", "ch", "name"
+    printf "  %-3s  %-9s  %-8s  %-3s  %s\n", "--", "--------", "----", "--", "----"
+    for (i = 1; i <= count; i++) {
+        tid = order[i]
+        printf "  %s%-3d%s  %-9s  %-8s  %-3s  %s\n", \
+            BOLD, tid, R, \
+            (tid in dur  ? dur[tid]  : "?"), \
+            (tid in size ? size[tid] : "?"), \
+            (tid in chap ? chap[tid] : "?"), \
+            (tid in name ? name[tid] : (tid in fname ? fname[tid] : ""))
+    }
+}' "$TMP"
