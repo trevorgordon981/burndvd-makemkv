@@ -42,11 +42,84 @@ def _free_gb(path: Path) -> float:
         return shutil.disk_usage(path).free / 1e9
 
 
+class AtomicPublishUnsupportedError(OSError):
+    """Raised when a filesystem supports neither native no-replace rename nor hard-link fallback."""
+
+
+_UNSUPPORTED_ATOMIC_ERRNOS = frozenset(
+    {
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        errno.ENOSYS,
+    }
+)
+
+
+def _configured_nas_roots() -> tuple[str, ...]:
+    """Return deduplicated configured SMB/NFS mount root paths."""
+    roots: list[str] = []
+    for candidate in (
+        SMB_MEDIA_PREFIX,
+        NFS_MEDIA_PREFIX,
+        os.environ.get("BURNDVD_MEDIA_ROOT", "").strip(),
+        os.environ.get("BURNDVD_NFS_MEDIA_ROOT", "").strip(),
+    ):
+        if not candidate:
+            continue
+        norm = os.path.normpath(os.fspath(candidate))
+        if norm != os.sep and norm not in roots:
+            roots.append(norm)
+    return tuple(roots)
+
+
+def _nas_root_for(dirpath: Path) -> Path | None:
+    """Return the configured NAS mount root containing `dirpath`, or None."""
+    raw = os.path.normpath(os.fspath(Path(dirpath)))
+    resolved: Path | None = None
+    for norm_root in _configured_nas_roots():
+        if raw == norm_root or raw.startswith(norm_root + os.sep):
+            return Path(norm_root)
+        try:
+            if resolved is None:
+                resolved = Path(dirpath).resolve(strict=False)
+            resolved_root = Path(norm_root).resolve(strict=False)
+            if resolved_root != Path(os.sep) and resolved.is_relative_to(resolved_root):
+                return Path(norm_root)
+        except OSError:
+            continue
+    return None
+
+
+def _verify_nas_mount_identity(dirpath: Path) -> bool:
+    """Verify that a path under a configured NAS root sits on an active mount.
+
+    Paths outside configured NAS roots (for example local temp/test directories)
+    return True without mount checks. Paths at or under a configured SMB or NFS
+    root return True only when that root is an existing non-symlink directory
+    reported as an active mountpoint by `os.path.ismount()`.
+    """
+    mount_root = _nas_root_for(dirpath)
+    if mount_root is None:
+        return True
+    try:
+        return (
+            mount_root.is_dir()
+            and not mount_root.is_symlink()
+            and os.path.ismount(mount_root)
+        )
+    except OSError:
+        return False
+
+
 def _nfs_mount_available() -> bool:
     """True when the configured NFS media root is an active mountpoint."""
     nfs_root = Path(NFS_MEDIA_PREFIX)
     try:
-        return nfs_root.is_dir() and os.path.ismount(nfs_root)
+        return (
+            nfs_root.is_dir()
+            and not nfs_root.is_symlink()
+            and os.path.ismount(nfs_root)
+        )
     except OSError:
         return False
 
@@ -71,7 +144,11 @@ def resolve_nas_path(path: Path, prefer_nfs: bool = False) -> Path:
         return nfs_alt
     smb_root = Path(SMB_MEDIA_PREFIX)
     try:
-        smb_ok = smb_root.is_dir() and os.path.ismount(smb_root)
+        smb_ok = (
+            smb_root.is_dir()
+            and not smb_root.is_symlink()
+            and os.path.ismount(smb_root)
+        )
     except OSError:
         smb_ok = False
     if not smb_ok and _nfs_mount_available():
@@ -80,6 +157,9 @@ def resolve_nas_path(path: Path, prefer_nfs: bool = False) -> Path:
 
 
 def _dir_writable(dirpath: Path) -> bool:
+    dirpath = Path(dirpath)
+    if not _verify_nas_mount_identity(dirpath):
+        return False
     try:
         dirpath.mkdir(parents=True, exist_ok=True)
         probe = dirpath / f".writeprobe-{os.getpid()}-{threading.get_ident()}"
@@ -391,6 +471,12 @@ def move_with_progress(
     pre-existing destination.
     """
     src, dst = Path(src), Path(dst)
+    if not _verify_nas_mount_identity(dst.parent):
+        raise OSError(
+            errno.ENOTCONN,
+            f"destination NAS mount is not active (refusing write to local backing directory): {dst.parent}",
+            str(dst.parent),
+        )
     dst.parent.mkdir(parents=True, exist_ok=True)
     if not allow_overwrite:
         try:
@@ -414,6 +500,7 @@ def move_with_progress(
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
             raise OSError(f"move source is not a regular file: {src}")
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
         total = source_stat.st_size
     except BaseException:
         os.close(source_fd)
@@ -422,7 +509,9 @@ def move_with_progress(
     token = f".burndvd-tmp-{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.partial"
     partial = dst.parent / token
     partial_fd = None
+    partial_identity = None
     monitor_fd = None
+    source_guard_fd = None
     try:
         partial_fd = os.open(
             str(partial),
@@ -434,15 +523,28 @@ def move_with_progress(
             0o644,
         )
         partial_stat = os.fstat(partial_fd)
+        if not stat.S_ISREG(partial_stat.st_mode):
+            raise OSError(f"move partial is not a regular file: {partial}")
         partial_identity = (partial_stat.st_dev, partial_stat.st_ino)
         monitor_fd = os.dup(partial_fd)
+        source_guard_fd = os.dup(source_fd)
     except BaseException:
-        for fd in (monitor_fd, partial_fd, source_fd):
+        for fd in (monitor_fd, partial_fd, source_guard_fd, source_fd):
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
+        if partial_fd is not None:
+            try:
+                cur_stat = os.lstat(partial)
+                if (
+                    partial_identity is None
+                    or (cur_stat.st_dev, cur_stat.st_ino) == partial_identity
+                ):
+                    partial.unlink()
+            except OSError:
+                pass
         raise
 
     done_evt = threading.Event()
@@ -495,8 +597,14 @@ def move_with_progress(
             raise err_box[0]
 
         copied = os.lstat(partial)
+        guarded_source = os.fstat(source_guard_fd)
         if (copied.st_dev, copied.st_ino) != partial_identity or copied.st_size != total:
             raise OSError(f"partial copy identity/size changed: {partial}")
+        if (
+            (guarded_source.st_dev, guarded_source.st_ino) != source_identity
+            or guarded_source.st_size != total
+        ):
+            raise OSError(f"move source identity/size changed: {src}")
 
         if allow_overwrite:
             os.replace(partial, dst)
@@ -505,9 +613,40 @@ def move_with_progress(
         published = True
 
         try:
-            src.unlink()
+            current_src = os.lstat(src)
         except FileNotFoundError:
-            pass
+            current_src = None
+        if current_src is not None:
+            if (current_src.st_dev, current_src.st_ino) != source_identity:
+                raise OSError(
+                    f"source path was replaced during move; completed "
+                    f"destination retained at {dst}; replacement source "
+                    f"left untouched at {src}"
+                )
+            retired = src.with_name(
+                f".{src.name}.burndvd-consumed-{os.getpid()}-"
+                f"{time.time_ns()}-{os.urandom(8).hex()}"
+            )
+            try:
+                os.rename(src, retired)
+            except FileNotFoundError:
+                pass
+            else:
+                retired_stat = os.lstat(retired)
+                if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
+                    retained_at = retired
+                    if not src.exists():
+                        try:
+                            os.rename(retired, src)
+                            retained_at = src
+                        except OSError:
+                            pass
+                    raise OSError(
+                        f"source path was replaced during move; completed "
+                        f"destination retained at {dst}; foreign source "
+                        f"retained at {retained_at}"
+                    )
+                retired.unlink()
     except BaseException:
         if monitor_fd is not None:
             try:
@@ -523,6 +662,11 @@ def move_with_progress(
             except OSError:
                 pass
         raise
+    finally:
+        try:
+            os.close(source_guard_fd)
+        except OSError:
+            pass
 
     elapsed = time.time() - start
     avg_mbps = total / elapsed / (1024 * 1024) if elapsed > 0 else 0.0
@@ -576,11 +720,22 @@ def _atomic_rename_noreplace(source: Path, destination: Path) -> None:
     except FileExistsError:
         raise
     except OSError as fallback_error:
+        if (
+            native_errno in _UNSUPPORTED_ATOMIC_ERRNOS
+            or fallback_error.errno in _UNSUPPORTED_ATOMIC_ERRNOS
+        ):
+            raise AtomicPublishUnsupportedError(
+                fallback_error.errno or native_errno,
+                f"atomic no-replace publish unsupported on destination filesystem "
+                f"({os.strerror(native_errno)}); hard-link fallback failed "
+                f"({fallback_error}) — destination untouched and staging preserved",
+                str(destination),
+            ) from fallback_error
         raise OSError(
             native_errno,
             f"atomic no-replace rename unsupported ({os.strerror(native_errno)}); "
             f"hard-link fallback failed: {fallback_error}",
-            destination,
+            str(destination),
         ) from fallback_error
     try:
         source.unlink()
@@ -605,6 +760,13 @@ def move_with_progress_noclobber(
     if partial_root is None:
         raise ValueError("protected TV move requires an out-of-library partial_root")
     partial_root = Path(partial_root)
+    for target_path in (dst.parent, partial_root):
+        if not _verify_nas_mount_identity(target_path):
+            raise OSError(
+                errno.ENOTCONN,
+                f"destination NAS mount is not active (refusing write to local backing directory): {target_path}",
+                str(target_path),
+            )
     dst.parent.mkdir(parents=True, exist_ok=True)
     partial_root.mkdir(parents=True, exist_ok=True)
 
@@ -628,6 +790,7 @@ def move_with_progress_noclobber(
     token = f".{os.getpid()}-{time.time_ns()}-{os.urandom(8).hex()}.partial"
     partial = partial_root / token
     partial_fd = None
+    partial_identity = None
     monitor_fd = None
     try:
         partial_fd = os.open(
@@ -651,6 +814,16 @@ def move_with_progress_noclobber(
                     os.close(descriptor)
                 except OSError:
                     pass
+        if partial_fd is not None:
+            try:
+                cur_stat = os.lstat(partial)
+                if (
+                    partial_identity is None
+                    or (cur_stat.st_dev, cur_stat.st_ino) == partial_identity
+                ):
+                    partial.unlink()
+            except OSError:
+                pass
         raise
 
     done_evt = threading.Event()
@@ -1113,11 +1286,11 @@ def starting_ep(
             s_str = str(season_dir)
             if s_str.startswith(SMB_MEDIA_PREFIX + "/"):
                 alt = Path(s_str.replace(SMB_MEDIA_PREFIX + "/", NFS_MEDIA_PREFIX + "/", 1))
-                if alt.exists():
+                if alt.exists() and _verify_nas_mount_identity(alt):
                     season_dir = alt
             elif s_str.startswith(NFS_MEDIA_PREFIX + "/"):
                 alt = Path(s_str.replace(NFS_MEDIA_PREFIX + "/", SMB_MEDIA_PREFIX + "/", 1))
-                if alt.exists():
+                if alt.exists() and _verify_nas_mount_identity(alt):
                     season_dir = alt
         try:
             highest = 0
@@ -1217,6 +1390,12 @@ def _salvage_and_fail(
 
     saved_names: list[str] = []
     try:
+        if not _verify_nas_mount_identity(partial_dir):
+            raise OSError(
+                errno.ENOTCONN,
+                f"salvage NAS mount is not active (refusing write to local backing directory): {partial_dir}",
+                str(partial_dir),
+            )
         partial_dir.mkdir(parents=True, exist_ok=True)
         planned = []
         for p in complete:
@@ -1230,8 +1409,8 @@ def _salvage_and_fail(
             dest = partial_dir / name
             allow_overwrite = bool(getattr(args, "overwrite", False) and item.type == "movie")
             require_free_extra_destination(p, dest, allow_overwrite)
-            planned.append((p, dest, tag))
-        for p, dest, tag in planned:
+            planned.append((p, dest, tag, allow_overwrite))
+        for p, dest, tag, allow_overwrite in planned:
             if item.type == "tv-season":
                 move_with_progress_noclobber(
                     p,
@@ -1243,7 +1422,12 @@ def _salvage_and_fail(
                     lock_dir=target_dir,
                 )
             else:
-                move_with_progress(p, dest, label=f"salvaging {tag}")
+                move_with_progress(
+                    p,
+                    dest,
+                    label=f"salvaging {tag}",
+                    allow_overwrite=allow_overwrite,
+                )
             saved_names.append(dest.name)
     except OSError as e:
         return False, (

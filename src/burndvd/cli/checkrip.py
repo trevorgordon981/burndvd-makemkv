@@ -38,6 +38,14 @@ FFPROBE = resolve_binary(
     "/usr/local/bin/ffprobe",
     env_var="BURNDVD_FFPROBE",
 )
+FFMPEG = resolve_binary(
+    "ffmpeg",
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    env_var="BURNDVD_FFMPEG",
+)
+
+_LAST_PROBE_ERRORS: dict[str, str] = {}
 
 _MEDIA_BASES = (NFS_MEDIA_PREFIX, "/private/tmp/nasmedia", SMB_MEDIA_PREFIX)
 _MEDIA_SUBDIRS = MEDIA_SUBDIRS
@@ -58,8 +66,74 @@ ACTIVE_TAIL_LINES = 14
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
+def _parse_ffmpeg_out_time_s(progress_stdout: str) -> float | None:
+    """Parse final packet timestamp (seconds) from ffmpeg `-progress pipe:1` output."""
+    val: float | None = None
+    for line in (progress_stdout or "").splitlines():
+        if line.startswith("out_time_us="):
+            raw = line.split("=", 1)[1].strip()
+            try:
+                us = int(raw)
+                if us >= 0:
+                    val = us / 1_000_000.0
+            except ValueError:
+                pass
+    return val
+
+
+def verify_stream_integrity(
+    path: str, expected_dur: float | None = None
+) -> tuple[bool, str]:
+    """Verify container packet integrity end-to-end without full video pixel decode."""
+    try:
+        out = subprocess.run(
+            [
+                FFMPEG,
+                "-nostdin",
+                "-v",
+                "error",
+                "-err_detect",
+                "explode",
+                "-xerror",
+                "-progress",
+                "pipe:1",
+                "-i",
+                path,
+                "-c",
+                "copy",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"stream integrity check failed ({exc})"
+    stderr_txt = (getattr(out, "stderr", "") or "").strip()
+    if out.returncode != 0:
+        return (
+            False,
+            f"corrupt/truncated stream (ffmpeg exit {out.returncode}: {stderr_txt[:160]})",
+        )
+    if stderr_txt:
+        return False, f"corrupt/truncated stream ({stderr_txt[:160]})"
+    if expected_dur is not None and expected_dur > 0:
+        read_s = _parse_ffmpeg_out_time_s(getattr(out, "stdout", "") or "")
+        if read_s is not None:
+            tol = max(0.35, min(10.0, expected_dur * 0.05))
+            if read_s <= 0 or (expected_dur - read_s) > tol:
+                return (
+                    False,
+                    f"truncated stream (read {read_s:.2f}s of {expected_dur:.2f}s container duration)",
+                )
+    return True, ""
+
+
 def probe_duration(path: str) -> float | None:
-    """Return positive duration in seconds (float) for a readable video file, or None."""
+    """Return positive duration in seconds (float) for a complete, readable video file, or None."""
+    _LAST_PROBE_ERRORS.pop(path, None)
     try:
         if os.path.getsize(path) <= 0:
             return None
@@ -81,7 +155,13 @@ def probe_duration(path: str) -> float | None:
             text=True,
             timeout=120,
         )
+        stderr_txt = (getattr(out, "stderr", "") or "").strip()
         if out.returncode != 0:
+            if stderr_txt:
+                _LAST_PROBE_ERRORS[path] = f"probe_failed ({stderr_txt[:160]})"
+            return None
+        if stderr_txt:
+            _LAST_PROBE_ERRORS[path] = f"probe_failed ({stderr_txt[:160]})"
             return None
         data = json.loads(out.stdout or "{}")
         streams = data.get("streams") or []
@@ -101,7 +181,13 @@ def probe_duration(path: str) -> float | None:
         if raw_dur is None:
             return None
         dur = float(raw_dur)
-        return dur if dur > 0 else None
+        if dur <= 0:
+            return None
+        ok, integrity_err = verify_stream_integrity(path, expected_dur=dur)
+        if not ok:
+            _LAST_PROBE_ERRORS[path] = integrity_err
+            return None
+        return dur
     except (ValueError, TypeError, OSError, subprocess.SubprocessError):
         return None
 
@@ -140,16 +226,20 @@ def scan(directory: str) -> list[dict]:
     entries = []
     for f in files:
         m = EP_RE.search(os.path.basename(f))
-        entries.append(
-            {
-                "path": f,
-                "name": os.path.basename(f),
-                "season": int(m.group(1)) if m else None,
-                "episode": int(m.group(2)) if m else None,
-                "size": os.path.getsize(f),
-                "duration": probe_duration(f),
-            }
-        )
+        dur = probe_duration(f)
+        entry = {
+            "path": f,
+            "name": os.path.basename(f),
+            "season": int(m.group(1)) if m else None,
+            "episode": int(m.group(2)) if m else None,
+            "size": os.path.getsize(f),
+            "duration": dur,
+        }
+        if dur is None:
+            err = _LAST_PROBE_ERRORS.pop(f, None)
+            if err:
+                entry["probe_error"] = err
+        entries.append(entry)
     return entries
 
 
@@ -160,7 +250,9 @@ def analyze(entries: list[dict], expected: int | None = None) -> dict:
         if not e.get("size") or e["size"] <= 0:
             reasons.append("empty (0 bytes)")
         if e.get("duration") is None or e["duration"] <= 0:
-            reasons.append("probe_failed (no valid duration/video stream)")
+            reasons.append(
+                e.get("probe_error") or "probe_failed (no valid duration/video stream)"
+            )
         if reasons:
             unreadable.append({**e, "reason": "; ".join(reasons)})
 
@@ -746,7 +838,7 @@ def main() -> int:
 
     unreadable_by_path = {u["path"]: u["reason"] for u in result["unreadable"]}
     print(
-        f"\n{os.path.basename(args.directory.rstrip("/"))}  "
+        f"\n{os.path.basename(args.directory.rstrip('/'))}  "
         f"({len(entries)} files, median {result["median_min"]} min)\n"
     )
     for e in entries:

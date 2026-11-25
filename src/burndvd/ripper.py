@@ -22,6 +22,7 @@ from burndvd.config import (
     C,
     EXTRAS_MIN_DUR_S,
     FFMPEG_BIN,
+    FFPROBE_BIN,
     LOCAL_STAGING_BASE,
     MAX_NONINTERACTIVE_RETRIES,
     MAX_RESPINS,
@@ -172,21 +173,126 @@ def _draw_progress(
     sys.stdout.flush()
 
 
+def _parse_ffmpeg_out_time_s(progress_stdout: str) -> float | None:
+    """Parse the final decoded timestamp (seconds) from ffmpeg `-progress pipe:1` output."""
+    val: float | None = None
+    for line in (progress_stdout or "").splitlines():
+        if line.startswith("out_time_us="):
+            raw = line.split("=", 1)[1].strip()
+            try:
+                us = int(raw)
+                if us >= 0:
+                    val = us / 1_000_000.0
+            except ValueError:
+                pass
+    return val
+
+
+def _probe_expected_duration_s(path: str) -> tuple[float | None, str | None]:
+    """Probe container/video-stream metadata with ffprobe; return (duration_s, error)."""
+    try:
+        probe = subprocess.run(
+            [
+                FFPROBE_BIN,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=codec_type,duration",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"ffprobe failed: {exc}"
+    if probe.returncode != 0:
+        return None, f"ffprobe exit {probe.returncode}; {(probe.stderr or "").strip()[:200]}"
+    if (probe.stderr or "").strip():
+        return None, f"ffprobe error: {(probe.stderr or "").strip()[:200]}"
+    try:
+        data = json.loads(probe.stdout or "{}")
+    except (ValueError, TypeError):
+        return None, "ffprobe returned invalid JSON"
+    streams = data.get("streams") or []
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    if not video_streams:
+        return None, "no video stream found"
+    raw_dur = (data.get("format") or {}).get("duration")
+    if raw_dur in (None, "", "N/A"):
+        raw_dur = next(
+            (
+                s.get("duration")
+                for s in video_streams
+                if s.get("duration") not in (None, "", "N/A")
+            ),
+            None,
+        )
+    if raw_dur is None:
+        return None, "missing duration metadata"
+    try:
+        dur = float(raw_dur)
+    except (ValueError, TypeError):
+        return None, f"invalid duration metadata: {raw_dur!r}"
+    if dur <= 0:
+        return None, f"non-positive duration: {dur}"
+    return dur, None
+
+
 def verify(paths: list[str]) -> tuple[bool, str]:
-    """Decode-verify every output MKV through ffmpeg null muxer."""
+    """Decode-verify every output MKV through strict ffmpeg null muxer and duration checks."""
     for p in paths:
         r = subprocess.run(
-            [FFMPEG_BIN, "-nostdin", "-v", "error", "-i", p, "-f", "null", "-"],
+            [
+                FFMPEG_BIN,
+                "-nostdin",
+                "-v",
+                "error",
+                "-err_detect",
+                "explode",
+                "-xerror",
+                "-progress",
+                "pipe:1",
+                "-i",
+                p,
+                "-f",
+                "null",
+                "-",
+            ],
             capture_output=True,
             text=True,
         )
+        stderr_txt = (getattr(r, "stderr", "") or "").strip()
         if r.returncode != 0:
-            return False, f"{p}: exit {r.returncode}; {r.stderr.strip()[:240]}"
+            return False, f"{p}: exit {r.returncode}; {stderr_txt[:240]}"
+        if stderr_txt:
+            return False, f"{p}: ffmpeg decode error: {stderr_txt[:240]}"
+        if os.path.isfile(p):
+            try:
+                if os.path.getsize(p) <= 0:
+                    return False, f"{p}: empty file (0 bytes)"
+            except OSError as exc:
+                return False, f"{p}: stat failed: {exc}"
+            expected_dur, probe_err = _probe_expected_duration_s(p)
+            if probe_err is not None:
+                return False, f"{p}: {probe_err}"
+            if expected_dur is not None and expected_dur > 0:
+                decoded_s = _parse_ffmpeg_out_time_s(getattr(r, "stdout", "") or "")
+                if decoded_s is not None:
+                    tol = max(0.25, min(10.0, expected_dur * 0.05))
+                    if decoded_s <= 0 or (expected_dur - decoded_s) > tol:
+                        return (
+                            False,
+                            f"{p}: truncated stream (decoded {decoded_s:.2f}s of "
+                            f"{expected_dur:.2f}s container duration)",
+                        )
     return True, ""
 
 
 def run_subocr_postrip(args, files: list[str]) -> None:
-    """Detach a kernel-flock-serialized `subocr --post-rip` run for landed MKVs."""
+    """Detach a background `subocr --post-rip` run (subocr itself owns subocr.flock)."""
     if getattr(args, "no_subocr", False) or not files:
         return
     subocr_bin = Path.home() / ".local" / "bin" / "subocr"
@@ -195,20 +301,17 @@ def run_subocr_postrip(args, files: list[str]) -> None:
     log_dir = Path.home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"subocr-postrip-{int(time.time())}.log"
-    lock_file = Path.home() / ".cache" / "burndvd" / "subocr.flock"
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
     runner = (
-        "import fcntl, os, subprocess, sys; "
+        "import os, subprocess, sys; "
         "os.environ['PATH'] = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:' + os.environ.get('PATH', ''); "
-        "f = open(sys.argv[1], 'a+'); "
-        "fcntl.flock(f.fileno(), fcntl.LOCK_EX); "
-        "raise SystemExit(subprocess.call(sys.argv[2:]))"
+        "rc = subprocess.call(sys.argv[1:]); "
+        "print(f'[subocr-postrip] exit={rc}', flush=True); "
+        "raise SystemExit(rc)"
     )
     cmd = [
         sys.executable,
         "-c",
         runner,
-        str(lock_file),
         str(subocr_bin),
         "--post-rip",
         *files,
@@ -283,6 +386,20 @@ def _run_finalize(
     allow_movie_overwrite = bool(
         getattr(args, "overwrite", False) and getattr(item, "type", None) == "movie"
     )
+    media_committed = False
+    failure_reported = False
+
+    def _report_failure(err_msg: str) -> None:
+        nonlocal failure_reported
+        if failure_reported or media_committed:
+            return
+        failure_reported = True
+        if on_failure is not None:
+            try:
+                on_failure(err_msg)
+            except Exception:
+                pass
+
     try:
         with _FINALIZE_LOCK:
             done = 0
@@ -331,8 +448,6 @@ def _run_finalize(
                     else:
                         move_with_progress(Path(src), dst, label=label)
                     done = i + 1
-                if staging:
-                    shutil.rmtree(staging, ignore_errors=True)
             except BaseException as e:
                 # Only clean owned zero-byte TV claim placeholders (verified by
                 # exact inode identity). Never touch pre-existing destinations or
@@ -372,11 +487,7 @@ def _run_finalize(
                     flush=True,
                 )
                 beep(args, ok=False)
-                if on_failure is not None:
-                    try:
-                        on_failure(err_msg)
-                    except Exception:
-                        pass
+                _report_failure(err_msg)
                 if not isinstance(e, Exception):
                     raise
                 return False
@@ -394,29 +505,58 @@ def _run_finalize(
                 append_log(args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err}")
                 print(f"{C.RED}Verify failed (background): {err}{C.R}", flush=True)
                 beep(args, ok=False)
-                if on_failure is not None:
-                    try:
-                        on_failure(err_msg)
-                    except Exception:
-                        pass
-        fingerprint = result.get("disc_fingerprint")
-        if (
-            getattr(args, "verify", False)
-            and verified
-            and fingerprint
-            and files
-            and not getattr(args, "rerip_review", False)
-            and not result.get("routed_to_review", False)
-        ):
-            append_disc_receipt(
-                Path(args.disc_receipts), item, disc_n, fingerprint, files
-            )
+                _report_failure(err_msg)
         if verified:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+            fingerprint = result.get("disc_fingerprint")
+            if (
+                getattr(args, "verify", False)
+                and fingerprint
+                and files
+                and not getattr(args, "rerip_review", False)
+                and not result.get("routed_to_review", False)
+            ):
+                append_disc_receipt(
+                    Path(args.disc_receipts), item, disc_n, fingerprint, files
+                )
             if on_complete is not None:
                 on_complete(result)
-            run_subocr_postrip(args, files)
+            media_committed = True
+            try:
+                run_subocr_postrip(args, files)
+            except Exception as ocr_exc:
+                warn_msg = (
+                    f"SUBOCR_WARN {item.title} disc{disc_n} :: "
+                    f"{type(ocr_exc).__name__}: {ocr_exc}"
+                )
+                try:
+                    append_log(args, warn_msg)
+                except Exception:
+                    pass
+                print(
+                    f"{C.YLW}Warning: subtitle OCR launch failed "
+                    f"({type(ocr_exc).__name__}): {ocr_exc} "
+                    f"(verified media already committed).{C.R}",
+                    flush=True,
+                )
         return verified
     except Exception as exc:
+        if media_committed:
+            warn_msg = (
+                f"SUBOCR_WARN {item.title} disc{disc_n} :: "
+                f"post-commit error ({type(exc).__name__}: {exc})"
+            )
+            try:
+                append_log(args, warn_msg)
+            except Exception:
+                pass
+            print(
+                f"{C.YLW}Warning: post-commit step failed ({type(exc).__name__}): "
+                f"{exc} (verified media already committed).{C.R}",
+                flush=True,
+            )
+            return True
         err_msg = (
             f"FINALIZE_FAIL {item.title} disc{disc_n}: "
             f"{type(exc).__name__}: {exc}"
@@ -438,11 +578,7 @@ def _run_finalize(
             beep(args, ok=False)
         except Exception:
             pass
-        if on_failure is not None:
-            try:
-                on_failure(err_msg)
-            except Exception:
-                pass
+        _report_failure(err_msg)
         return False
 
 

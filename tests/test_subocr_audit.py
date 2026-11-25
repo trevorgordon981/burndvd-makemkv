@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from burndvd import compat_subocr as subocr
+from _compat import subocr
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -351,7 +351,8 @@ class TestSubocrAuditFixes(unittest.TestCase):
                 [
                     "import sys, time",
                     f"sys.path.insert(0, {str(REPO_ROOT / 'src')!r})",
-                    "from burndvd import compat_subocr as subocr",
+                    f"sys.path.insert(0, {str(REPO_ROOT / 'tests')!r})",
+                    "from _compat import subocr",
                     "from pathlib import Path",
                     "from unittest import mock",
                     f"d = Path({str(marker_dir)!r})",

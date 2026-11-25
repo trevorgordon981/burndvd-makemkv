@@ -16,7 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from burndvd import compat_ripqueue as ripqueue
+from _compat import ripqueue
 
 
 def _make_tv_item(root: Path, **overrides) -> ripqueue.QueueItem:
@@ -322,24 +322,32 @@ class AuditFixesTests(unittest.TestCase):
             self.assertEqual(ripqueue.starting_ep(item, 1, {}, target_dir=nfs_real), 4)
 
     def test_06_resolve_nas_path_and_await_dir_writable_failover(self):
-        smb_tv = Path("/Volumes/Media/TV Shows/Show/Season 01")
-        nfs_tv = Path("/private/nas/media/TV Shows/Show/Season 01")
-        with mock.patch.object(ripqueue, "_nfs_mount_available", return_value=True), \
-             mock.patch.object(ripqueue.os.path, "ismount", return_value=True):
-            self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=True), nfs_tv)
-            self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=False), smb_tv)
-        with mock.patch.object(ripqueue, "_nfs_mount_available", return_value=True), \
-             mock.patch.object(ripqueue.os.path, "ismount", return_value=False):
-            self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=False), nfs_tv)
+        with tempfile.TemporaryDirectory() as tmp:
+            smb_root = Path(tmp) / "smb-media"
+            nfs_root = Path(tmp) / "nfs-media"
+            smb_root.mkdir()
+            nfs_root.mkdir()
+            smb_tv = smb_root / "TV Shows" / "Show" / "Season 01"
+            nfs_tv = nfs_root / "TV Shows" / "Show" / "Season 01"
+            smb_movie_dir = smb_root / "Movies" / "Test"
+            nfs_movie_dir = nfs_root / "Movies" / "Test"
 
-        smb_movie_dir = Path("/Volumes/Media/Movies/Test")
-        nfs_movie_dir = Path("/private/nas/media/Movies/Test")
-        with mock.patch.object(
-            ripqueue, "_dir_writable", side_effect=lambda p: Path(p) == nfs_movie_dir
-        ), mock.patch.object(ripqueue.time, "sleep") as sleep_fn:
-            got = ripqueue._await_dir_writable(smb_movie_dir, "/tmp/staging")
-        self.assertEqual(got, nfs_movie_dir)
-        sleep_fn.assert_not_called()
+            with mock.patch.object(ripqueue, "SMB_MEDIA_PREFIX", str(smb_root)), \
+                 mock.patch.object(ripqueue, "NFS_MEDIA_PREFIX", str(nfs_root)):
+                with mock.patch.object(ripqueue, "_nfs_mount_available", return_value=True), \
+                     mock.patch.object(ripqueue.os.path, "ismount", return_value=True):
+                    self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=True), nfs_tv)
+                    self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=False), smb_tv)
+                with mock.patch.object(ripqueue, "_nfs_mount_available", return_value=True), \
+                     mock.patch.object(ripqueue.os.path, "ismount", return_value=False):
+                    self.assertEqual(ripqueue.resolve_nas_path(smb_tv, prefer_nfs=False), nfs_tv)
+
+                with mock.patch.object(
+                    ripqueue, "_dir_writable", side_effect=lambda p: Path(p) == nfs_movie_dir
+                ), mock.patch.object(ripqueue.time, "sleep") as sleep_fn:
+                    got = ripqueue._await_dir_writable(smb_movie_dir, str(Path(tmp) / "staging"))
+                self.assertEqual(got, nfs_movie_dir)
+                sleep_fn.assert_not_called()
 
     def test_06_run_finalize_updates_files_on_nfs_failover(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -754,7 +762,7 @@ class AuditFixesTests(unittest.TestCase):
 
             self.assertEqual(len(seen), 1)
             cmd, kw = seen[0]
-            self.assertIn("fcntl.flock", cmd[2])
+            self.assertNotIn("fcntl.flock", cmd[2])
             self.assertNotIn("mkdir", cmd[2])
             self.assertNotIn("pgrep", cmd[2])
             self.assertTrue(kw["start_new_session"])

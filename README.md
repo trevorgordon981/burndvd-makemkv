@@ -1,6 +1,8 @@
 # burndvd
 
-Decoupled macOS optical-disc ripping, verification, unencrypted-Blu-ray `mkvmerge` fallback, and Apple Vision HDMV PGS subtitle OCR library and CLI toolkit for Plex/Jellyfin media libraries.
+[![CI](https://github.com/trevorgordon981/burndvd-makemkv/actions/workflows/ci.yml/badge.svg)](https://github.com/trevorgordon981/burndvd-makemkv/actions/workflows/ci.yml)
+
+Decoupled macOS optical-disc ripping, verification, unencrypted-Blu-ray `mkvmerge` fallback, and Apple Vision Blu-ray HDMV PGS & DVD VobSub subtitle OCR library and CLI toolkit for Plex/Jellyfin media libraries.
 
 Designed for unattended multi-drive batch ripping with strict data-safety invariants: no silent overwrites, atomic hard-link/no-replace NAS publication, durable physical-disc receipt tracking, slim-tray optical drive protection, empirical frame-hash verification of Play-All titles, and fail-closed `mkvmerge` fallback for unencrypted Blu-ray discs.
 
@@ -8,7 +10,7 @@ Designed for unattended multi-drive batch ripping with strict data-safety invari
 
 ```mermaid
 flowchart LR
-    CLI["bin/burndvd & CLI<br/>(ripqueue, checkrip, stoprip, subocr)"] --> Models["models.py & metadata.py<br/>(QueueItem, CSV Contracts)"]
+    CLI["bin/burndvd & CLI<br/>(ripqueue, doctor, checkrip, stoprip, subocr)"] --> Models["models.py & metadata.py<br/>(QueueItem, CSV Contracts)"]
     CLI --> Drive["drive.py<br/>(Slim-Tray Guard, Unmount, Eject)"]
     CLI --> Probe["probe.py<br/>(MakeMKV Probe, SHA-256 Fingerprint)"]
     Probe --> Select["selection.py<br/>(Play-All Corroboration, Frame MD5, Chapter Split)"]
@@ -17,7 +19,7 @@ flowchart LR
     Fallback --> NAS["nas.py<br/>(SMB→NFS Failover, PID Claims, No-Clobber Publish)"]
     Ripper --> NAS
     NAS --> Receipts["receipts.py<br/>(Locked JSONL Ledger)"]
-    NAS --> SubOCR["subocr/<br/>(PGS RLE Decode, Apple Vision OCR, Atomic SRT)"]
+    NAS --> SubOCR["subocr/<br/>(PGS + DVD VobSub RLE Decode, Apple Vision OCR, Atomic SRT)"]
 ```
 
 ## Package Layout

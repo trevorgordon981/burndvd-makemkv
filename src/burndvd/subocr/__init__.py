@@ -1,4 +1,4 @@
-"""Decoupled HDMV PGS subtitle OCR library using Apple Vision."""
+"""Decoupled Blu-ray HDMV PGS and DVD VobSub subtitle OCR library using Apple Vision."""
 
 from __future__ import annotations
 
@@ -25,9 +25,12 @@ from burndvd.subocr.pipeline import (
     find_mkvs,
     ocr_mkv,
     ocr_pgs_track,
+    ocr_sub_track,
+    ocr_vobsub_track,
     process_mkv,
 )
 from burndvd.subocr.srt import _ms_to_srt_ts, write_srt
+from burndvd.subocr.vobsub import parse_vobsub, parse_vobsub_cues
 from burndvd.subocr.tracks import (
     CONFIG_PATH,
     DEFAULT_CONFIG,
@@ -74,6 +77,10 @@ __all__ = [
     "ocr_image",
     "ocr_mkv",
     "ocr_pgs_track",
+    "ocr_sub_track",
+    "ocr_vobsub_track",
+    "parse_vobsub",
+    "parse_vobsub_cues",
     "parse_sup",
     "pick_audio_default",
     "pick_sub_track",

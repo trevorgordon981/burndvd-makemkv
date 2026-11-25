@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 
 from burndvd import metadata as _metadata
@@ -205,18 +206,30 @@ def _median(xs: list[float] | list[int]) -> float:
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
+TV_OUTLIER_MEDIAN_RATIO = max(EP_BONUS_MEDIAN_RATIO, 0.60)
+TV_OUTLIER_MIN_COUNT = max(EP_BONUS_MIN_COUNT, 3)
+
+
 def episode_bonus_split(
-    cand: list[tuple[int, int]]
+    cand: list[tuple[int, int]],
+    *,
+    protected_ids: Iterable[int] | None = None,
+    ratio: float | None = None,
 ) -> tuple[list[int], list[int], float | None]:
     """Split episode candidates into `(episode_ids, bonus_ids, threshold_s)`.
 
-    Demotes featurettes far shorter than the disc's median episode runtime to Extras.
+    Demotes short duration outliers (`duration_s < 0.60 * median`) to Extras
+    once at least 3 episode candidates establish a reliable runtime cluster.
+    Titles explicitly listed in `protected_ids` (for example, contracted
+    `expected_title_ids`) are never demoted.
     """
-    if len(cand) < EP_BONUS_MIN_COUNT:
+    if len(cand) < TV_OUTLIER_MIN_COUNT:
         return sorted(t for t, _ in cand), [], None
-    thr = EP_BONUS_MEDIAN_RATIO * _median([d for _, d in cand])
-    eps = sorted(t for t, d in cand if d >= thr)
-    bonus = sorted(t for t, d in cand if d < thr)
+    protected = set(protected_ids or ())
+    eff_ratio = TV_OUTLIER_MEDIAN_RATIO if ratio is None else ratio
+    thr = eff_ratio * _median([d for _, d in cand])
+    eps = sorted(t for t, d in cand if d >= thr or t in protected)
+    bonus = sorted(t for t, d in cand if d < thr and t not in protected)
     return eps, bonus, thr
 
 
@@ -319,7 +332,9 @@ def select_titles(item: QueueItem, info: dict) -> list[int]:
         for tid, dur in durs
         if dur >= TV_MIN_DUR_S and tid not in play_all
     ]
-    eps, _bonus, _thr = episode_bonus_split(cand)
+    eps, _bonus, _thr = episode_bonus_split(
+        cand, protected_ids=item.expected_title_ids
+    )
     return eps
 
 
@@ -339,7 +354,9 @@ def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]) -> 
             if parse_duration(info["titles"][tid].get(9, "0:00:00")) >= TV_MIN_DUR_S
             and tid not in play_all
         ]
-        _eps, _bonus_ids, _thr = episode_bonus_split(_cand)
+        _eps, _bonus_ids, _thr = episode_bonus_split(
+            _cand, protected_ids=item.expected_title_ids
+        )
         bonus_gate = set(_bonus_ids)
     floor = TV_MIN_DUR_S if item.type != "movie" else 0
     rows = []

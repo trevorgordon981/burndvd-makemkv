@@ -37,9 +37,9 @@ from burndvd.selection import (
     staging_space_requirement,
     verify_play_all,
 )
-from burndvd.subocr import ocr_mkv, parse_sup, probe_tracks, write_srt
+from burndvd.subocr import ocr_mkv, parse_sup, parse_vobsub, probe_tracks, write_srt
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 __all__ = [
     "__version__",
@@ -66,6 +66,7 @@ __all__ = [
     "move_with_progress_noclobber",
     "ocr_mkv",
     "parse_sup",
+    "parse_vobsub",
     "planned_rip_selectors",
     "play_all_title_ids",
     "probe_disc",

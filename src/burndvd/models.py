@@ -349,6 +349,73 @@ def warn_queue_divergence(state: dict, items: list[QueueItem]) -> None:
         )
 
 
+def _reconcile_pending_finalize(state: dict) -> list[dict]:
+    """Drop already-completed pending entries and rewind cursor to earliest unresolved pending item."""
+    raw_pending = state.get("pending_finalize")
+    if not isinstance(raw_pending, list):
+        state["pending_finalize"] = []
+        return []
+    queue = state.get("queue", [])
+    completed_keys: set[tuple[str, int]] = set()
+    for rec in state.get("completed", []):
+        if isinstance(rec, dict) and isinstance(rec.get("item"), str):
+            try:
+                completed_keys.add((rec["item"], int(rec.get("disc_n", 0))))
+            except (TypeError, ValueError):
+                pass
+
+    unresolved: list[dict] = []
+    earliest: tuple[int, int] | None = None
+    for entry in raw_pending:
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("item")
+        try:
+            disc_n = int(entry.get("disc_n", 0))
+        except (TypeError, ValueError):
+            disc_n = 0
+        if isinstance(title, str) and (title, disc_n) in completed_keys:
+            continue
+        unresolved.append(entry)
+
+        item_idx = entry.get("item_index")
+        if not isinstance(item_idx, int) or not (0 <= item_idx < len(queue)):
+            item_idx = None
+            if isinstance(title, str):
+                for q_idx, q_row in enumerate(queue):
+                    if isinstance(q_row, dict) and q_row.get("title") == title:
+                        item_idx = q_idx
+                        break
+        if item_idx is None:
+            continue
+
+        disc_idx = entry.get("disc_index_in_item")
+        if not isinstance(disc_idx, int) or disc_idx < 0:
+            q_disc_n = entry.get("queue_disc_n", entry.get("disc_n", 1))
+            try:
+                disc_idx = max(0, int(q_disc_n) - 1)
+            except (TypeError, ValueError):
+                disc_idx = 0
+        pos = (item_idx, disc_idx)
+        if earliest is None or pos < earliest:
+            earliest = pos
+
+    state["pending_finalize"] = unresolved
+    cur_pos = (
+        int(state.get("current_index", 0)),
+        int(state.get("disc_index_in_item", 0) or 0),
+    )
+    if earliest is not None and cur_pos > earliest:
+        state["current_index"] = earliest[0]
+        state["disc_index_in_item"] = earliest[1]
+        print(
+            f"{C.YLW}Warning: {len(unresolved)} unresolved pending_finalize entry(ies); "
+            f"rewinding resume cursor to item {earliest[0] + 1}, "
+            f"disc {earliest[1] + 1}.{C.R}"
+        )
+    return unresolved
+
+
 def load_or_init(args, items: list[QueueItem]) -> dict:
     p = Path(args.state)
     if p.exists():
@@ -375,11 +442,16 @@ def load_or_init(args, items: list[QueueItem]) -> dict:
         ):
             if key not in state or not isinstance(state[key], expected_type):
                 raise ValueError(f"state file {p} has invalid or missing {key!r}")
+        state.setdefault("disc_index_in_item", 0)
         state.setdefault("disc_episode_counts", {})
         state.setdefault("pending_finalize", [])
         state.setdefault("failed_finalize", [])
         state.pop("next_episode", None)
-        prior_done = state.get("current_index", 0) >= len(state.get("queue", []))
+        unresolved = _reconcile_pending_finalize(state)
+        prior_done = (
+            state.get("current_index", 0) >= len(state.get("queue", []))
+            and not unresolved
+        )
         same_queue = state.get("queue", []) == [asdict(i) for i in items]
         if prior_done and not same_queue:
             print(

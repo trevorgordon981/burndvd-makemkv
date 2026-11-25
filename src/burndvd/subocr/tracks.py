@@ -336,34 +336,43 @@ def pick_audio_default(audio: list[TrackInfo], pref_lang: str) -> TrackInfo | No
     return cands[0]
 
 
-def pick_sub_track(
-    subs: list[TrackInfo], lang: str, mode: str, mkv: Path
-) -> TrackInfo | None:
-    """Pick the PGS subtitle track to OCR for `lang` and `mode` (`full` or `forced`)."""
-    target_lang = _to_iso639_2(lang)
-    cands = [
-        s
-        for s in subs
-        if s.codec == "hdmv_pgs_subtitle" and _to_iso639_2(s.lang) == target_lang
-    ]
-    if not cands:
-        return None
+OCR_SUB_CODECS = ("hdmv_pgs_subtitle", "dvd_subtitle")
 
+
+def _measure_sub_candidates(cands: list[TrackInfo], mkv: Path) -> list[TrackInfo]:
+    """Populate missing `size_bytes` via `mkvextract` and return non-empty candidates."""
     need_measure = [t for t in cands if t.size_bytes is None]
     measured_ok: set[int] = set()
     if need_measure:
         with tempfile.TemporaryDirectory(prefix="subocr-sizehint-") as td:
             for t in need_measure:
-                sup = Path(td) / f"t{t.index}.sup"
-                r = subprocess.run(
-                    ["mkvextract", "tracks", str(mkv), f"{t.index}:{sup}"],
-                    capture_output=True,
-                    text=True,
-                )
-                if r.returncode != 0 or not sup.exists():
-                    continue
-                t.size_bytes = sup.stat().st_size
-                measured_ok.add(t.index)
+                if t.codec == "dvd_subtitle":
+                    out_path = Path(td) / f"t{t.index}.idx"
+                    r = subprocess.run(
+                        ["mkvextract", "tracks", str(mkv), f"{t.index}:{out_path}"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    sub_path = out_path.with_suffix(".sub")
+                    if r.returncode != 0 or (not sub_path.exists() and not out_path.exists()):
+                        continue
+                    t.size_bytes = (
+                        sub_path.stat().st_size
+                        if sub_path.exists()
+                        else out_path.stat().st_size
+                    )
+                    measured_ok.add(t.index)
+                else:
+                    sup = Path(td) / f"t{t.index}.sup"
+                    r = subprocess.run(
+                        ["mkvextract", "tracks", str(mkv), f"{t.index}:{sup}"],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if r.returncode != 0 or not sup.exists():
+                        continue
+                    t.size_bytes = sup.stat().st_size
+                    measured_ok.add(t.index)
 
     sized = [
         t
@@ -371,10 +380,12 @@ def pick_sub_track(
         if t.size_bytes is not None
         and (t not in need_measure or t.index in measured_ok)
     ]
-    nonempty = [t for t in sized if (t.size_bytes or 0) > 0]
+    return [t for t in sized if (t.size_bytes or 0) > 0]
+
+
+def _select_by_mode(nonempty: list[TrackInfo], mode: str) -> TrackInfo | None:
     if not nonempty:
         return None
-
     for t in nonempty:
         t.forced_only = False
 
@@ -398,6 +409,46 @@ def pick_sub_track(
     chosen = nonempty[-1]
     chosen.forced_only = False
     return chosen
+
+
+def pick_sub_track(
+    subs: list[TrackInfo], lang: str, mode: str, mkv: Path
+) -> TrackInfo | None:
+    """Pick the PGS or VobSub subtitle track to OCR for `lang` and `mode` (`full` or `forced`).
+
+    Prefers `hdmv_pgs_subtitle` (Blu-ray PGS) when both PGS and `dvd_subtitle` (DVD VobSub)
+    exist for the same language/forced profile, falling back seamlessly to VobSub on DVD MKVs.
+    """
+    target_lang = _to_iso639_2(lang)
+    pgs_cands = [
+        s
+        for s in subs
+        if s.codec == "hdmv_pgs_subtitle" and _to_iso639_2(s.lang) == target_lang
+    ]
+    vobsub_cands = [
+        s
+        for s in subs
+        if s.codec == "dvd_subtitle" and _to_iso639_2(s.lang) == target_lang
+    ]
+    if not pgs_cands and not vobsub_cands:
+        return None
+
+    pgs_nonempty = _measure_sub_candidates(pgs_cands, mkv) if pgs_cands else []
+    pgs_pick = _select_by_mode(pgs_nonempty, mode)
+
+    if mode == "forced":
+        if pgs_pick is not None and pgs_pick.forced:
+            return pgs_pick
+        vobsub_nonempty = _measure_sub_candidates(vobsub_cands, mkv) if vobsub_cands else []
+        vobsub_pick = _select_by_mode(vobsub_nonempty, mode)
+        if vobsub_pick is not None and vobsub_pick.forced:
+            return vobsub_pick
+        return pgs_pick if pgs_pick is not None else vobsub_pick
+
+    if pgs_pick is not None:
+        return pgs_pick
+    vobsub_nonempty = _measure_sub_candidates(vobsub_cands, mkv) if vobsub_cands else []
+    return _select_by_mode(vobsub_nonempty, mode)
 
 
 def _mkvmerge_track_positions(mkv: Path) -> dict[int, int]:

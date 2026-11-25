@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from burndvd import compat_ripqueue as ripqueue
+from _compat import ripqueue
 from burndvd import metadata
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

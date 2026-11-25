@@ -98,6 +98,15 @@ def _classify_process(argv: list[str]) -> str | None:
         return None
     if exe == "makemkvcon":
         return "makemkv"
+    if exe == "mkvmerge":
+        if any(
+            "/staging/" in a
+            or "mkvmerge-fallback" in a
+            or "/bdmv/playlist/" in a.lower()
+            for a in argv[1:]
+        ):
+            return "mkvmerge"
+        return None
     if exe in ("ripqueue.py", "burndvd-queue"):
         if "--validate-queue" in argv or "--scan" in argv:
             return None
@@ -152,10 +161,21 @@ def discover_rip_sessions(
         parsed.append((pid, ppid, argv, role))
 
     burndvd_pids = {pid for pid, _, _, role in parsed if role == "burndvd"}
+    session_parent_pids = {
+        pid
+        for pid, _, _, role in parsed
+        if role in ("ripqueue", "burndvd", "caffeinate", "script")
+    }
     matched: list[tuple[int, int, list[str], str]] = []
     for pid, ppid, argv, role in parsed:
         if role is not None:
             matched.append((pid, ppid, argv, role))
+        elif (
+            argv
+            and os.path.basename(argv[0]).lower() == "mkvmerge"
+            and any(_is_ancestor(spid, pid, ppid_map) for spid in session_parent_pids)
+        ):
+            matched.append((pid, ppid, argv, "mkvmerge"))
         elif (
             ppid in burndvd_pids
             and argv
@@ -247,12 +267,14 @@ def discover_rip_sessions(
                 break
         if attached:
             continue
-        if role == "makemkv":
+        if role in ("makemkv", "mkvmerge"):
             for tok in reversed(argv[1:]):
                 if "/staging/" in tok:
+                    m = re.search(r"/staging/([^/]+)(?:/|$)", tok)
+                    seg = m.group(1) if m else tok
                     for sess in sessions:
                         for rq_pid in sess["roles"].get("ripqueue", []):
-                            if tok.endswith(f"-{rq_pid}"):
+                            if tok.endswith(f"-{rq_pid}") or seg.endswith(f"-{rq_pid}"):
                                 _attach(sess, pid, role, argv)
                                 attached = True
                                 break
@@ -313,10 +335,16 @@ def locate_staging(
     session: dict, staging_base: Path = STAGING_BASE
 ) -> Path | None:
     argv_by_pid = session.get("argv_by_pid", {})
-    for mk_pid in session.get("roles", {}).get("makemkv", []):
+    roles = session.get("roles", {})
+    for mk_pid in list(roles.get("makemkv", [])) + list(roles.get("mkvmerge", [])):
         argv = argv_by_pid.get(mk_pid) or proc_argv(mk_pid)
         for tok in reversed(argv[1:]):
             if "/staging/" in tok:
+                m = re.search(r"/staging/([^/]+)(?:/|$)", tok)
+                if m:
+                    sess_dir = Path(tok[: m.end(1)])
+                    if sess_dir.is_dir():
+                        return sess_dir
                 cand = Path(tok)
                 if cand.is_dir():
                     return cand
@@ -390,20 +418,74 @@ def sanitize(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip()
 
 
-def _open_write_paths(pids: list[int]) -> set[Path]:
-    opened: set[Path] = set()
-    if not pids:
-        return opened
-    lsof_bin = shutil.which("lsof") or "/usr/sbin/lsof"
+_UNSET = object()
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _proc_state_and_argv(pid: int) -> tuple[str, list[str]] | None:
     try:
         out = subprocess.check_output(
-            [lsof_bin, "-Ffan", "-p", ",".join(str(p) for p in pids)],
+            ["ps", "-ww", "-o", "state=,args=", "-p", str(pid)],
             text=True,
             stderr=subprocess.DEVNULL,
             timeout=5,
-        )
+        ).strip()
     except (OSError, subprocess.SubprocessError):
-        return opened
+        return None
+    if not out:
+        return ("", [])
+    parts = out.split(None, 1)
+    state = parts[0]
+    argv = _split_cmd(parts[1]) if len(parts) > 1 else []
+    return (state, argv)
+
+
+def _live_writer_pids(
+    writer_pids: list[int], session: dict | None = None
+) -> list[int]:
+    """Return writer PIDs that still appear alive (or cannot be confirmed dead)."""
+    alive: list[int] = []
+    argv_by_pid = (session or {}).get("argv_by_pid") or {}
+    for pid in sorted(set(writer_pids)):
+        owned_by_us = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            owned_by_us = False
+
+        info = _proc_state_and_argv(pid)
+        if info is None:
+            if owned_by_us or os.geteuid() == 0:
+                alive.append(pid)
+            continue
+        state, cur_argv = info
+        if not cur_argv or state.startswith("Z"):
+            continue
+        cur_exe = os.path.basename(cur_argv[0]).lower()
+        if cur_exe in ("makemkvcon", "mkvmerge"):
+            alive.append(pid)
+            continue
+        if owned_by_us:
+            expected = argv_by_pid.get(pid)
+            if expected and os.path.basename(expected[0]).lower() == cur_exe:
+                alive.append(pid)
+    return alive
+
+
+def _parse_lsof_write_paths(out: str) -> tuple[set[Path], set[int]]:
+    opened: set[Path] = set()
+    seen_pids: set[int] = set()
     cur_write = False
     for line in out.splitlines():
         if not line:
@@ -411,6 +493,10 @@ def _open_write_paths(pids: list[int]) -> set[Path]:
         tag, val = line[0], line[1:]
         if tag == "p":
             cur_write = False
+            try:
+                seen_pids.add(int(val))
+            except ValueError:
+                pass
         elif tag == "f":
             # Linux lsof may append w/u to numeric fd; avoid false match on "cwd".
             cur_write = bool(re.match(r"^\d+[wu]$", val))
@@ -422,6 +508,37 @@ def _open_write_paths(pids: list[int]) -> set[Path]:
                 opened.add(Path(val).resolve())
             except OSError:
                 opened.add(Path(val))
+    return opened, seen_pids
+
+
+def _open_write_paths(pids: list[int]) -> set[Path] | None:
+    """Return resolved paths open for write by `pids`, or `None` if inspection failed."""
+    if not pids:
+        return set()
+    lsof_bin = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        out = subprocess.check_output(
+            [lsof_bin, "-Ffan", "-p", ",".join(str(p) for p in pids)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except subprocess.CalledProcessError as exc:
+        # macOS lsof exits 1 when one of several PIDs already exited while still
+        # emitting valid records for the remaining live PIDs. Fail closed unless
+        # rc == 1 produced valid records covering every still-alive queried PID.
+        out = exc.output or ""
+        if exc.returncode != 1 or not out.strip():
+            return None
+        opened, seen_pids = _parse_lsof_write_paths(out)
+        if not seen_pids:
+            return None
+        if any(p not in seen_pids and _pid_exists(p) for p in pids):
+            return None
+        return opened
+    except (OSError, subprocess.SubprocessError):
+        return None
+    opened, _ = _parse_lsof_write_paths(out)
     return opened
 
 def _move_with_backup(src: Path, dest: Path) -> Path:
@@ -471,6 +588,29 @@ def _rescue_quarantine_dir(
     return dest / staging.name
 
 
+def _collect_session_pids(session: dict | None) -> list[int]:
+    pids: set[int] = set()
+    if session:
+        pids.update(session.get("pids") or [])
+        roles = session.get("roles") or {}
+        for role_pids in roles.values():
+            if isinstance(role_pids, list):
+                pids.update(role_pids)
+    return sorted(pids)
+
+
+def _collect_writer_role_pids(session: dict | None) -> list[int]:
+    if not session:
+        return []
+    roles = session.get("roles") or {}
+    writers: set[int] = set()
+    for role in ("makemkv", "mkvmerge"):
+        role_pids = roles.get(role)
+        if isinstance(role_pids, list):
+            writers.update(role_pids)
+    return sorted(writers)
+
+
 def rescue_staging(
     staging: Path | None,
     queue: Path | None,
@@ -478,6 +618,7 @@ def rescue_staging(
     session: dict | None = None,
     nas_root: Path = DEFAULT_NAS_ROOT,
     vol_root: Path = DEFAULT_VOL_ROOT,
+    in_progress: set[Path] | None | object = _UNSET,
 ) -> list[Path]:
     if not staging or not staging.is_dir():
         print("stoprip: cannot find staging dir; skipping rescue")
@@ -495,14 +636,16 @@ def rescue_staging(
         print(f"stoprip: no non-empty .mkv in {staging}; skipping rescue")
         return []
 
-    writer_pids: set[int] = set()
-    if session:
-        writer_pids.update(session.get("pids") or [])
-        roles = session.get("roles") or {}
-        for role_pids in roles.values():
-            if isinstance(role_pids, list):
-                writer_pids.update(role_pids)
-    in_progress = _open_write_paths(sorted(writer_pids))
+    if in_progress is _UNSET:
+        writer_pids = _collect_session_pids(session)
+        in_progress = _open_write_paths(writer_pids)
+
+    if in_progress is None:
+        print(
+            f"stoprip: writer open-file inspection unavailable; "
+            f"refusing rescue and preserving staging {staging}"
+        )
+        return []
 
     completed = [p for p in mkvs if p.resolve() not in in_progress]
     if not completed:
@@ -541,8 +684,10 @@ def stop_session(
     vol_root: Path = DEFAULT_VOL_ROOT,
     kill_fn=signal_all,
     sleep_fn=time.sleep,
+    alive_fn=_live_writer_pids,
 ) -> list[Path]:
     pids = list(session["pids"])
+    writer_role_pids = _collect_writer_role_pids(session)
     print(
         f"stoprip: targeting {len(pids)} rip-chain procs "
         f"({session.get('device') or session['key']}): {session['roles']}"
@@ -550,13 +695,36 @@ def stop_session(
 
     kill_fn(pids, signal.SIGSTOP)
     staging: Path | None = None
+    queue: Path | None = None
+    state: Path | None = None
     rescued: list[Path] = []
     rescue_completed = False
+    in_progress: set[Path] | None | object = _UNSET
+    killed = False
     try:
         sleep_fn(0.5)
         staging = locate_staging(session, staging_base=staging_base)
         queue, state = locate_queue_state(session)
-        if not no_save:
+        if not no_save and staging and staging.is_dir():
+            in_progress = _open_write_paths(_collect_session_pids(session))
+        kill_fn(pids, signal.SIGKILL)
+        killed = True
+    finally:
+        if not killed:
+            kill_fn(pids, signal.SIGKILL)
+
+    sleep_fn(1.0)
+
+    still_alive = alive_fn(writer_role_pids, session) if writer_role_pids else []
+    if still_alive:
+        print(
+            f"stoprip: writer process(es) {still_alive} still alive after SIGKILL; "
+            f"refusing rescue and preserving staging {staging}"
+        )
+        return []
+
+    if not no_save:
+        if in_progress is _UNSET:
             rescued = rescue_staging(
                 staging,
                 queue,
@@ -565,11 +733,17 @@ def stop_session(
                 nas_root=nas_root,
                 vol_root=vol_root,
             )
-        rescue_completed = True
-    finally:
-        kill_fn(pids, signal.SIGKILL)
-
-    sleep_fn(1.0)
+        else:
+            rescued = rescue_staging(
+                staging,
+                queue,
+                state,
+                session=session,
+                nas_root=nas_root,
+                vol_root=vol_root,
+                in_progress=in_progress,
+            )
+    rescue_completed = True
 
     if rescue_completed and staging and staging.is_dir():
         if no_save:
@@ -655,7 +829,7 @@ def main() -> int:
                 print(f"stoprip: no ripqueue.py process to signal in {sess['key']}")
                 rc = 1
                 continue
-            signal_all(sess["roles"].get("makemkv", []), signal.SIGKILL)
+            signal_all(sess["roles"].get("makemkv", []) + sess["roles"].get("mkvmerge", []), signal.SIGKILL)
             for rq_pid in rq_pids:
                 try:
                     os.kill(rq_pid, signal.SIGUSR1)

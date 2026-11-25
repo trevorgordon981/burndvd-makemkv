@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: macOS Python 3.12
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Check shell script syntax
+        run: bash -n bin/burndvd bin/discinfo bin/ejectdisc bin/subocr
+
+      - name: CLI smoke checks
+        run: |
+          bin/burndvd --help
+          burndvd-queue --help
+          burndvd-doctor --help
+          checkrip --help
+          stoprip --help
+          subocr --help
+
+      - name: Run test suite
+        run: pytest -v

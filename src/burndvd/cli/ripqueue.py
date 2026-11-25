@@ -257,34 +257,53 @@ def main() -> None:
             else:
                 committed_cursor["disc_index_in_item"] = cd + 1
 
+    def _earliest_pending_locked() -> tuple[int, int] | None:
+        earliest: tuple[int, int] | None = None
+        for entry in state.get("pending_finalize", []):
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("item_index")
+            if not isinstance(idx, int) or idx < 0:
+                continue
+            disc_idx = entry.get("disc_index_in_item", 0)
+            if not isinstance(disc_idx, int) or disc_idx < 0:
+                disc_idx = 0
+            pos = (idx, disc_idx)
+            if earliest is None or pos < earliest:
+                earliest = pos
+        return earliest
+
+    def _save_snapshot_locked() -> None:
+        _advance_committed_locked()
+        cur_i = committed_cursor["current_index"]
+        cur_d = committed_cursor["disc_index_in_item"]
+        earliest = _earliest_pending_locked()
+        if earliest is not None and (cur_i, cur_d) > earliest:
+            cur_i, cur_d = earliest
+        snapshot = copy.deepcopy(state)
+        snapshot["current_index"] = cur_i
+        snapshot["disc_index_in_item"] = cur_d
+        snapshot["disc_episode_counts"] = copy.deepcopy(
+            committed_cursor["disc_episode_counts"]
+        )
+        save_state(snapshot, args.state)
+
     def _persist_committed_state() -> None:
         with state_lock:
-            _advance_committed_locked()
-            snapshot = copy.deepcopy(state)
-            snapshot["current_index"] = committed_cursor["current_index"]
-            snapshot["disc_index_in_item"] = committed_cursor["disc_index_in_item"]
-            snapshot["disc_episode_counts"] = copy.deepcopy(
-                committed_cursor["disc_episode_counts"]
-            )
-            save_state(snapshot, args.state)
+            _save_snapshot_locked()
 
     def _sync_committed_on_skip() -> None:
         with state_lock:
             if not state.get("pending_finalize") and not state.get("failed_finalize"):
                 committed_cursor["current_index"] = state["current_index"]
                 committed_cursor["disc_index_in_item"] = state["disc_index_in_item"]
-            _advance_committed_locked()
-            snapshot = copy.deepcopy(state)
-            snapshot["current_index"] = committed_cursor["current_index"]
-            snapshot["disc_index_in_item"] = committed_cursor["disc_index_in_item"]
-            snapshot["disc_episode_counts"] = copy.deepcopy(
-                committed_cursor["disc_episode_counts"]
-            )
-            save_state(snapshot, args.state)
+            _save_snapshot_locked()
 
     _persist_committed_state()
     clear_finalize_errors()
     _FINALIZE_THREADS.clear()
+    pending_final_summary: list[tuple[str, int, float, list[str]]] = []
+    needs_final_eject = False
 
     while state["current_index"] < len(state["queue"]):
         if _initial_drive_idx is not None:
@@ -373,15 +392,17 @@ def main() -> None:
             print("  Recent UHD release? Wait for next MakeMKV update or refresh keys.")
             ans = auto_answer(args, "[p]ark item / [s]kip item / [r]etry: ", "s")
             if ans.startswith("p"):
-                cur = state["queue"].pop(state["current_index"])
-                state["queue"].append(cur)
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    cur = state["queue"].pop(state["current_index"])
+                    state["queue"].append(cur)
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
                 append_log(args, f"AACS  {item.title} disc{disc_n}  parked to end")
             elif ans.startswith("s"):
-                state["current_index"] += 1
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    state["current_index"] += 1
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
                 append_log(args, f"AACS  {item.title} disc{disc_n}  skipped")
             beep(args, ok=False)
             eject(args)
@@ -413,8 +434,9 @@ def main() -> None:
             probe_retries_used = int(probe_retry_counts.get(probe_retry_key, 0))
             if args.non_interactive and args.on_fail == "retry":
                 if probe_retries_used < MAX_NONINTERACTIVE_RETRIES:
-                    probe_retry_counts[probe_retry_key] = probe_retries_used + 1
-                    save_state(state, args.state)
+                    with state_lock:
+                        probe_retry_counts[probe_retry_key] = probe_retries_used + 1
+                    _persist_committed_state()
                     print(
                         f"  {C.YLW}Transient probe retry "
                         f"{probe_retries_used + 1}/{MAX_NONINTERACTIVE_RETRIES}; "
@@ -438,7 +460,7 @@ def main() -> None:
                     args,
                     f"PROBE_RETRY_EXHAUSTED  {item.title} disc{disc_n}",
                 )
-                save_state(state, args.state)
+                _persist_committed_state()
                 beep(args, ok=False)
                 sys.exit(2)
             if args.non_interactive and args.on_fail == "abort":
@@ -446,24 +468,26 @@ def main() -> None:
                     f"{C.RED}--on-fail=abort; exiting non-zero and leaving "
                     f"the disc in place.{C.R}"
                 )
-                save_state(state, args.state)
+                _persist_committed_state()
                 beep(args, ok=False)
                 sys.exit(2)
 
             ans = auto_answer(args, "[p]ark item / [s]kip item / [r]etry: ", "s")
             if ans.startswith("p"):
-                cur = state["queue"].pop(state["current_index"])
-                state["queue"].append(cur)
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    cur = state["queue"].pop(state["current_index"])
+                    state["queue"].append(cur)
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
                 append_log(
                     args,
                     f"BAD_DISC  {item.title} disc{disc_n}  parked to end (codes={info.get('codes')})",
                 )
             elif ans.startswith("s"):
-                state["current_index"] += 1
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    state["current_index"] += 1
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
                 append_log(
                     args,
                     f"BAD_DISC  {item.title} disc{disc_n}  skipped (codes={info.get('codes')})",
@@ -473,9 +497,13 @@ def main() -> None:
             continue
 
         probe_retry_key = f"{item.title}||disc{disc_n}"
-        probe_retry_counts = state.get("physical_probe_failure_retry_counts", {})
-        if probe_retry_counts.pop(probe_retry_key, None) is not None:
-            save_state(state, args.state)
+        with state_lock:
+            probe_retry_counts = state.get("physical_probe_failure_retry_counts", {})
+            cleared_probe_retry = (
+                probe_retry_counts.pop(probe_retry_key, None) is not None
+            )
+        if cleared_probe_retry:
+            _persist_committed_state()
 
         label = disc_label(info)
         print(f"  Disc label: {C.MAG}{label}{C.R}")
@@ -530,9 +558,10 @@ def main() -> None:
             print(f"{C.YLW}Disc label doesn't match expected '{item.title}'.{C.R}")
             ans = auto_answer(args, "Proceed anyway? [y/N/skip] ", "y")
             if ans == "skip":
-                state["current_index"] += 1
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    state["current_index"] += 1
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
                 continue
             if ans != "y":
                 print("Eject and try again.")
@@ -547,9 +576,10 @@ def main() -> None:
             beep(args, ok=False)
             ans = auto_answer(args, "[r]etry / [s]kip? ", "s")
             if ans.startswith("s"):
-                state["current_index"] += 1
-                state["disc_index_in_item"] = 0
-                save_state(state, args.state)
+                with state_lock:
+                    state["current_index"] += 1
+                    state["disc_index_in_item"] = 0
+                _sync_committed_on_skip()
             continue
 
         print(f"  Selected {len(title_ids)} title(s): {title_ids}")
@@ -619,10 +649,11 @@ def main() -> None:
                         )
                     else:
                         print(f"{C.RED}--on-fail=abort; exiting non-zero.{C.R}")
-                    save_state(state, args.state)
+                    _persist_committed_state()
                     sys.exit(2)
                 if ans == "retry":
-                    retry_counts[key] = retries_used + 1
+                    with state_lock:
+                        retry_counts[key] = retries_used + 1
                     print(
                         f"[r]etry / [s]kip? r  {C.D}(automatic retry "
                         f"{retries_used + 1}/{MAX_NONINTERACTIVE_RETRIES}; "
@@ -633,17 +664,20 @@ def main() -> None:
                         f"RETRY {item.title} disc{disc_n}  automatic "
                         f"{retries_used + 1}/{MAX_NONINTERACTIVE_RETRIES}",
                     )
-                    save_state(state, args.state)
+                    _persist_committed_state()
                     time.sleep(NONINTERACTIVE_RETRY_DELAY_S)
                 else:
                     print(f"[r]etry / [s]kip? s  {C.D}(--on-fail={args.on_fail}){C.R}")
 
             if ans.startswith("s"):
-                state["current_index"] += 1
-                state["disc_index_in_item"] = 0
-                recent.pop(key, None)
-                retry_counts.pop(key, None)
-            save_state(state, args.state)
+                with state_lock:
+                    state["current_index"] += 1
+                    state["disc_index_in_item"] = 0
+                    recent.pop(key, None)
+                    retry_counts.pop(key, None)
+                _sync_committed_on_skip()
+            else:
+                _persist_committed_state()
             continue
 
         result["disc_fingerprint"] = fingerprint
@@ -670,6 +704,15 @@ def main() -> None:
             "ts": time.time(),
         }
         with state_lock:
+            state["pending_finalize"] = [
+                e
+                for e in state.get("pending_finalize", [])
+                if not (
+                    isinstance(e, dict)
+                    and e.get("item_index") == cur_item_idx
+                    and e.get("disc_index_in_item", 0) == cur_disc_idx
+                )
+            ]
             state["pending_finalize"].append(pending_entry)
         # Persist pending_finalize BEFORE transfer/verification; do NOT mark
         # completed or advance persisted cursor yet.
@@ -697,8 +740,14 @@ def main() -> None:
             def _on_complete(final_result: dict) -> None:
                 with state_lock:
                     state["pending_finalize"] = [
-                        e for e in state.get("pending_finalize", [])
+                        e
+                        for e in state.get("pending_finalize", [])
                         if e.get("id") != _pending_id
+                        and not (
+                            isinstance(e, dict)
+                            and e.get("item_index") == _slot[0]
+                            and e.get("disc_index_in_item", 0) == _slot[1]
+                        )
                     ]
                     state["completed"].append(
                         {
@@ -742,17 +791,12 @@ def main() -> None:
 
         on_complete_cb, on_failure_cb = _make_commit_callbacks()
 
-        append_log(
-            args,
-            f"OK    {item.title} disc{disc_n}  {fmt_dur(result['elapsed_s'])}  "
-            f"{len(result['files'])} file(s)",
-        )
-        print(f"{C.GRN}Done in {fmt_dur(result['elapsed_s'])}:{C.R}")
-        for fp in result["files"]:
-            print(f"  {fp}")
-        beep(args, ok=True)
-        eject(args)
+        has_more_items = state["current_index"] < len(state["queue"])
         if result.get("move_jobs") is not None:
+            print(
+                f"{C.D}Staged in {fmt_dur(result['elapsed_s'])}; "
+                f"finalizing to NAS...{C.R}"
+            )
             start_background_finalize(
                 disc_args,
                 result,
@@ -761,6 +805,14 @@ def main() -> None:
                 on_complete=on_complete_cb,
                 on_failure=on_failure_cb,
             )
+            pending_final_summary.append(
+                (item.title, disc_n, result["elapsed_s"], list(result["files"]))
+            )
+            if has_more_items:
+                if not get_finalize_errors():
+                    eject(args)
+            else:
+                needs_final_eject = True
         else:
             try:
                 log_final_durations(disc_args, item, disc_n, result["files"])
@@ -794,7 +846,42 @@ def main() -> None:
                             result["files"],
                         )
                     on_complete_cb(result)
-                    run_subocr_postrip(disc_args, result["files"])
+                    if has_more_items:
+                        append_log(
+                            args,
+                            f"OK    {item.title} disc{disc_n}  "
+                            f"{fmt_dur(result['elapsed_s'])}  "
+                            f"{len(result['files'])} file(s)",
+                        )
+                        print(f"{C.GRN}Done in {fmt_dur(result['elapsed_s'])}:{C.R}")
+                        for fp in result["files"]:
+                            print(f"  {fp}")
+                        if not get_finalize_errors():
+                            beep(args, ok=True)
+                            eject(args)
+                    else:
+                        pending_final_summary.append(
+                            (
+                                item.title,
+                                disc_n,
+                                result["elapsed_s"],
+                                list(result["files"]),
+                            )
+                        )
+                        needs_final_eject = True
+                    try:
+                        run_subocr_postrip(disc_args, result["files"])
+                    except Exception as ocr_exc:
+                        append_log(
+                            args,
+                            f"SUBOCR_WARN {item.title} disc{disc_n} :: "
+                            f"{type(ocr_exc).__name__}: {ocr_exc}",
+                        )
+                        print(
+                            f"{C.YLW}Warning: post-rip subtitle OCR failed to launch "
+                            f"({type(ocr_exc).__name__}: {ocr_exc}); "
+                            f"verified media publication remains committed.{C.R}"
+                        )
             except Exception as exc:
                 err_msg = (
                     f"FINALIZE_FAIL {item.title} disc{disc_n}: "
@@ -821,7 +908,21 @@ def main() -> None:
         )
         for err in finalize_errors:
             print(f"  {C.RED}- {err}{C.R}", file=sys.stderr)
+        beep(args, ok=False)
         sys.exit(2)
+    for title_s, disc_s, elapsed_s, files_s in pending_final_summary:
+        append_log(
+            args,
+            f"OK    {title_s} disc{disc_s}  {fmt_dur(elapsed_s)}  "
+            f"{len(files_s)} file(s)",
+        )
+        print(f"{C.GRN}Done in {fmt_dur(elapsed_s)}:{C.R}")
+        for fp in files_s:
+            print(f"  {fp}")
+    if pending_final_summary:
+        beep(args, ok=True)
+    if needs_final_eject:
+        eject(args)
     print(f"\n{C.B}{C.GRN}Queue complete.{C.R}")
 
 

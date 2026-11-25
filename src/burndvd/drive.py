@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import subprocess
@@ -18,9 +19,14 @@ from burndvd.config import (
     PROBE_COOLDOWN_S,
 )
 
+DRUTIL_DRIVE_ENV = "BURNDVD_DRUTIL_DRIVE"
+DRIVE_DEVICE_ENV = "BURNDVD_DRIVE_DEVICE"
+
 _SLIM_TRAY_DRIVE_RE = re.compile(
     r"\b(?:BU\d+N|BP\d+NB\d+|WP\d+NB\d+|SLIM)\b", re.IGNORECASE
 )
+_DEVICE_NODE_RE = re.compile(r"^(?:/dev/)?r?(disk\d+)$")
+_DRUTIL_LIST_LINE_RE = re.compile(r"^\s*(\d+)\s+\S")
 
 
 def append_log(args, line: str) -> None:
@@ -33,10 +39,245 @@ def append_log(args, line: str) -> None:
         fh.write(f"{datetime.now().isoformat(timespec='seconds')}  {line}\n")
 
 
-def _drive_idx_from_args(args) -> int | None:
-    """Extract the 0-based `disc:N` index from `args.device`, or None for non-disc inputs."""
-    m = re.match(r"disc:(\d+)$", getattr(args, "device", "") or "")
+def _parse_positive_int(value: int | str | None) -> int | None:
+    """Return a positive integer (>= 1) or None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if re.fullmatch(r"\d+", s):
+            n = int(s)
+            return n if n >= 1 else None
+    return None
+
+
+def _normalize_device_node(device_node: str | None) -> str | None:
+    """Normalize `diskN`, `/dev/diskN`, or `/dev/rdiskN` to `/dev/diskN`."""
+    if not isinstance(device_node, str):
+        return None
+    m = _DEVICE_NODE_RE.match(device_node.strip())
+    return f"/dev/{m.group(1)}" if m else None
+
+
+def _extract_device_spec(target) -> str:
+    """Return the MakeMKV device string from a string or args-like namespace."""
+    if target is None:
+        return ""
+    if isinstance(target, str):
+        return target
+    return getattr(target, "device", "") or ""
+
+
+def _disc_selector_index(device: str) -> int | None:
+    """Extract the 0-based `disc:N` MakeMKV selector index, or None."""
+    m = re.match(r"disc:(\d+)$", device or "")
     return int(m.group(1)) if m else None
+
+
+def _explicit_drive_target(
+    target=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> tuple[int | None, str | None]:
+    """Return explicit `(1-based drutil drive, /dev/diskN)` from kwargs, args, or env."""
+    device_spec = _extract_device_spec(target)
+    disc_idx = _disc_selector_index(device_spec)
+    is_non_disc = bool(device_spec) and disc_idx is None
+
+    if drutil_drive is None and target is not None and not isinstance(target, str):
+        drutil_drive = getattr(target, "drutil_drive", None)
+    if drutil_drive is None and not is_non_disc:
+        drutil_drive = os.environ.get(DRUTIL_DRIVE_ENV)
+
+    if device_node is None and target is not None and not isinstance(target, str):
+        device_node = getattr(target, "drive_device", None) or getattr(
+            target, "device_node", None
+        )
+    if device_node is None and not is_non_disc:
+        device_node = os.environ.get(DRIVE_DEVICE_ENV)
+
+    return _parse_positive_int(drutil_drive), _normalize_device_node(device_node)
+
+
+def _drutil_status_output(drutil_drive: int | None = None) -> str | None:
+    """Run `drutil status [-drive N]` and return stdout, or None on error."""
+    cmd = [DRUTIL_BIN, "status"]
+    if drutil_drive is not None:
+        cmd += ["-drive", str(drutil_drive)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout or ""
+
+
+def _parse_disk_node_from_status(status_text: str | None) -> str | None:
+    """Extract `/dev/diskN` from `drutil status` output."""
+    m = re.search(r"Name:\s+(/dev/disk\d+)", status_text or "")
+    return m.group(1) if m else None
+
+
+def _parse_media_type_from_status(status_text: str | None) -> str | None:
+    """Extract the `Type:` value from `drutil status` output."""
+    m = re.search(r"Type:\s*(.+)", status_text or "")
+    return m.group(1).strip() if m else None
+
+
+def _status_has_media(status_text: str | None) -> bool:
+    """Return True if `drutil status` output indicates inserted optical media."""
+    media_type = _parse_media_type_from_status(status_text)
+    return bool(media_type) and "no media" not in media_type.lower()
+
+
+def _drutil_list_drives() -> list[int]:
+    """Return 1-based drive indices reported by `drutil list`."""
+    try:
+        r = subprocess.run(
+            [DRUTIL_BIN, "list"], capture_output=True, text=True, timeout=10
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    drives: list[int] = []
+    for line in (r.stdout or "").splitlines():
+        m = _DRUTIL_LIST_LINE_RE.match(line)
+        if m:
+            idx = int(m.group(1))
+            if idx >= 1 and idx not in drives:
+                drives.append(idx)
+    return drives
+
+
+def _find_drive_by_device_node(
+    device_node: str,
+) -> tuple[int | None, str | None, str | None]:
+    """Find the 1-based drutil drive currently holding `device_node`."""
+    for drv in _drutil_list_drives():
+        out = _drutil_status_output(drv)
+        if out is None:
+            continue
+        node = _parse_disk_node_from_status(out)
+        if node == device_node:
+            return drv, node, out
+    return None, None, None
+
+
+def _resolve_disc_selector_from_drutil(
+    disc_index: int,
+) -> tuple[int | None, str | None, str | None]:
+    """Map a 0-based MakeMKV `disc:N` selector onto loaded physical `drutil` drives.
+
+    Matches the wrapper's disk-number ordering so an empty drive 1 does not
+    cause `disc:0` to target drive 1 when drive 2 holds the inserted disc.
+    """
+    drives = _drutil_list_drives()
+    if not drives:
+        return None, None, None
+
+    loaded: list[tuple[int, int, str | None, str]] = []
+    for drv in drives:
+        out = _drutil_status_output(drv)
+        if out is None or not _status_has_media(out):
+            continue
+        node = _parse_disk_node_from_status(out)
+        if node:
+            disk_num = int(node.rsplit("disk", 1)[1])
+        else:
+            disk_num = 10**9 + drv
+        loaded.append((disk_num, drv, node, out))
+
+    loaded.sort(key=lambda entry: (entry[0], entry[1]))
+    if 0 <= disc_index < len(loaded):
+        _, drv, node, out = loaded[disc_index]
+        return drv, node, out
+    return None, None, None
+
+
+def _resolve_drive_target(
+    target=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+    probe: bool = True,
+) -> tuple[int | None, str | None, str | None]:
+    """Resolve `(1-based drutil drive, /dev/diskN, cached drutil status output)`.
+
+    Resolution order:
+      1. Explicit verified `drutil_drive` (kwarg, args attr, or `BURNDVD_DRUTIL_DRIVE`),
+         cross-checked against `device_node` / `BURNDVD_DRIVE_DEVICE` when both are set.
+      2. Explicit `device_node` / `BURNDVD_DRIVE_DEVICE` matched via `drutil list/status`.
+      3. For `disc:N`, probe `drutil list/status` to map the Nth inserted disc to its
+         actual physical drive index, falling back to `N + 1` when `drutil list` yields
+         no drives (e.g., mocked or unavailable enumeration).
+    """
+    device_spec = _extract_device_spec(target)
+    disc_idx = _disc_selector_index(device_spec)
+    exp_drive, exp_node = _explicit_drive_target(
+        target, drutil_drive=drutil_drive, device_node=device_node
+    )
+
+    if device_spec and disc_idx is None and exp_drive is None and exp_node is None:
+        return None, None, None
+
+    if exp_drive is not None:
+        if exp_node is None or not probe:
+            return exp_drive, exp_node, None
+        status_out = _drutil_status_output(exp_drive)
+        actual_node = _parse_disk_node_from_status(status_out)
+        if actual_node == exp_node:
+            return exp_drive, actual_node, status_out
+        if actual_node is not None and actual_node != exp_node:
+            # Explicit drive holds a different disk node than verified; search for exp_node.
+            return _find_drive_by_device_node(exp_node)
+        if status_out and "no media" in status_out.lower():
+            matched = _find_drive_by_device_node(exp_node)
+            if matched[0] is not None:
+                return matched
+            return exp_drive, None, status_out
+        return exp_drive, exp_node, status_out
+
+    if exp_node is not None:
+        if probe:
+            return _find_drive_by_device_node(exp_node)
+        return None, exp_node, None
+
+    if disc_idx is not None:
+        if probe:
+            resolved = _resolve_disc_selector_from_drutil(disc_idx)
+            if resolved[0] is not None:
+                return resolved
+        return disc_idx + 1, None, None
+
+    return None, None, None
+
+
+def drutil_drive_index(
+    device=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+    probe: bool = True,
+) -> int | None:
+    """Resolve the 1-based `drutil -drive N` index for a device or args namespace."""
+    resolved, _, _ = _resolve_drive_target(
+        device, drutil_drive=drutil_drive, device_node=device_node, probe=probe
+    )
+    return resolved
+
+
+def _drive_idx_from_args(args, *, probe: bool = False) -> int | None:
+    """Return the 0-based physical optical drive index for `args`, or None.
+
+    Honors explicit `BURNDVD_DRUTIL_DRIVE` / `BURNDVD_DRIVE_DEVICE` (and matching
+    attributes on `args`). When neither is set and `probe=False`, falls back directly
+    to parsing `disc:N` without spawning `drutil`.
+    """
+    exp_drive, exp_node = _explicit_drive_target(args)
+    should_probe = probe or (exp_node is not None)
+    resolved = drutil_drive_index(args, probe=should_probe)
+    return (resolved - 1) if resolved is not None else None
 
 
 def _drive_identity(drive_idx: int) -> str | None:
@@ -78,17 +319,17 @@ def _drive_identity(drive_idx: int) -> str | None:
     return None
 
 
-def _drutil_disk_node(drive_idx: int | None = None) -> str | None:
-    """Return `/dev/diskN` for 0-based `drive_idx` (or first drive if None)."""
-    cmd = [DRUTIL_BIN, "status"]
-    if drive_idx is not None:
-        cmd += ["-drive", str(drive_idx + 1)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    except (subprocess.TimeoutExpired, OSError):
-        return None
-    m = re.search(r"Name:\s+(/dev/disk\d+)", r.stdout or "")
-    return m.group(1) if m else None
+def _drutil_disk_node(
+    drive_idx: int | None = None, *, drutil_drive: int | None = None
+) -> str | None:
+    """Return `/dev/diskN` for 0-based `drive_idx` or 1-based `drutil_drive`."""
+    resolved_drive = (
+        _parse_positive_int(drutil_drive)
+        if drutil_drive is not None
+        else (drive_idx + 1 if drive_idx is not None else None)
+    )
+    out = _drutil_status_output(resolved_drive)
+    return _parse_disk_node_from_status(out)
 
 
 def _optical_disk_node() -> str | None:
@@ -143,12 +384,16 @@ def mount_optical_readonly(disk_node: str) -> Path | None:
 
 
 def unmount_blocking_volume(
-    rdisk_path: str | None, drive_idx: int | None = None
+    rdisk_path: str | None,
+    drive_idx: int | None = None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
 ) -> bool:
     """Unmount an auto-mounted optical volume so MakeMKV can open raw blocks.
 
-    When `drive_idx` is given, strictly targets that drive so concurrent rips on
-    other optical drives are never disturbed.
+    When `drive_idx`, `drutil_drive`, or `device_node` is given, strictly targets
+    that drive so concurrent rips on other optical drives are never disturbed.
     """
     try:
         subprocess.run(["pkill", "-x", "DVD Player"], capture_output=True, timeout=5)
@@ -156,20 +401,38 @@ def unmount_blocking_volume(
         pass
 
     candidates: list[str] = []
-    m = re.match(r"^/dev/r(disk\d+)$", rdisk_path or "")
-    if m:
-        candidates.append(f"/dev/{m.group(1)}")
-    if drive_idx is not None:
+    norm_rdisk = _normalize_device_node(rdisk_path)
+    if norm_rdisk:
+        candidates.append(norm_rdisk)
+
+    norm_node = _normalize_device_node(device_node)
+    if norm_node and norm_node not in candidates:
+        candidates.append(norm_node)
+
+    resolved_drive = _parse_positive_int(drutil_drive)
+    if resolved_drive is not None:
+        drutil_node = _drutil_disk_node(drutil_drive=resolved_drive)
+        if drutil_node and drutil_node not in candidates:
+            candidates.append(drutil_node)
+    elif drive_idx is not None:
         drutil_node = _drutil_disk_node(drive_idx)
         if drutil_node and drutil_node not in candidates:
             candidates.append(drutil_node)
-    else:
-        drutil_node = _optical_disk_node()
-        if drutil_node and drutil_node not in candidates:
-            candidates.append(drutil_node)
-        for stale in _optical_mounts():
-            if stale not in candidates:
-                candidates.append(stale)
+    elif not candidates:
+        env_drive, env_node = _explicit_drive_target(None)
+        if env_node and env_node not in candidates:
+            candidates.append(env_node)
+        if env_drive is not None:
+            drutil_node = _drutil_disk_node(drutil_drive=env_drive)
+            if drutil_node and drutil_node not in candidates:
+                candidates.append(drutil_node)
+        else:
+            drutil_node = _optical_disk_node()
+            if drutil_node and drutil_node not in candidates:
+                candidates.append(drutil_node)
+            for stale in _optical_mounts():
+                if stale not in candidates:
+                    candidates.append(stale)
 
     try:
         mounts = subprocess.run(
@@ -207,20 +470,47 @@ def unmount_blocking_volume(
     return unmounted
 
 
-def disc_present(args=None) -> bool:
+def drive_status(
+    device=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> dict[str, object]:
+    """Query `drutil status` for the verified physical drive and return parsed details."""
+    exp_drive, exp_node = _explicit_drive_target(
+        device, drutil_drive=drutil_drive, device_node=device_node
+    )
+    resolved_drive, resolved_node, cached_out = _resolve_drive_target(
+        device, drutil_drive=drutil_drive, device_node=device_node, probe=True
+    )
+    if resolved_drive is None and (exp_drive is not None or exp_node is not None):
+        return {
+            "drutil_drive": None,
+            "device_node": None,
+            "media_present": False,
+            "media_type": None,
+            "raw": "",
+        }
+    out = cached_out if cached_out is not None else _drutil_status_output(resolved_drive)
+    disk_node = _parse_disk_node_from_status(out) or resolved_node
+    return {
+        "drutil_drive": resolved_drive,
+        "device_node": disk_node,
+        "media_present": _status_has_media(out),
+        "media_type": _parse_media_type_from_status(out),
+        "raw": out or "",
+    }
+
+
+def disc_present(
+    args=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> bool:
     """Return True if optical media is loaded in the targeted drive."""
-    cmd = [DRUTIL_BIN, "status"]
-    drive_idx = _drive_idx_from_args(args) if args is not None else None
-    if drive_idx is not None:
-        cmd += ["-drive", str(drive_idx + 1)]
-    try:
-        out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10
-        ).stdout
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    m = re.search(r"Type:\s*(.+)", out)
-    return bool(m) and "no media" not in m.group(1).strip().lower()
+    status = drive_status(args, drutil_drive=drutil_drive, device_node=device_node)
+    return bool(status["media_present"])
 
 
 def _is_slim_tray_drive(drive_id: str | None) -> bool:
@@ -228,15 +518,36 @@ def _is_slim_tray_drive(drive_id: str | None) -> bool:
     return bool(drive_id and _SLIM_TRAY_DRIVE_RE.search(drive_id))
 
 
-def respin_drive(args=None) -> bool:
+def respin_drive(
+    args=None,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> bool:
     """Reset a hung LibreDrive handshake via tray cycle (motorized) or cooldown (slim).
 
     Slim non-motorized drives (e.g. LG BU40N) cannot auto-close their spring
     tray via `drutil tray close`; on those drives we unmount and cool down only
     without ejecting. Returns True if a tray cycle ran, False if cooldown-only.
     """
-    drive_idx = _drive_idx_from_args(args) if args is not None else None
-    unmount_blocking_volume(None, drive_idx=drive_idx)
+    exp_drive, exp_node = _explicit_drive_target(
+        args, drutil_drive=drutil_drive, device_node=device_node
+    )
+    if exp_drive is not None or exp_node is not None:
+        resolved_drive = drutil_drive_index(
+            args,
+            drutil_drive=drutil_drive,
+            device_node=device_node,
+            probe=(exp_node is not None),
+        )
+        drive_idx = (resolved_drive - 1) if resolved_drive is not None else None
+    else:
+        drive_idx = _drive_idx_from_args(args) if args is not None else None
+
+    if exp_node is not None:
+        unmount_blocking_volume(None, drive_idx=drive_idx, device_node=exp_node)
+    else:
+        unmount_blocking_volume(None, drive_idx=drive_idx)
     drive_id = getattr(args, "_drive_identity", None) if args is not None else None
     if drive_id is None:
         drive_id = _drive_identity(drive_idx if drive_idx is not None else 0)
@@ -371,16 +682,43 @@ def check_key_expiry(args) -> int | None:
     return days
 
 
-def eject(args) -> None:
-    """Eject the disc in the targeted drive with bounded timeouts and diskutil fallback."""
-    if getattr(args, "no_eject", False):
-        return
-    drive_idx = _drive_idx_from_args(args)
-    disk_node = _drutil_disk_node(drive_idx)
+def eject_disc(
+    args=None,
+    *,
+    device: str | None = None,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> bool:
+    """Eject the disc in the verified target drive with bounded timeouts and diskutil fallback."""
+    if args is not None and getattr(args, "no_eject", False):
+        return False
+
+    target = device if device is not None else args
+    exp_drive, exp_node = _explicit_drive_target(
+        target, drutil_drive=drutil_drive, device_node=device_node
+    )
+    resolved_drive, resolved_node, cached_out = _resolve_drive_target(
+        target, drutil_drive=drutil_drive, device_node=device_node, probe=True
+    )
+
+    if resolved_drive is None and (exp_drive is not None or exp_node is not None):
+        print(
+            f"{C.YLW}Refusing eject: verified drive target did not match an active drive.{C.R}"
+        )
+        append_log(
+            args,
+            "WARN  eject skipped (verified physical drive target mismatch)",
+        )
+        return False
+
+    disk_node = resolved_node
+    if disk_node is None and cached_out is None:
+        disk_node = _drutil_disk_node(drutil_drive=resolved_drive)
+
     candidates: list[list[str]] = []
-    if drive_idx is not None:
-        candidates.append([DRUTIL_BIN, "-drive", str(drive_idx + 1), "eject"])
-        candidates.append([DRUTIL_BIN, "-drive", str(drive_idx + 1), "tray", "eject"])
+    if resolved_drive is not None:
+        candidates.append([DRUTIL_BIN, "-drive", str(resolved_drive), "eject"])
+        candidates.append([DRUTIL_BIN, "-drive", str(resolved_drive), "tray", "eject"])
     else:
         candidates.append([DRUTIL_BIN, "eject", "external"])
         candidates.append([DRUTIL_BIN, "tray", "eject"])
@@ -392,9 +730,20 @@ def eject(args) -> None:
         except (subprocess.TimeoutExpired, OSError):
             continue
         if r.returncode == 0:
-            return
+            return True
     print(f"{C.YLW}Eject failed; remove disc manually before next.{C.R}")
     append_log(args, "WARN  eject failed (all eject variants returned non-zero)")
+    return False
+
+
+def eject(
+    args,
+    *,
+    drutil_drive: int | None = None,
+    device_node: str | None = None,
+) -> None:
+    """Eject the disc in the targeted drive with bounded timeouts and diskutil fallback."""
+    eject_disc(args, drutil_drive=drutil_drive, device_node=device_node)
 
 
 def beep(args, ok: bool) -> None:
