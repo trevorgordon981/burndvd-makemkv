@@ -349,6 +349,30 @@ def warn_queue_divergence(state: dict, items: list[QueueItem]) -> None:
         )
 
 
+def record_committed_job(entry: dict, record: dict) -> list[dict]:
+    """Append/dedupe a per-file published commit record on a pending_finalize entry."""
+    committed = entry.get("committed_jobs")
+    if not isinstance(committed, list):
+        committed = []
+        entry["committed_jobs"] = committed
+    key = (
+        os.path.normpath(str(record.get("src", ""))),
+        os.path.normpath(str(record.get("orig_dst", record.get("dst", "")))),
+    )
+    for existing in committed:
+        if not isinstance(existing, dict):
+            continue
+        existing_key = (
+            os.path.normpath(str(existing.get("src", ""))),
+            os.path.normpath(str(existing.get("orig_dst", existing.get("dst", "")))),
+        )
+        if existing_key == key:
+            existing.update(record)
+            return committed
+    committed.append(dict(record))
+    return committed
+
+
 def _reconcile_pending_finalize(state: dict) -> list[dict]:
     """Drop already-completed pending entries and rewind cursor to earliest unresolved pending item."""
     raw_pending = state.get("pending_finalize")
@@ -376,6 +400,11 @@ def _reconcile_pending_finalize(state: dict) -> list[dict]:
             disc_n = 0
         if isinstance(title, str) and (title, disc_n) in completed_keys:
             continue
+        raw_committed = entry.get("committed_jobs")
+        if isinstance(raw_committed, list):
+            entry["committed_jobs"] = [c for c in raw_committed if isinstance(c, dict)]
+        else:
+            entry["committed_jobs"] = []
         unresolved.append(entry)
 
         item_idx = entry.get("item_index")

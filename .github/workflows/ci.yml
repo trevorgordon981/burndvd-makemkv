@@ -33,11 +33,17 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Check shell script syntax
-        run: bash -n bin/burndvd bin/discinfo bin/ejectdisc bin/subocr
+        run: |
+          for script in bin/burndvd bin/discinfo bin/ejectdisc bin/subocr; do
+            bash -n "$script"
+          done
 
       - name: CLI smoke checks
         run: |
+          burndvd --help
           bin/burndvd --help
+          command -v discinfo
+          command -v ejectdisc
           burndvd-queue --help
           burndvd-doctor --help
           checkrip --help

@@ -90,23 +90,65 @@ def _nas_root_for(dirpath: Path) -> Path | None:
     return None
 
 
+def _path_escapes_mount_root(target: Path, mount_root: Path) -> bool:
+    """Return True if `target` or any descendant symlink resolves outside `mount_root`."""
+    try:
+        real_root = Path(os.path.realpath(mount_root))
+        if real_root == Path(os.sep):
+            return True
+        real_target = Path(os.path.realpath(target))
+        if real_target != real_root and not real_target.is_relative_to(real_root):
+            return True
+
+        norm_root = Path(os.path.normpath(os.fspath(mount_root)))
+        norm_target = Path(os.path.normpath(os.fspath(target)))
+        try:
+            rel_parts = norm_target.relative_to(norm_root).parts
+        except ValueError:
+            rel_parts = ()
+        cur = norm_root
+        for part in rel_parts:
+            cur = cur / part
+            try:
+                st = os.lstat(cur)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(st.st_mode):
+                try:
+                    os.stat(cur)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    return True
+                resolved_cur = Path(os.path.realpath(cur))
+                if resolved_cur != real_root and not resolved_cur.is_relative_to(real_root):
+                    return True
+        return False
+    except OSError:
+        return True
+
+
 def _verify_nas_mount_identity(dirpath: Path) -> bool:
-    """Verify that a path under a configured NAS root sits on an active mount.
+    """Verify that a path under a configured NAS root sits on an active mount
+    and does not escape the mount root via descendant symlinks.
 
     Paths outside configured NAS roots (for example local temp/test directories)
     return True without mount checks. Paths at or under a configured SMB or NFS
     root return True only when that root is an existing non-symlink directory
-    reported as an active mountpoint by `os.path.ismount()`.
+    reported as an active mountpoint by `os.path.ismount()` AND the symlink-resolved
+    target still lies inside `os.path.realpath(mount_root)`.
     """
     mount_root = _nas_root_for(dirpath)
     if mount_root is None:
         return True
     try:
-        return (
+        if not (
             mount_root.is_dir()
             and not mount_root.is_symlink()
             and os.path.ismount(mount_root)
-        )
+        ):
+            return False
+        return not _path_escapes_mount_root(Path(dirpath), mount_root)
     except OSError:
         return False
 
@@ -162,6 +204,8 @@ def _dir_writable(dirpath: Path) -> bool:
         return False
     try:
         dirpath.mkdir(parents=True, exist_ok=True)
+        if not _verify_nas_mount_identity(dirpath):
+            return False
         probe = dirpath / f".writeprobe-{os.getpid()}-{threading.get_ident()}"
         probe.write_text("ok", encoding="utf-8")
         probe.unlink()
@@ -471,12 +515,13 @@ def move_with_progress(
     pre-existing destination.
     """
     src, dst = Path(src), Path(dst)
-    if not _verify_nas_mount_identity(dst.parent):
-        raise OSError(
-            errno.ENOTCONN,
-            f"destination NAS mount is not active (refusing write to local backing directory): {dst.parent}",
-            str(dst.parent),
-        )
+    for target_path in (dst.parent, dst):
+        if not _verify_nas_mount_identity(target_path):
+            raise OSError(
+                errno.ENOTCONN,
+                f"destination NAS mount is not active or path escapes mount root: {target_path}",
+                str(target_path),
+            )
     dst.parent.mkdir(parents=True, exist_ok=True)
     if not allow_overwrite:
         try:
@@ -760,11 +805,11 @@ def move_with_progress_noclobber(
     if partial_root is None:
         raise ValueError("protected TV move requires an out-of-library partial_root")
     partial_root = Path(partial_root)
-    for target_path in (dst.parent, partial_root):
+    for target_path in (dst.parent, dst, partial_root):
         if not _verify_nas_mount_identity(target_path):
             raise OSError(
                 errno.ENOTCONN,
-                f"destination NAS mount is not active (refusing write to local backing directory): {target_path}",
+                f"destination NAS mount is not active or path escapes mount root: {target_path}",
                 str(target_path),
             )
     dst.parent.mkdir(parents=True, exist_ok=True)

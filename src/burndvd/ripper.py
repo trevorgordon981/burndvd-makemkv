@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -370,6 +371,136 @@ def _unpack_move_job(job):
     )
 
 
+_COMMITTED_MANIFEST_NAME = ".burndvd-committed.json"
+
+
+def _norm_job_key(src: Path | str, orig_dst: Path | str) -> tuple[str, str]:
+    return (os.path.normpath(os.fspath(src)), os.path.normpath(os.fspath(orig_dst)))
+
+
+def _load_committed_jobs(result: dict, staging) -> list[dict]:
+    """Load committed per-file publish records from `result` and staging manifest."""
+    merged: dict[tuple[str, str], dict] = {}
+    sources: list[list] = []
+    if isinstance(result.get("committed_jobs"), list):
+        sources.append(result["committed_jobs"])
+    if staging:
+        manifest = Path(staging) / _COMMITTED_MANIFEST_NAME
+        if manifest.is_file():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and isinstance(data.get("committed_jobs"), list):
+                    sources.append(data["committed_jobs"])
+            except Exception:
+                pass
+    for entries in sources:
+        for rec in entries:
+            if not isinstance(rec, dict):
+                continue
+            src = rec.get("src")
+            orig_dst = rec.get("orig_dst", rec.get("dst"))
+            if not src or not orig_dst:
+                continue
+            merged[_norm_job_key(src, orig_dst)] = dict(rec)
+    return list(merged.values())
+
+
+def _save_committed_manifest(staging, committed_jobs: list[dict]) -> None:
+    """Atomically persist per-file commit records inside the staging directory."""
+    if not staging:
+        return
+    stage_dir = Path(staging)
+    if not stage_dir.is_dir():
+        return
+    manifest = stage_dir / _COMMITTED_MANIFEST_NAME
+    tmp = stage_dir / f"{_COMMITTED_MANIFEST_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        tmp.write_text(
+            json.dumps({"committed_jobs": committed_jobs}, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp, manifest)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _find_committed_record(
+    committed_jobs: list[dict], src: Path, orig_dst: Path
+) -> dict | None:
+    key = _norm_job_key(src, orig_dst)
+    for rec in committed_jobs:
+        if not isinstance(rec, dict):
+            continue
+        if _norm_job_key(rec.get("src", ""), rec.get("orig_dst", rec.get("dst", ""))) == key:
+            return rec
+    return None
+
+
+def _verify_committed_destination(rec: dict, src: Path) -> Path:
+    """Verify a previously committed destination still exists with recorded size/identity."""
+    dst_raw = rec.get("dst") or rec.get("orig_dst")
+    if not dst_raw:
+        raise OSError("committed job record is missing destination path")
+    actual_dst = Path(dst_raw)
+    try:
+        dst_stat = os.lstat(actual_dst)
+    except OSError as exc:
+        raise OSError(
+            f"previously committed destination missing or unreadable: {actual_dst}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(dst_stat.st_mode):
+        raise OSError(
+            f"previously committed destination is not a regular file: {actual_dst}"
+        )
+    expected_size = rec.get("size")
+    if expected_size is not None and dst_stat.st_size != int(expected_size):
+        raise OSError(
+            f"previously committed destination size mismatch at {actual_dst}: "
+            f"expected {expected_size}, found {dst_stat.st_size}"
+        )
+    rec_dev = rec.get("dst_dev")
+    rec_ino = rec.get("dst_ino")
+    if (
+        rec_dev is not None
+        and rec_ino is not None
+        and dst_stat.st_dev == int(rec_dev)
+        and dst_stat.st_ino != int(rec_ino)
+    ):
+        raise OSError(
+            f"previously committed destination inode mismatch at {actual_dst}"
+        )
+    if src.exists():
+        raise OSError(
+            f"staged source still present for committed destination {actual_dst}: {src}"
+        )
+    return actual_dst
+
+
+def _cleanup_owned_claims(unpacked_jobs: list[tuple]) -> int:
+    cleaned = 0
+    for (
+        _src,
+        _dst,
+        _,
+        protected,
+        placeholder_identity,
+        claim_path,
+        _,
+        _,
+    ) in unpacked_jobs:
+        if (
+            protected
+            and placeholder_identity is not None
+            and claim_path is not None
+        ):
+            _remove_zero_placeholder(claim_path, placeholder_identity)
+            cleaned += 1
+    return cleaned
+
+
 def _run_finalize(
     args,
     result: dict,
@@ -378,8 +509,9 @@ def _run_finalize(
     *,
     on_complete=None,
     on_failure=None,
+    on_file_committed=None,
 ) -> bool:
-    """Execute deferred NAS moves, clean staging, log durations, verify, receipt, commit, and subocr."""
+    """Verify staged files before publish, execute resumable NAS moves, clean staging, receipt, commit, and subocr."""
     staging = result.get("staging")
     jobs = result.get("move_jobs") or []
     files = list(result.get("files", []))
@@ -401,10 +533,71 @@ def _run_finalize(
                 pass
 
     try:
+        verified = True
         with _FINALIZE_LOCK:
-            done = 0
+            unpacked_jobs = [_unpack_move_job(job) for job in jobs]
+            committed_jobs = _load_committed_jobs(result, staging)
+            result["committed_jobs"] = list(committed_jobs)
+
+            # Classify jobs into already-committed (from an earlier partial batch) vs pending.
+            pending_indices: list[int] = []
             try:
-                for i, job in enumerate(jobs):
+                for i, unpacked in enumerate(unpacked_jobs):
+                    src, orig_dst_raw = unpacked[0], unpacked[1]
+                    src_path = Path(src)
+                    orig_dst = Path(orig_dst_raw)
+                    rec = _find_committed_record(committed_jobs, src_path, orig_dst)
+                    if rec is not None:
+                        actual_dst = _verify_committed_destination(rec, src_path)
+                        if str(actual_dst) != str(orig_dst):
+                            files = [
+                                str(actual_dst) if fp == str(orig_dst) else fp
+                                for fp in files
+                            ]
+                    else:
+                        pending_indices.append(i)
+            except BaseException as e:
+                cleaned_claims = _cleanup_owned_claims(unpacked_jobs)
+                err_msg = f"MOVE_FAIL {item.title} disc{disc_n}: {e}"
+                _record_finalize_error(err_msg)
+                append_log(
+                    args,
+                    f"MOVE_FAIL {item.title} disc{disc_n} :: {e} "
+                    f"(RIP PRESERVED at {staging}; "
+                    f"{cleaned_claims} owned claim(s) cleaned)",
+                )
+                print(f"{C.RED}Background NAS move failed: {e}{C.R}", flush=True)
+                beep(args, ok=False)
+                _report_failure(err_msg)
+                if not isinstance(e, Exception):
+                    raise
+                return False
+
+            # Pre-publish verification: decode-verify staged files BEFORE moving any bytes
+            # into the live library so corrupt/truncated rips never become visible at final
+            # filenames and staged sources stay 100% intact on failure.
+            if getattr(args, "verify", False) and pending_indices:
+                staged_sources = [str(Path(unpacked_jobs[i][0])) for i in pending_indices]
+                ok_pre, err_pre = verify(staged_sources)
+                if not ok_pre:
+                    verified = False
+                    _cleanup_owned_claims([unpacked_jobs[i] for i in pending_indices])
+                    err_msg = f"VERIFY_FAIL {item.title} disc{disc_n}: {err_pre}"
+                    _record_finalize_error(err_msg)
+                    append_log(
+                        args, f"VERIFY_FAIL {item.title} disc{disc_n} :: {err_pre}"
+                    )
+                    print(
+                        f"{C.RED}Verify failed (pre-publish): {err_pre}{C.R}",
+                        flush=True,
+                    )
+                    beep(args, ok=False)
+                    _report_failure(err_msg)
+                    return False
+
+            done_pending_pos = 0
+            try:
+                for pos, i in enumerate(pending_indices):
                     (
                         src,
                         dst,
@@ -414,7 +607,8 @@ def _run_finalize(
                         claim_path,
                         partial_root,
                         lock_dir,
-                    ) = _unpack_move_job(job)
+                    ) = unpacked_jobs[i]
+                    src_path = Path(src)
                     orig_dst = Path(dst)
                     dst = orig_dst
                     writable_dir = _await_dir_writable(dst.parent, staging)
@@ -431,9 +625,14 @@ def _run_finalize(
                         files = [
                             str(dst) if fp == str(orig_dst) else fp for fp in files
                         ]
+                    expected_size: int | None = None
+                    try:
+                        expected_size = os.lstat(src_path).st_size
+                    except OSError:
+                        expected_size = None
                     if protected:
                         move_with_progress_noclobber(
-                            Path(src),
+                            src_path,
                             dst,
                             label=label,
                             placeholder_identity=placeholder_identity,
@@ -443,35 +642,47 @@ def _run_finalize(
                         )
                     elif allow_movie_overwrite:
                         move_with_progress(
-                            Path(src), dst, label=label, allow_overwrite=True
+                            src_path, dst, label=label, allow_overwrite=True
                         )
                     else:
-                        move_with_progress(Path(src), dst, label=label)
-                    done = i + 1
+                        move_with_progress(src_path, dst, label=label)
+
+                    dst_stat = os.lstat(dst)
+                    if not stat.S_ISREG(dst_stat.st_mode):
+                        raise OSError(f"published destination is not a regular file: {dst}")
+                    if expected_size is not None and dst_stat.st_size != expected_size:
+                        raise OSError(
+                            f"published destination size mismatch at {dst}: "
+                            f"expected {expected_size}, got {dst_stat.st_size}"
+                        )
+                    commit_rec = {
+                        "src": str(src_path),
+                        "orig_dst": str(orig_dst),
+                        "dst": str(dst),
+                        "size": int(dst_stat.st_size),
+                        "dst_dev": int(dst_stat.st_dev),
+                        "dst_ino": int(dst_stat.st_ino),
+                        "label": str(label),
+                        "committed_at": time.time(),
+                    }
+                    committed_jobs.append(commit_rec)
+                    result["committed_jobs"] = list(committed_jobs)
+                    _save_committed_manifest(staging, committed_jobs)
+                    if on_file_committed is not None:
+                        try:
+                            on_file_committed(dict(commit_rec))
+                        except Exception:
+                            pass
+                    done_pending_pos = pos + 1
             except BaseException as e:
                 # Only clean owned zero-byte TV claim placeholders (verified by
-                # exact inode identity). Never touch pre-existing destinations or
-                # unstarted jobs; owned `.partial` artifacts are rolled back inside
-                # move_with_progress / move_with_progress_noclobber.
-                cleaned_claims = 0
-                for job in jobs[done:]:
-                    (
-                        _src,
-                        _dst,
-                        _,
-                        protected,
-                        placeholder_identity,
-                        claim_path,
-                        _,
-                        _,
-                    ) = _unpack_move_job(job)
-                    if (
-                        protected
-                        and placeholder_identity is not None
-                        and claim_path is not None
-                    ):
-                        _remove_zero_placeholder(claim_path, placeholder_identity)
-                        cleaned_claims += 1
+                # exact inode identity) for uncommitted jobs. Never touch
+                # pre-existing destinations; owned `.partial` artifacts are rolled
+                # back inside move_with_progress / move_with_progress_noclobber.
+                remaining_unpacked = [
+                    unpacked_jobs[idx] for idx in pending_indices[done_pending_pos:]
+                ]
+                cleaned_claims = _cleanup_owned_claims(remaining_unpacked)
                 err_msg = f"MOVE_FAIL {item.title} disc{disc_n}: {e}"
                 _record_finalize_error(err_msg)
                 append_log(
@@ -495,8 +706,8 @@ def _run_finalize(
         result["files"] = files
         if files and getattr(args, "state", None):
             log_final_durations(args, item, disc_n, files)
-        verified = True
-        if getattr(args, "verify", False) and files:
+        # If there were no move_jobs (files already at destination), still verify them.
+        if getattr(args, "verify", False) and files and not jobs:
             ok2, err = verify(files)
             if not ok2:
                 verified = False
@@ -590,11 +801,16 @@ def start_background_finalize(
     *,
     on_complete=None,
     on_failure=None,
+    on_file_committed=None,
 ) -> None:
     t = threading.Thread(
         target=_run_finalize,
         args=(args, result, item, disc_n),
-        kwargs={"on_complete": on_complete, "on_failure": on_failure},
+        kwargs={
+            "on_complete": on_complete,
+            "on_failure": on_failure,
+            "on_file_committed": on_file_committed,
+        },
         daemon=False,
     )
     t.start()

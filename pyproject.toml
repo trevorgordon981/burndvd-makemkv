@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "burndvd"
-version = "2.0.2"
+version = "2.0.3"
 description = "Decoupled macOS DVD/Blu-ray/UHD ripping, verification, unencrypted-BD fallback, and Apple Vision PGS subtitle OCR library and CLI toolkit."
 readme = "README.md"
 license = {text = "MIT"}
@@ -37,6 +37,13 @@ stoprip = "burndvd.cli.stoprip:cli_main"
 rip-progress = "burndvd.cli.rip_progress:cli_main"
 subocr = "burndvd.cli.subocr:main"
 burndvd-doctor = "burndvd.cli.doctor:main"
+
+[tool.setuptools]
+script-files = [
+    "bin/burndvd",
+    "bin/discinfo",
+    "bin/ejectdisc",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

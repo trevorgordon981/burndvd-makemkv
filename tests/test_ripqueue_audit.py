@@ -173,7 +173,8 @@ class AuditFixesTests(unittest.TestCase):
                 "move_jobs": [(src, dst, "moving")],
                 "staging": str(src.parent),
             }
-            with mock.patch.object(ripqueue, "_await_dir_writable", return_value=None), \
+            with mock.patch.object(ripqueue, "verify", return_value=(True, "")), \
+                 mock.patch.object(ripqueue, "_await_dir_writable", return_value=None), \
                  mock.patch.object(ripqueue, "run_subocr_postrip") as subocr:
                 ripqueue._run_finalize(args, result, _make_movie_item(root), 1)
             subocr.assert_not_called()
@@ -373,9 +374,11 @@ class AuditFixesTests(unittest.TestCase):
                 "staging": str(src.parent),
             }
             verified_paths = []
+            dst_existed_during_verify = []
 
             def fake_verify(paths):
                 verified_paths.extend(paths)
+                dst_existed_during_verify.append(expected_nfs_dst.exists())
                 return True, ""
 
             with mock.patch.object(ripqueue, "_await_dir_writable", return_value=nfs_dir), \
@@ -383,7 +386,8 @@ class AuditFixesTests(unittest.TestCase):
                 ripqueue._run_finalize(args, result, _make_movie_item(root), 1)
             self.assertTrue(expected_nfs_dst.is_file())
             self.assertEqual(result["files"], [str(expected_nfs_dst)])
-            self.assertEqual(verified_paths, [str(expected_nfs_dst)])
+            self.assertEqual(verified_paths, [str(src)])
+            self.assertEqual(dst_existed_during_verify, [False])
 
     def test_07_move_extras_disambiguates_and_catches_fileexistserror(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,6 +22,8 @@ if [ -n "${BURNDVD_RIPQUEUE_PY:-}" ]; then
     RIPQUEUE_PY="$BURNDVD_RIPQUEUE_PY"
 elif [ -f "$SCRIPT_DIR/ripqueue.py" ]; then
     RIPQUEUE_PY="$SCRIPT_DIR/ripqueue.py"
+elif [ -x "$SCRIPT_DIR/burndvd-queue" ]; then
+    RIPQUEUE_PY="$SCRIPT_DIR/burndvd-queue"
 elif command -v burndvd-queue >/dev/null 2>&1; then
     RIPQUEUE_PY=$(command -v burndvd-queue)
 elif [ -f "$HOME/scripts/ripqueue.py" ]; then
@@ -38,6 +40,10 @@ fi
 run_metadata() {
     if [ -n "$METADATA_PY" ] && [ -f "$METADATA_PY" ]; then
         python3 "$METADATA_PY" "$@"
+    elif [ -x "$SCRIPT_DIR/burndvd-metadata" ]; then
+        "$SCRIPT_DIR/burndvd-metadata" "$@"
+    elif command -v burndvd-metadata >/dev/null 2>&1; then
+        burndvd-metadata "$@"
     else
         PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
             python3 -m burndvd.cli.metadata "$@"
@@ -780,9 +786,17 @@ case "$RIP_EXIT_CODE" in
         ;;
 esac
 
-if [ -x "$HOME/.local/bin/ejectdisc" ] && [ "$RIP_EXIT_CODE" = "0" ]; then
-    echo "Ejecting disc."
-    "$HOME/.local/bin/ejectdisc" "$DRUTIL_INDEX" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+if [ "$RIP_EXIT_CODE" = "0" ]; then
+    if [ -x "$HOME/.local/bin/ejectdisc" ]; then
+        echo "Ejecting disc."
+        "$HOME/.local/bin/ejectdisc" "$DRUTIL_INDEX" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+    elif [ -x "$SCRIPT_DIR/ejectdisc" ]; then
+        echo "Ejecting disc."
+        "$SCRIPT_DIR/ejectdisc" "$DRUTIL_INDEX" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+    elif command -v ejectdisc >/dev/null 2>&1; then
+        echo "Ejecting disc."
+        ejectdisc "$DRUTIL_INDEX" || echo "WARN: eject failed (drutil returned non-zero)" >&2
+    fi
 fi
 
 exit "$RIP_EXIT_CODE"

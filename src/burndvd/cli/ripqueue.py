@@ -34,6 +34,7 @@ from burndvd.models import (
     QueueItem,
     load_or_init,
     load_queue,
+    record_committed_job,
     run_policy_error,
     save_state,
     validate_queue_item,
@@ -689,6 +690,16 @@ def main() -> None:
         }
 
         pending_id = f"{cur_item_idx}:{cur_disc_idx}:{disc_n}:{time.time_ns()}"
+        raw_move_jobs = result.get("move_jobs") or []
+        serialized_move_jobs = [
+            {
+                "src": str(job[0]),
+                "dst": str(job[1]),
+                "label": str(job[2]) if len(job) > 2 else "moving",
+            }
+            for job in raw_move_jobs
+            if isinstance(job, (tuple, list)) and len(job) >= 2
+        ]
         pending_entry = {
             "id": pending_id,
             "item_index": cur_item_idx,
@@ -698,6 +709,8 @@ def main() -> None:
             "disc_n": disc_n,
             "type": item.type,
             "files": list(result["files"]),
+            "move_jobs": serialized_move_jobs,
+            "committed_jobs": list(result.get("committed_jobs") or []),
             "staging": result.get("staging"),
             "elapsed_s": result["elapsed_s"],
             "status": "pending_finalize",
@@ -772,6 +785,14 @@ def main() -> None:
                     committed_slots.add(_slot)
                 _persist_committed_state()
 
+            def _on_file_committed(commit_rec: dict) -> None:
+                with state_lock:
+                    record_committed_job(_pending_entry, commit_rec)
+                    for entry in state.get("pending_finalize", []):
+                        if isinstance(entry, dict) and entry.get("id") == _pending_id:
+                            record_committed_job(entry, commit_rec)
+                _persist_committed_state()
+
             def _on_failure(err_msg: str) -> None:
                 with state_lock:
                     state["pending_finalize"] = [
@@ -779,7 +800,7 @@ def main() -> None:
                         if e.get("id") != _pending_id
                     ]
                     failed_rec = {
-                        **_pending_entry,
+                        **copy.deepcopy(_pending_entry),
                         "status": "failed",
                         "error": err_msg,
                         "failed_ts": time.time(),
@@ -787,9 +808,9 @@ def main() -> None:
                     state.setdefault("failed_finalize", []).append(failed_rec)
                 _persist_committed_state()
 
-            return _on_complete, _on_failure
+            return _on_complete, _on_failure, _on_file_committed
 
-        on_complete_cb, on_failure_cb = _make_commit_callbacks()
+        on_complete_cb, on_failure_cb, on_file_committed_cb = _make_commit_callbacks()
 
         has_more_items = state["current_index"] < len(state["queue"])
         if result.get("move_jobs") is not None:
@@ -804,6 +825,7 @@ def main() -> None:
                 disc_n,
                 on_complete=on_complete_cb,
                 on_failure=on_failure_cb,
+                on_file_committed=on_file_committed_cb,
             )
             pending_final_summary.append(
                 (item.title, disc_n, result["elapsed_s"], list(result["files"]))
