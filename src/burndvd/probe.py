@@ -23,10 +23,12 @@ from burndvd.config import (
     fmt_dur,
 )
 from burndvd.drive import (
+    _disc_selector_index,
     _drive_idx_from_args,
     _optical_mounts,
     append_log,
     disc_present,
+    resolve_makemkv_device,
     unmount_blocking_volume,
 )
 from burndvd.models import QueueItem, TitleInfo
@@ -174,6 +176,11 @@ def probe_disc(args) -> dict | None:
     def _run_once():
         if _optical_mounts():
             unmount_blocking_volume(None, drive_idx=target_drive_idx)
+        resolved_device = resolve_makemkv_device(args)
+        resolved_disc_idx = _disc_selector_index(resolved_device)
+        eff_drv_idx = (
+            resolved_disc_idx if resolved_disc_idx is not None else want_drv_idx
+        )
         try:
             proc = subprocess.Popen(
                 [
@@ -182,7 +189,7 @@ def probe_disc(args) -> dict | None:
                     "--cache=128",
                     f"--minlength={EXTRAS_MIN_DUR_S}",
                     "info",
-                    args.device,
+                    resolved_device,
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -275,7 +282,7 @@ def probe_disc(args) -> dict | None:
                     pass
             elif tag == "DRV" and f and len(f) >= 7 and f[6].startswith("/dev/rdisk"):
                 try:
-                    if int(f[0]) == want_drv_idx:
+                    if int(f[0]) == eff_drv_idx:
                         rdisk = f[6]
                 except ValueError:
                     pass

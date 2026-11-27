@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from burndvd.metadata import (
+    compute_next_tv_episode,
     episode_contract,
     infer_defaults,
     movie_title_has_year,
@@ -32,6 +33,15 @@ def main() -> int:
     contract.add_argument("--title", required=True)
     contract.add_argument("--season", required=True, type=int)
     contract.add_argument("--volume", required=True)
+
+    next_ep = subparsers.add_parser("next-episode")
+    next_ep.add_argument("--title", required=True)
+    next_ep.add_argument("--season", required=True, type=int)
+    next_ep.add_argument("--target-root", default="")
+    next_ep.add_argument("--season-dir", default="")
+    next_ep.add_argument("--media-smb-root", default="/Volumes/Media")
+    next_ep.add_argument("--media-nfs-root", default="/private/nas/media")
+    next_ep.add_argument("--wait-scan-s", type=float, default=0.0)
 
     queue = subparsers.add_parser("write-queue")
     queue.add_argument("--output", required=True, type=Path)
@@ -61,6 +71,18 @@ def main() -> int:
         value = episode_contract(args.title, args.season, args.volume)
         if value is None:
             return 2
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        return 0
+    if args.command == "next-episode":
+        value = compute_next_tv_episode(
+            title=args.title,
+            season=args.season,
+            target_root=args.target_root,
+            season_dir=args.season_dir or None,
+            media_smb_root=args.media_smb_root,
+            media_nfs_root=args.media_nfs_root,
+            wait_scan_s=args.wait_scan_s,
+        )
         print(json.dumps(value, sort_keys=True, separators=(",", ":")))
         return 0
     if args.command == "write-queue":

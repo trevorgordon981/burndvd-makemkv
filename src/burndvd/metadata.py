@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import atexit
 import csv
+import os
+import subprocess
+import time
 import json
 import re
 from pathlib import Path
@@ -227,3 +231,371 @@ def write_queue(
                 normalized_features,
             ]
         )
+
+ACTIVE_TV_SLOTS_ENV = "BURNDVD_ACTIVE_TV_SLOTS_DIR"
+_REGISTERED_ATEXIT_PIDS: set[int] = set()
+
+
+def active_tv_slots_dir(slots_dir: Path | str | None = None) -> Path:
+    if slots_dir is not None:
+        return Path(slots_dir)
+    env_dir = os.environ.get(ACTIVE_TV_SLOTS_ENV, "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".cache" / "burndvd" / "active-tv-slots"
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def clear_tv_slot_reservation(
+    pid: int | None = None, *, slots_dir: Path | str | None = None
+) -> None:
+    target_pid = os.getpid() if pid is None else int(pid)
+    try:
+        (active_tv_slots_dir(slots_dir) / f"pid-{target_pid}.json").unlink(
+            missing_ok=True
+        )
+    except OSError:
+        pass
+
+
+def write_tv_slot_reservation(
+    *,
+    pid: int,
+    title: str,
+    season: int,
+    target_root: str,
+    episode_start: int,
+    episode_count: int,
+    slots_dir: Path | str | None = None,
+) -> Path | None:
+    if episode_start <= 0 or episode_count <= 0:
+        return None
+    sdir = active_tv_slots_dir(slots_dir)
+    try:
+        sdir.mkdir(parents=True, exist_ok=True)
+        dest = sdir / f"pid-{int(pid)}.json"
+        tmp = sdir / f"pid-{int(pid)}.json.tmp.{os.getpid()}"
+        payload = {
+            "pid": int(pid),
+            "title": str(title),
+            "season": int(season),
+            "target_root": str(target_root),
+            "episode_start": int(episode_start),
+            "episode_count": int(episode_count),
+            "next_episode": int(episode_start) + int(episode_count),
+            "created_at": time.time(),
+        }
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp, dest)
+        if int(pid) == os.getpid() and int(pid) not in _REGISTERED_ATEXIT_PIDS:
+            _REGISTERED_ATEXIT_PIDS.add(int(pid))
+            atexit.register(clear_tv_slot_reservation, int(pid), slots_dir=sdir)
+        return dest
+    except OSError:
+        return None
+
+
+def scan_season_highest_episode(
+    season_dir: Path | str | None, season: int
+) -> int:
+    if not season_dir:
+        return 0
+    sdir = Path(season_dir)
+    if not sdir.is_dir():
+        return 0
+    pat = re.compile(rf"S0*{int(season)}E(\d+)", re.IGNORECASE)
+    highest = 0
+    try:
+        for entry in sdir.iterdir():
+            if not entry.name.lower().endswith(".mkv"):
+                continue
+            try:
+                if not entry.is_file() or entry.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            m = pat.search(entry.name)
+            if m:
+                ep = int(m.group(1))
+                if ep > highest:
+                    highest = ep
+    except OSError:
+        return highest
+    return highest
+
+
+def _norm_media_root(p: str, smb: str, nfs: str) -> str:
+    norm = os.path.normpath((p or "").strip())
+    if not norm or norm == ".":
+        return ""
+    for pref in (smb.rstrip("/"), nfs.rstrip("/")):
+        if pref and (norm == pref or norm.startswith(pref + "/")):
+            return "<MEDIA>" + norm[len(pref):]
+    return norm
+
+
+def _tv_matches(
+    want_title: str,
+    want_season: int,
+    want_root: str,
+    cand_title: str,
+    cand_season: object,
+    cand_root: str,
+    smb: str,
+    nfs: str,
+) -> bool:
+    try:
+        c_season = int(str(cand_season).strip())
+    except (TypeError, ValueError):
+        return False
+    if c_season != int(want_season):
+        return False
+    if want_title and cand_title and _compact(want_title) == _compact(cand_title):
+        return True
+    if want_root and cand_root:
+        if _norm_media_root(want_root, smb, nfs) == _norm_media_root(cand_root, smb, nfs):
+            return True
+    return False
+
+
+def _selected_count_from_log(log_path: str | Path) -> int:
+    try:
+        txt = Path(log_path).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0
+    txt = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", txt)
+    matches = re.findall(r"Selected\s+(\d+)\s+title\(s\):", txt)
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1])
+    except ValueError:
+        return 0
+
+
+def _discover_active_ripqueue_procs() -> list[dict]:
+    try:
+        r = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    by_pid: dict[int, tuple[int, str]] = {}
+    for line in (r.stdout or "").splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        by_pid[pid] = (ppid, parts[2])
+
+    out: list[dict] = []
+    for pid, (ppid, cmdline) in by_pid.items():
+        if not re.search(r"python.*(?:ripqueue\.py|burndvd-queue)", cmdline, re.IGNORECASE):
+            continue
+        m_state = re.search(r"--state\s+([^\s]+)", cmdline)
+        m_queue = re.search(r"--queue\s+([^\s]+)", cmdline)
+        log_path = ""
+        cur_ppid = ppid
+        for _ in range(3):
+            parent = by_pid.get(cur_ppid)
+            if not parent:
+                break
+            p_ppid, p_cmd = parent
+            m_log = re.search(r"\bscript\s+-q\s+([^\s]+\.log)\b", p_cmd)
+            if m_log:
+                log_path = m_log.group(1)
+                break
+            cur_ppid = p_ppid
+        out.append(
+            {
+                "pid": pid,
+                "state_file": m_state.group(1).strip(chr(39) + chr(34)) if m_state else "",
+                "queue_file": m_queue.group(1).strip(chr(39) + chr(34)) if m_queue else "",
+                "log_file": log_path,
+            }
+        )
+    return out
+
+
+def compute_next_tv_episode(
+    *,
+    title: str,
+    season: int,
+    target_root: str = "",
+    season_dir: Path | str | None = None,
+    slots_dir: Path | str | None = None,
+    media_smb_root: str = "/Volumes/Media",
+    media_nfs_root: str = "/private/nas/media",
+    active_processes: list[dict] | None = None,
+    wait_scan_s: float = 0.0,
+    poll_interval_s: float = 2.0,
+) -> dict:
+    deadline = time.monotonic() + max(0.0, float(wait_scan_s))
+    notified_wait = False
+    while True:
+        nas_highest = scan_season_highest_episode(season_dir, int(season))
+        next_ep = nas_highest + 1
+        reservations: list[dict] = []
+        seen_pids: set[int] = set()
+        pending_scan_pids: list[int] = []
+
+        sdir = active_tv_slots_dir(slots_dir)
+        if sdir.is_dir():
+            for path in sorted(sdir.glob("pid-*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                try:
+                    pid = int(data.get("pid", 0))
+                    ep_start = int(data.get("episode_start", 0))
+                    ep_count = int(data.get("episode_count", 0))
+                except (TypeError, ValueError):
+                    continue
+                if not _pid_alive(pid):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    continue
+                if pid == os.getpid():
+                    continue
+                if _tv_matches(
+                    title,
+                    int(season),
+                    target_root,
+                    str(data.get("title") or ""),
+                    data.get("season"),
+                    str(data.get("target_root") or ""),
+                    media_smb_root,
+                    media_nfs_root,
+                ):
+                    seen_pids.add(pid)
+                    if ep_start > 0 and ep_count > 0:
+                        end_ep = ep_start + ep_count - 1
+                        reservations.append(
+                            {
+                                "pid": pid,
+                                "episode_start": ep_start,
+                                "episode_count": ep_count,
+                                "episode_end": end_ep,
+                                "source": "slot",
+                            }
+                        )
+                        next_ep = max(next_ep, ep_start + ep_count)
+
+        procs = (
+            _discover_active_ripqueue_procs()
+            if active_processes is None
+            else list(active_processes)
+        )
+        for proc in procs:
+            try:
+                pid = int(proc.get("pid", 0))
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0 or pid == os.getpid() or pid in seen_pids:
+                continue
+            rows: list[dict] = []
+            sp = str(proc.get("state_file") or "")
+            qp = str(proc.get("queue_file") or "")
+            if sp and os.path.isfile(sp):
+                try:
+                    st = json.loads(Path(sp).read_text(encoding="utf-8"))
+                    rows.extend(st.get("queue") or [])
+                except (OSError, ValueError):
+                    pass
+            if not rows and qp and os.path.isfile(qp):
+                try:
+                    with open(qp, encoding="utf-8", newline="") as fh:
+                        rows.extend(csv.DictReader(fh))
+                except OSError:
+                    pass
+            matched_row = None
+            for q in rows:
+                if _tv_matches(
+                    title,
+                    int(season),
+                    target_root,
+                    str(q.get("title") or ""),
+                    q.get("season"),
+                    str(q.get("target_root") or ""),
+                    media_smb_root,
+                    media_nfs_root,
+                ):
+                    matched_row = q
+                    break
+            if matched_row is None:
+                continue
+            seen_pids.add(pid)
+            raw_start = str(matched_row.get("episode_start") or "").strip()
+            ep_start = int(raw_start) if raw_start.isdigit() and int(raw_start) > 0 else (nas_highest + 1)
+            raw_cnt = str(matched_row.get("expected_disc_episodes") or "").strip()
+            ep_count = int(raw_cnt) if raw_cnt.isdigit() and int(raw_cnt) > 0 else 0
+            source = "queue"
+            if ep_count <= 0:
+                log_file = str(proc.get("log_file") or "")
+                if log_file:
+                    ep_count = _selected_count_from_log(log_file)
+                    if ep_count > 0:
+                        source = "log"
+            if ep_count > 0:
+                end_ep = ep_start + ep_count - 1
+                reservations.append(
+                    {
+                        "pid": pid,
+                        "episode_start": ep_start,
+                        "episode_count": ep_count,
+                        "episode_end": end_ep,
+                        "source": source,
+                    }
+                )
+                next_ep = max(next_ep, ep_start + ep_count)
+            else:
+                pending_scan_pids.append(pid)
+
+        result = {
+            "next_episode": next_ep,
+            "nas_highest": nas_highest,
+            "reservations": reservations,
+            "pending_scan_pids": pending_scan_pids,
+        }
+        if not pending_scan_pids or time.monotonic() >= deadline:
+            return result
+        if not notified_wait:
+            notified_wait = True
+            import sys as _sys
+            pids_s = ", ".join(str(p) for p in pending_scan_pids)
+            print(
+                f"Waiting up to {int(wait_scan_s)}s for active rip (pid {pids_s}) to finish scanning disc...",
+                file=_sys.stderr,
+                flush=True,
+            )
+        time.sleep(min(poll_interval_s, max(0.05, deadline - time.monotonic())))

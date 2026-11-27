@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import json
 import os
@@ -37,8 +38,19 @@ from burndvd.config import (
     render_bar,
     sanitize,
 )
-from burndvd.drive import append_log, beep, disc_present, respin_drive
+from burndvd.drive import (
+    append_log,
+    beep,
+    disc_present,
+    resolve_makemkv_device,
+    respin_drive,
+)
 from burndvd.fallback import mkvmerge_fallback_rip
+from burndvd.metadata import (
+    clear_tv_slot_reservation,
+    scan_season_highest_episode,
+    write_tv_slot_reservation,
+)
 from burndvd.models import QueueItem, save_state
 from burndvd.nas import (
     _await_dir_writable,
@@ -243,53 +255,68 @@ def _probe_expected_duration_s(path: str) -> tuple[float | None, str | None]:
     return dur, None
 
 
+def _verify_single(p: str) -> tuple[bool, str]:
+    """Decode-verify a single MKV through strict ffmpeg null muxer and duration checks."""
+    r = subprocess.run(
+        [
+            FFMPEG_BIN,
+            "-nostdin",
+            "-v",
+            "error",
+            "-err_detect",
+            "explode",
+            "-xerror",
+            "-progress",
+            "pipe:1",
+            "-i",
+            p,
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    stderr_txt = (getattr(r, "stderr", "") or "").strip()
+    if r.returncode != 0:
+        return False, f"{p}: exit {r.returncode}; {stderr_txt[:240]}"
+    if stderr_txt:
+        return False, f"{p}: ffmpeg decode error: {stderr_txt[:240]}"
+    if os.path.isfile(p):
+        try:
+            if os.path.getsize(p) <= 0:
+                return False, f"{p}: empty file (0 bytes)"
+        except OSError as exc:
+            return False, f"{p}: stat failed: {exc}"
+        expected_dur, probe_err = _probe_expected_duration_s(p)
+        if probe_err is not None:
+            return False, f"{p}: {probe_err}"
+        if expected_dur is not None and expected_dur > 0:
+            decoded_s = _parse_ffmpeg_out_time_s(getattr(r, "stdout", "") or "")
+            if decoded_s is not None:
+                tol = max(0.25, min(10.0, expected_dur * 0.05))
+                if decoded_s <= 0 or (expected_dur - decoded_s) > tol:
+                    return (
+                        False,
+                        f"{p}: truncated stream (decoded {decoded_s:.2f}s of "
+                        f"{expected_dur:.2f}s container duration)",
+                    )
+    return True, ""
+
+
 def verify(paths: list[str]) -> tuple[bool, str]:
     """Decode-verify every output MKV through strict ffmpeg null muxer and duration checks."""
-    for p in paths:
-        r = subprocess.run(
-            [
-                FFMPEG_BIN,
-                "-nostdin",
-                "-v",
-                "error",
-                "-err_detect",
-                "explode",
-                "-xerror",
-                "-progress",
-                "pipe:1",
-                "-i",
-                p,
-                "-f",
-                "null",
-                "-",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        stderr_txt = (getattr(r, "stderr", "") or "").strip()
-        if r.returncode != 0:
-            return False, f"{p}: exit {r.returncode}; {stderr_txt[:240]}"
-        if stderr_txt:
-            return False, f"{p}: ffmpeg decode error: {stderr_txt[:240]}"
-        if os.path.isfile(p):
-            try:
-                if os.path.getsize(p) <= 0:
-                    return False, f"{p}: empty file (0 bytes)"
-            except OSError as exc:
-                return False, f"{p}: stat failed: {exc}"
-            expected_dur, probe_err = _probe_expected_duration_s(p)
-            if probe_err is not None:
-                return False, f"{p}: {probe_err}"
-            if expected_dur is not None and expected_dur > 0:
-                decoded_s = _parse_ffmpeg_out_time_s(getattr(r, "stdout", "") or "")
-                if decoded_s is not None:
-                    tol = max(0.25, min(10.0, expected_dur * 0.05))
-                    if decoded_s <= 0 or (expected_dur - decoded_s) > tol:
-                        return (
-                            False,
-                            f"{p}: truncated stream (decoded {decoded_s:.2f}s of "
-                            f"{expected_dur:.2f}s container duration)",
-                        )
+    path_list = list(paths)
+    if not path_list:
+        return True, ""
+    if len(path_list) == 1:
+        return _verify_single(path_list[0])
+    max_workers = min(len(path_list), max(2, min(6, (os.cpu_count() or 4) // 2)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_verify_single, path_list))
+    for ok, err in results:
+        if not ok:
+            return False, err
     return True, ""
 
 
@@ -511,11 +538,14 @@ def _run_finalize(
     on_complete=None,
     on_failure=None,
     on_file_committed=None,
+    on_verified=None,
 ) -> bool:
     """Verify staged files before publish, execute resumable NAS moves, clean staging, receipt, commit, and subocr."""
     staging = result.get("staging")
     jobs = result.get("move_jobs") or []
     files = list(result.get("files", []))
+    preverify_futures = result.pop("_preverify_futures", None)
+    preverify_pool = result.pop("_preverify_pool", None)
     allow_movie_overwrite = bool(
         getattr(args, "overwrite", False) and getattr(item, "type", None) == "movie"
     )
@@ -574,12 +604,50 @@ def _run_finalize(
                     raise
                 return False
 
+            # Join any pipelined pre-verify futures started during multi-title ripping.
+            preverified: dict[str, tuple[int, int, bool, str]] = dict(
+                result.get("preverified") or {}
+            )
+            if preverify_futures:
+                for p_str, (snap_sz, snap_mtime, fut) in preverify_futures.items():
+                    try:
+                        p_ok, p_err = fut.result()
+                    except Exception as exc:
+                        p_ok, p_err = False, f"{p_str}: pre-verify error: {exc}"
+                    preverified[p_str] = (
+                        snap_sz,
+                        snap_mtime,
+                        bool(p_ok),
+                        str(p_err or ""),
+                    )
+                result["preverified"] = preverified
+
             # Pre-publish verification: decode-verify staged files BEFORE moving any bytes
             # into the live library so corrupt/truncated rips never become visible at final
             # filenames and staged sources stay 100% intact on failure.
             if getattr(args, "verify", False) and pending_indices:
                 staged_sources = [str(Path(unpacked_jobs[i][0])) for i in pending_indices]
-                ok_pre, err_pre = verify(staged_sources)
+                ok_pre, err_pre = True, ""
+                remaining_to_verify: list[str] = []
+                for src_s in staged_sources:
+                    cached = preverified.get(src_s)
+                    if cached is not None:
+                        c_size, c_mtime, c_ok, c_err = cached
+                        try:
+                            st = os.stat(src_s)
+                            stat_matches = (
+                                st.st_size == c_size and st.st_mtime_ns == c_mtime
+                            )
+                        except OSError:
+                            stat_matches = False
+                        if stat_matches:
+                            if not c_ok:
+                                ok_pre, err_pre = False, c_err
+                                break
+                            continue
+                    remaining_to_verify.append(src_s)
+                if ok_pre and remaining_to_verify:
+                    ok_pre, err_pre = verify(remaining_to_verify)
                 if not ok_pre:
                     verified = False
                     _cleanup_owned_claims([unpacked_jobs[i] for i in pending_indices])
@@ -595,6 +663,11 @@ def _run_finalize(
                     beep(args, ok=False)
                     _report_failure(err_msg)
                     return False
+                if on_verified is not None:
+                    try:
+                        on_verified()
+                    except Exception:
+                        pass
 
             done_pending_pos = 0
             try:
@@ -734,6 +807,11 @@ def _run_finalize(
                 beep(args, ok=False)
                 _report_failure(err_msg)
         if verified:
+            if not jobs and getattr(args, "verify", False) and on_verified is not None:
+                try:
+                    on_verified()
+                except Exception:
+                    pass
             if staging:
                 shutil.rmtree(staging, ignore_errors=True)
             fingerprint = result.get("disc_fingerprint")
@@ -807,6 +885,9 @@ def _run_finalize(
             pass
         _report_failure(err_msg)
         return False
+    finally:
+        if preverify_pool is not None:
+            preverify_pool.shutdown(wait=True)
 
 
 def start_background_finalize(
@@ -818,6 +899,7 @@ def start_background_finalize(
     on_complete=None,
     on_failure=None,
     on_file_committed=None,
+    on_verified=None,
 ) -> None:
     t = threading.Thread(
         target=_run_finalize,
@@ -826,6 +908,7 @@ def start_background_finalize(
             "on_complete": on_complete,
             "on_failure": on_failure,
             "on_file_committed": on_file_committed,
+            "on_verified": on_verified,
         },
         daemon=False,
     )
@@ -892,6 +975,30 @@ def rip(
 ):
     """Rip one disc to local staging, optionally falling back to mkvmerge for
     unencrypted BDs on MakeMKV failure, then publish safely to NAS."""
+    preverify_holder: dict = {"pool": None, "transferred": False}
+    try:
+        ok, payload = _rip_impl(
+            args, item, info, title_ids, target_dir, state, disc_n, preverify_holder
+        )
+        if not ok:
+            clear_tv_slot_reservation(os.getpid())
+        return ok, payload
+    finally:
+        pool = preverify_holder.get("pool")
+        if pool is not None and not preverify_holder.get("transferred"):
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _rip_impl(
+    args,
+    item: QueueItem,
+    info: dict,
+    title_ids: list[int],
+    target_dir: Path,
+    state: dict,
+    disc_n: int,
+    preverify_holder: dict,
+):
     if item.type == "tv-season" and getattr(args, "overwrite", False):
         return False, "--overwrite is forbidden for TV in every mode"
 
@@ -955,11 +1062,13 @@ def rip(
 
     LOCAL_STAGING_BASE.mkdir(parents=True, exist_ok=True)
     local_free_gb = shutil.disk_usage(LOCAL_STAGING_BASE).free / 1e9
+    skip_extras = bool(getattr(args, "no_extras", False))
     local_need, selected_gb, legacy_space_fallback = staging_space_requirement(
         item,
         info,
         title_ids,
         split_playall=not getattr(args, "no_split_playall", False),
+        skip_extras=skip_extras,
     )
     active_other_rips = 0
     try:
@@ -1008,11 +1117,36 @@ def rip(
 
     if item.type == "movie" and len(title_ids) != 1:
         return False, f"movie rip expects 1 title, got {title_ids}"
-    selectors, skipped_play_all = planned_rip_selectors(item, info, title_ids)
+    selectors, skipped_play_all = planned_rip_selectors(
+        item, info, title_ids, skip_extras=skip_extras
+    )
+    if (
+        item.type == "tv-season"
+        and item.season
+        and title_ids
+        and not getattr(args, "rerip_review", False)
+    ):
+        _res_start = (
+            int(item.episode_start)
+            if item.episode_start and int(item.episode_start) > 0
+            else (scan_season_highest_episode(target_dir, int(item.season)) + 1)
+        )
+        write_tv_slot_reservation(
+            pid=os.getpid(),
+            title=item.title,
+            season=int(item.season),
+            target_root=str(item.target_root or target_dir.parent),
+            episode_start=_res_start,
+            episode_count=len(title_ids),
+        )
     if skipped_play_all:
         print(
             f"{C.D}  skipping play-all duplicate title(s) {sorted(skipped_play_all)}; "
             f"ripping {len(selectors)} title(s) directly{C.R}"
+        )
+    elif skip_extras and item.type == "tv-season" and selectors != ["all"]:
+        print(
+            f"{C.D}  --no-extras: ripping {len(selectors)} episode title(s) directly{C.R}"
         )
 
     print(f"{C.D}  staging: {staging}{C.R}")
@@ -1021,8 +1155,45 @@ def rip(
     fail_reason = None
     multi_sel = len(selectors) > 1
 
+    do_preverify = bool(getattr(args, "verify", False)) and multi_sel
+    preverify_pool: concurrent.futures.ThreadPoolExecutor | None = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) if do_preverify else None
+    )
+    preverify_holder["pool"] = preverify_pool
+    preverify_futures: dict[str, tuple[int, int, concurrent.futures.Future]] = {}
+    seen_staged_mkvs: set[Path] = set()
+
+    def _preverify_one(path_str: str) -> tuple[bool, str]:
+        return verify([path_str])
+
+    def _attach_preverify(target_payload: dict) -> None:
+        if not preverify_futures:
+            return
+        completed: dict[str, tuple[int, int, bool, str]] = {}
+        pending_futs: dict[str, tuple[int, int, concurrent.futures.Future]] = {}
+        for p_str, (snap_sz, snap_mtime, fut) in preverify_futures.items():
+            if fut.done():
+                try:
+                    p_ok, p_err = fut.result()
+                except Exception as exc:
+                    p_ok, p_err = False, f"{p_str}: pre-verify error: {exc}"
+                completed[p_str] = (
+                    snap_sz,
+                    snap_mtime,
+                    bool(p_ok),
+                    str(p_err or ""),
+                )
+            else:
+                pending_futs[p_str] = (snap_sz, snap_mtime, fut)
+        target_payload["preverified"] = completed
+        if pending_futs and preverify_pool is not None:
+            target_payload["_preverify_futures"] = pending_futs
+            target_payload["_preverify_pool"] = preverify_pool
+            preverify_holder["transferred"] = True
+
     for sel_idx, selector in enumerate(selectors, 1):
         sel_start = time.time()
+        resolved_device = resolve_makemkv_device(args)
         cmd = [
             args.makemkvcon,
             "-r",
@@ -1031,7 +1202,7 @@ def rip(
             "--cache=1024",
             f"--minlength={EXTRAS_MIN_DUR_S}",
             "mkv",
-            args.device,
+            resolved_device,
             selector,
             str(staging),
         ]
@@ -1179,6 +1350,17 @@ def rip(
                     )
         if fail_reason is not None:
             break
+        if preverify_pool is not None:
+            for new_mkv in sorted(staging.glob("*.mkv")):
+                if new_mkv in seen_staged_mkvs:
+                    continue
+                seen_staged_mkvs.add(new_mkv)
+                try:
+                    st = new_mkv.stat()
+                except OSError:
+                    continue
+                fut = preverify_pool.submit(_preverify_one, str(new_mkv))
+                preverify_futures[str(new_mkv)] = (st.st_size, st.st_mtime_ns, fut)
 
     elapsed = time.time() - start
     used_fallback = False
@@ -1849,6 +2031,7 @@ def rip(
                 return True, early_payload
             early_payload["move_jobs"] = move_jobs
             early_payload["staging"] = str(staging)
+            _attach_preverify(early_payload)
             return True, early_payload
 
         with season_dir_lock(target_dir, what="rename"):
@@ -2005,6 +2188,7 @@ def rip(
         return True, payload
     payload["move_jobs"] = move_jobs
     payload["staging"] = str(staging)
+    _attach_preverify(payload)
     return True, payload
 
 

@@ -189,22 +189,28 @@ show_usage() {
 burndvd — smart single-disc wrapper around burndvd-queue / ripqueue.py
 
 Usage:
-  burndvd                         Detect inserted disc, confirm 1-3 prompts, and rip detached
+  burndvd [OPTS...]               Detect inserted disc, confirm 1-3 prompts, and rip detached
+  burndvd --drive <diskN|serial>  Target a specific optical drive by device node or serial
+  burndvd --no-extras             Skip ripping TV bonus/extra titles shorter than TV_MIN_DUR_S
   burndvd --rerip-review          Capture a known TV disc into isolated out-of-library review
   burndvd --queue FILE [OPTS...]  Pass-through to burndvd-queue for multi-disc CSV queues
   burndvd doctor [--json]         Check binaries, optical drive, NAS mounts, space, and OCR
   burndvd -h | --help             Show this help message and exit without probing optical drives
 
 Options:
+  --drive <diskN|serial>          Target a specific physical drive (e.g. disk5 or DRVSER00001)
+  --no-extras                     Skip bonus/extra titles shorter than TV_MIN_DUR_S on TV discs
   --rerip-review                  Route a known TV disc to review quarantine (published SxxExx unchanged)
   --queue FILE [OPTS...]          Run multi-disc CSV queue via burndvd-queue (accepts burndvd-queue flags
                                   such as --non-interactive, --on-fail, --verify, --device, --no-eject,
-                                  --no-subocr, --sync-move, --overwrite)
+                                  --no-subocr, --no-extras, --sync-move, --overwrite)
   -h, --help                      Print this usage summary and exit 0
 
 Environment variables:
   BURNDVD_DRUTIL_DRIVE            1-based drutil -drive index exported to burndvd-queue
   BURNDVD_DRIVE_DEVICE            Verified /dev/diskN device node exported to burndvd-queue
+  BURNDVD_DRIVE_SERIAL            Verified optical drive hardware serial exported to burndvd-queue
+  BURNDVD_NO_EXTRAS               Set to 1 to skip TV bonus/extra titles by default
   BURNDVD_MEDIA_ROOT              SMB media library root (default: /Volumes/Media)
   BURNDVD_NFS_MEDIA_ROOT          NFS media library root (default: /private/nas/media)
   BURNDVD_LOG_DIR                 Log directory (default: ~/logs)
@@ -257,11 +263,51 @@ if [ "$HAS_QUEUE_ARG" = "0" ]; then
 fi
 
 TV_OUTPUT_MODE="normal"
+TARGET_DRIVE=""
 RIPQUEUE_MODE_ARGS=()
-if [ "${1:-}" = "--rerip-review" ]; then
-    TV_OUTPUT_MODE="review"
-    append_ripqueue_mode_arg_once "--rerip-review"
-    shift
+case "${BURNDVD_NO_EXTRAS:-}" in
+    1|true|TRUE|yes|YES) append_ripqueue_mode_arg_once "--no-extras" ;;
+esac
+if [ "$HAS_QUEUE_ARG" = "1" ]; then
+    if [ "${1:-}" = "--rerip-review" ]; then
+        TV_OUTPUT_MODE="review"
+        append_ripqueue_mode_arg_once "--rerip-review"
+        shift
+    fi
+else
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --rerip-review)
+                TV_OUTPUT_MODE="review"
+                append_ripqueue_mode_arg_once "--rerip-review"
+                shift
+                ;;
+            --no-extras)
+                append_ripqueue_mode_arg_once "--no-extras"
+                shift
+                ;;
+            --drive)
+                if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+                    echo "burndvd: --drive requires a device (diskN) or drive serial." >&2
+                    exit 64
+                fi
+                TARGET_DRIVE="$2"
+                shift 2
+                ;;
+            --drive=*)
+                TARGET_DRIVE="${1#--drive=}"
+                if [ -z "$TARGET_DRIVE" ]; then
+                    echo "burndvd: --drive requires a device (diskN) or drive serial." >&2
+                    exit 64
+                fi
+                shift
+                ;;
+            *)
+                echo "burndvd: unknown option '$1' (use --help for usage)." >&2
+                exit 64
+                ;;
+        esac
+    done
 fi
 
 mkdir -p "$LOG_DIR"
@@ -287,7 +333,7 @@ sweep_burndvd_orphans() {
     local claim_dir="$HOME/.cache/burndvd/drive-claims"
     if [ -d "$claim_dir" ]; then
         local claim_pid
-        for claim in "$claim_dir"/disc-*.claim; do
+        for claim in "$claim_dir"/serial-*.claim "$claim_dir"/dev-*.claim "$claim_dir"/disc-*.claim; do
             [ -d "$claim" ] || continue
             claim_pid=$(cat "$claim/pid" 2>/dev/null || true)
             if [ -n "$claim_pid" ] && [[ "$claim_pid" =~ ^[0-9]+$ ]] && kill -0 "$claim_pid" 2>/dev/null; then
@@ -349,30 +395,62 @@ append_rip_summary() {
 }
 
 warn_concurrent_rip() {
-    local title="$1" season="$2"
-    local pid state_file
+    local title="$1" season="$2" target_root="${3:-}"
+    local pid cmdline state_file queue_file
     for pid in $(pgrep -if "python.*(ripqueue\.py|burndvd-queue)" 2>/dev/null || true); do
         [ "$pid" = "$$" ] && continue
-        state_file=$( (ps -o args= -p "$pid" 2>/dev/null \
-            | grep -oE -- "--state [^ ]+" | awk '{print $2}' | tr -d "'\"") || true )
-        [ -z "$state_file" ] && continue
-        [ -f "$state_file" ] || continue
-        if python3 - "$state_file" "$title" "$season" >/dev/null 2>&1 <<'PY'
-import json, sys
-sp, t, s = sys.argv[1:]
-try:
-    d = json.load(open(sp))
-except Exception:
-    sys.exit(1)
-for q in d.get("queue", []):
-    if q.get("title") == t and str(q.get("season")) == s:
+        cmdline=$(ps -o args= -p "$pid" 2>/dev/null || true)
+        [ -z "$cmdline" ] && continue
+        state_file=$(printf '%s\n' "$cmdline" \
+            | grep -oE -- "--state [^ ]+" | awk '{print $2}' | tr -d "'\"" || true)
+        queue_file=$(printf '%s\n' "$cmdline" \
+            | grep -oE -- "--queue [^ ]+" | awk '{print $2}' | tr -d "'\"" || true)
+        if python3 - "${state_file:-}" "${queue_file:-}" "$title" "$season" "$target_root" "$MEDIA_SMB_ROOT" "$MEDIA_NFS_ROOT" >/dev/null 2>&1 <<'PY'
+import csv, json, os, sys
+sp, qp, title, season, root, smb, nfs = sys.argv[1:8]
+
+def norm_root(p):
+    p = os.path.normpath((p or "").strip())
+    if not p or p == ".":
+        return ""
+    for pref in (smb.rstrip("/"), nfs.rstrip("/")):
+        if pref and (p == pref or p.startswith(pref + "/")):
+            return "<MEDIA>" + p[len(pref):]
+    return p
+
+want_title = (title or "").strip().casefold()
+want_season = str(int(season)) if (season or "").isdigit() else (season or "").strip()
+want_root = norm_root(root)
+
+rows = []
+if sp and os.path.isfile(sp):
+    try:
+        d = json.load(open(sp, encoding="utf-8"))
+        rows.extend(d.get("queue") or [])
+    except Exception:
+        pass
+if not rows and qp and os.path.isfile(qp):
+    try:
+        with open(qp, encoding="utf-8", newline="") as fh:
+            rows.extend(csv.DictReader(fh))
+    except Exception:
+        pass
+
+for q in rows:
+    qt = str(q.get("title") or "").strip().casefold()
+    qs_raw = str(q.get("season") or "").strip()
+    qs = str(int(qs_raw)) if qs_raw.isdigit() else qs_raw
+    qr = norm_root(str(q.get("target_root") or ""))
+    if want_root and qr and qr == want_root:
+        sys.exit(0)
+    if want_title and qt == want_title and (not want_season or not qs or qs == want_season):
         sys.exit(0)
 sys.exit(1)
 PY
         then
-            echo "  Note: another burndvd is ripping $title S$season (pid $pid)."
-            echo "  The physical-disc contract remains authoritative; ripqueue will"
-            echo "  serialize and isolate an occupied episode range as review output."
+            printf '\033[33mWARNING: another burndvd/ripqueue (pid %s) is already ripping %s (S%02d).\033[0m\n' \
+                "$pid" "$title" "$((10#$season))"
+            printf '\033[33m  Set an explicit non-overlapping Episode start for Disc 2+ so both drives do not target the same episode slots.\033[0m\n'
             return 0
         fi
     done
@@ -393,48 +471,185 @@ mkdir -p "$DRIVE_CLAIM_DIR"
 DEVICE=""
 DISC_INDEX=""
 DRUTIL_INDEX=""
+DRIVE_SERIAL=""
 DISC_TYPE=""
+
+MAKEMKVCON_BIN=""
+if [ -n "${BURNDVD_MAKEMKVCON:-}" ]; then
+    [ -x "$BURNDVD_MAKEMKVCON" ] && MAKEMKVCON_BIN="$BURNDVD_MAKEMKVCON"
+elif command -v makemkvcon >/dev/null 2>&1; then
+    MAKEMKVCON_BIN=$(command -v makemkvcon)
+elif [ "$(command -v drutil 2>/dev/null || true)" = "/usr/bin/drutil" ] \
+    && [ -x "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon" ]; then
+    MAKEMKVCON_BIN="/Applications/MakeMKV.app/Contents/MacOS/makemkvcon"
+fi
+
+claim_is_active() {
+    local cdir="$1" claim_pid claim_state
+    [ -d "$cdir" ] || return 1
+    claim_pid=$(cat "$cdir/pid" 2>/dev/null || true)
+    if [ -n "$claim_pid" ] && [[ "$claim_pid" =~ ^[0-9]+$ ]] && kill -0 "$claim_pid" 2>/dev/null; then
+        return 0
+    fi
+    claim_state=$(cat "$cdir/state" 2>/dev/null || true)
+    if [ -n "$claim_state" ] && pgrep -if "python.*(ripqueue\.py|burndvd-queue).*$claim_state" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 BUSY_DEVS=$( { for p in $(pgrep -f makemkvcon 2>/dev/null || true); do lsof -p "$p" 2>/dev/null | grep -oE '/dev/r?disk[0-9]+' || true; done | grep -oE 'disk[0-9]+' | sort -u; } || true )
-SORTED_NUMS=$( { drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]' | while read -r _l; do _ix=$(printf '%s\n' "$_l" | awk '{print $1}'); _inf=$(drutil status -drive "$_ix" 2>/dev/null || true); printf '%s' "$_inf" | grep -q "No Media Inserted" && continue; printf '%s' "$_inf" | sed -n 's|.*Name: */dev/disk\([0-9]*\).*|\1|p' | head -1; done | sort -n; } || true )
-while read -r line; do
-    idx=$(printf '%s\n' "$line" | awk '/^[[:space:]]*[0-9]+/ {print $1}')
-    [ -z "$idx" ] && continue
-    info=$(drutil status -drive "$idx" 2>/dev/null) || continue
-    printf '%s' "$info" | grep -q "No Media Inserted" && continue
-    dev=$(printf '%s' "$info" | sed -n 's|.*Name: */dev/\(disk[0-9]*\).*|\1|p' | head -1)
-    [ -z "$dev" ] && continue
-    dnum=$(printf '%s' "$dev" | grep -oE '[0-9]+' || true)
-    [ -z "$dnum" ] && continue
-    discN=$(printf '%s\n' "$SORTED_NUMS" | grep -nxF "$dnum" | head -1 | cut -d: -f1 || true); discN=$(( ${discN:-1} - 1 ))
-    if printf '%s\n' "$BUSY_DEVS" | grep -qx "$dev"; then
+
+ENUM_ROWS=$(python3 - "${MAKEMKVCON_BIN:-}" <<'PY'
+import re, subprocess, sys
+
+mkv_bin = (sys.argv[1] or "").strip()
+
+def parse_drv_line(line):
+    if ":" not in line:
+        return None
+    tag, rest = line.split(":", 1)
+    if tag != "DRV":
+        return None
+    out, cur, in_q, i = [], "", False, 0
+    while i < len(rest):
+        c = rest[i]
+        if c == '"':
+            if in_q and i + 1 < len(rest) and rest[i + 1] == '"':
+                cur += '"'
+                i += 2
+                continue
+            in_q = not in_q
+        elif c == "," and not in_q:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    out.append(cur)
+    if len(out) < 7:
+        return None
+    try:
+        idx = int(out[0])
+        state = int(out[1])
+    except ValueError:
+        return None
+    desc = out[4].strip()
+    vol = out[5].strip()
+    raw_dev = out[6].strip()
+    m = re.match(r"^(?:/dev/)?r?(disk\d+)$", raw_dev)
+    dev = m.group(1) if m else ""
+    toks = desc.split()
+    last_tok = toks[-1] if toks else ""
+    serial = last_tok if (len(last_tok) >= 6 and last_tok.isalnum()) else ""
+    return (idx, state, desc, serial, vol, dev)
+
+drutil_by_dev = {}
+drutil_loaded = []
+try:
+    dl = subprocess.run(["drutil", "list"], capture_output=True, text=True, timeout=10)
+    for line in (dl.stdout or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s+\S", line)
+        if not m:
+            continue
+        ix = m.group(1)
+        try:
+            st = subprocess.run(["drutil", "status", "-drive", ix], capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
+        out = st.stdout or ""
+        if "No Media Inserted" in out:
+            continue
+        dm = re.search(r"Name:\s*/dev/(disk\d+)", out)
+        if not dm:
+            continue
+        dev = dm.group(1)
+        tm = re.search(r"Type:\s*(\S+)", out)
+        dtype = tm.group(1) if tm else ""
+        drutil_by_dev[dev] = (ix, dtype)
+        dnum = int(dev[4:])
+        drutil_loaded.append((dnum, int(ix), dev, ix, dtype))
+except Exception:
+    pass
+
+mkv_rows = []
+if mkv_bin:
+    try:
+        r = subprocess.run([mkv_bin, "-r", "info", "list"], capture_output=True, text=True, timeout=15)
+        for line in (r.stdout or "").splitlines():
+            parsed = parse_drv_line(line.strip())
+            if not parsed:
+                continue
+            idx, state, desc, serial, vol, dev = parsed
+            if state == 2 and dev:
+                ix, dtype = drutil_by_dev.get(dev, (str(idx + 1), ""))
+                mkv_rows.append((dev, str(idx), ix, serial, dtype, vol))
+    except Exception:
+        pass
+
+SEP = "\x1f"
+if mkv_rows:
+    for row in mkv_rows:
+        print(SEP.join(field.replace(SEP, " ") for field in row))
+else:
+    drutil_loaded.sort(key=lambda item: (item[0], item[1]))
+    for rank, (_, _, dev, ix, dtype) in enumerate(drutil_loaded):
+        print(SEP.join((dev, str(rank), ix, "", dtype, "")))
+PY
+)
+
+AVAIL_DEVS=()
+AVAIL_DISCS=()
+AVAIL_DRUTILS=()
+AVAIL_SERIALS=()
+AVAIL_TYPES=()
+AVAIL_VOLS=()
+TARGET_FOUND=0
+TARGET_BUSY=0
+TARGET_NORM_DEV="${TARGET_DRIVE#/dev/}"
+TARGET_NORM_DEV="${TARGET_NORM_DEV#r}"
+TARGET_UPPER=$(printf '%s' "$TARGET_DRIVE" | tr '[:lower:]' '[:upper:]')
+
+while IFS=$'\x1f' read -r _dev _discN _drutilIx _serial _dtype _vol; do
+    [ -z "$_dev" ] && continue
+    _serial_upper=$(printf '%s' "$_serial" | tr '[:lower:]' '[:upper:]')
+    if [ -n "$TARGET_DRIVE" ]; then
+        if [ "$_dev" != "$TARGET_NORM_DEV" ] && { [ -z "$_serial_upper" ] || [ "$_serial_upper" != "$TARGET_UPPER" ]; }; then
+            continue
+        fi
+        TARGET_FOUND=1
+    fi
+    _is_busy=0
+    if printf '%s\n' "$BUSY_DEVS" | grep -qx "$_dev"; then
+        _is_busy=1
+    fi
+    if [ "$_is_busy" = "0" ] && [ -n "$_serial" ] && claim_is_active "$DRIVE_CLAIM_DIR/serial-${_serial}.claim"; then
+        _is_busy=1
+    fi
+    if [ "$_is_busy" = "0" ] && claim_is_active "$DRIVE_CLAIM_DIR/dev-${_dev}.claim"; then
+        _is_busy=1
+    fi
+    if [ "$_is_busy" = "1" ]; then
+        [ -n "$TARGET_DRIVE" ] && TARGET_BUSY=1
         continue
     fi
-    drive_claim="$DRIVE_CLAIM_DIR/disc-$discN.claim"
-    if ! mkdir "$drive_claim" 2>/dev/null; then
-        claim_pid=$(cat "$drive_claim/pid" 2>/dev/null || true)
-        claim_state=$(cat "$drive_claim/state" 2>/dev/null || true)
-        if [ -n "$claim_pid" ] && [[ "$claim_pid" =~ ^[0-9]+$ ]] && kill -0 "$claim_pid" 2>/dev/null; then
-            continue
-        fi
-        if [ -n "$claim_state" ] && pgrep -if "python.*(ripqueue\.py|burndvd-queue).*$claim_state" >/dev/null 2>&1; then
-            continue
-        fi
-        rm -rf "$drive_claim" 2>/dev/null || true
-        if ! mkdir "$drive_claim" 2>/dev/null; then
-            continue
-        fi
-    fi
-    DRIVE_CLAIM_HELD="$drive_claim"
-    echo "$$" > "$DRIVE_CLAIM_HELD/pid" 2>/dev/null || true
-    echo "$STATE" > "$DRIVE_CLAIM_HELD/state" 2>/dev/null || true
-    DEVICE="$dev"
-    DISC_INDEX="$discN"
-    DRUTIL_INDEX="$idx"
-    DISC_TYPE=$(printf '%s' "$info" | awk '/Type:/ {print $2; exit}')
-    break
-done < <(drutil list 2>/dev/null | grep -E '^[[:space:]]*[0-9]+[[:space:]]' || true)
+    AVAIL_DEVS+=("$_dev")
+    AVAIL_DISCS+=("$_discN")
+    AVAIL_DRUTILS+=("$_drutilIx")
+    AVAIL_SERIALS+=("$_serial")
+    AVAIL_TYPES+=("$_dtype")
+    AVAIL_VOLS+=("$_vol")
+done <<< "$ENUM_ROWS"
 
-if [ -z "$DEVICE" ]; then
+if [ "${#AVAIL_DEVS[@]}" -eq 0 ]; then
+    if [ -n "$TARGET_DRIVE" ]; then
+        if [ "$TARGET_BUSY" = "1" ]; then
+            echo "burndvd: requested drive '$TARGET_DRIVE' is busy ripping." >&2
+        else
+            echo "burndvd: requested drive '$TARGET_DRIVE' not found or has no disc inserted." >&2
+        fi
+        exit 1
+    fi
     n_drives=$( (drutil list 2>/dev/null | grep -cE '^[[:space:]]*[0-9]+[[:space:]]') || true )
     n_drives="${n_drives:-0}"
     if [ "$n_drives" -eq 0 ]; then
@@ -446,8 +661,64 @@ if [ -z "$DEVICE" ]; then
     exit 1
 fi
 
+CHOSEN_I=0
+if [ "${#AVAIL_DEVS[@]}" -ge 2 ]; then
+    echo "Multiple drives have discs inserted:"
+    for _mi in "${!AVAIL_DEVS[@]}"; do
+        _mdev="${AVAIL_DEVS[$_mi]}"
+        _mser="${AVAIL_SERIALS[$_mi]}"
+        _mvol="${AVAIL_VOLS[$_mi]}"
+        if [ -z "$_mvol" ]; then
+            _mvol=$( (diskutil info "/dev/$_mdev" 2>/dev/null \
+                | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}') || true )
+        fi
+        if [ -n "$_mser" ]; then
+            printf '  [%d] /dev/%s (%s) — %s\n' "$((_mi + 1))" "$_mdev" "$_mser" "${_mvol:-(unknown)}"
+        else
+            printf '  [%d] /dev/%s (disc:%s) — %s\n' "$((_mi + 1))" "$_mdev" "${AVAIL_DISCS[$_mi]}" "${_mvol:-(unknown)}"
+        fi
+    done
+    prompt_value DRIVE_CHOICE "Select drive [1-${#AVAIL_DEVS[@]}] (default 1): " "1" 1
+    if ! [[ "$DRIVE_CHOICE" =~ ^[0-9]+$ ]] || [ "$DRIVE_CHOICE" -lt 1 ] || [ "$DRIVE_CHOICE" -gt "${#AVAIL_DEVS[@]}" ]; then
+        echo "burndvd: invalid drive selection '$DRIVE_CHOICE'." >&2
+        exit 64
+    fi
+    CHOSEN_I=$((DRIVE_CHOICE - 1))
+fi
+
+dev="${AVAIL_DEVS[$CHOSEN_I]}"
+discN="${AVAIL_DISCS[$CHOSEN_I]}"
+idx="${AVAIL_DRUTILS[$CHOSEN_I]}"
+serial="${AVAIL_SERIALS[$CHOSEN_I]}"
+dtype="${AVAIL_TYPES[$CHOSEN_I]}"
+if [ -n "$serial" ]; then
+    drive_claim="$DRIVE_CLAIM_DIR/serial-${serial}.claim"
+else
+    drive_claim="$DRIVE_CLAIM_DIR/dev-${dev}.claim"
+fi
+if ! mkdir "$drive_claim" 2>/dev/null; then
+    if claim_is_active "$drive_claim"; then
+        echo "burndvd: drive /dev/$dev was just claimed by another burndvd process." >&2
+        exit 1
+    fi
+    rm -rf "$drive_claim" 2>/dev/null || true
+    if ! mkdir "$drive_claim" 2>/dev/null; then
+        echo "burndvd: could not claim drive /dev/$dev." >&2
+        exit 1
+    fi
+fi
+DRIVE_CLAIM_HELD="$drive_claim"
+echo "$$" > "$DRIVE_CLAIM_HELD/pid" 2>/dev/null || true
+echo "$STATE" > "$DRIVE_CLAIM_HELD/state" 2>/dev/null || true
+DEVICE="$dev"
+DISC_INDEX="$discN"
+DRUTIL_INDEX="$idx"
+DRIVE_SERIAL="$serial"
+DISC_TYPE="$dtype"
+
 export BURNDVD_DRUTIL_DRIVE="$DRUTIL_INDEX"
 export BURNDVD_DRIVE_DEVICE="/dev/$DEVICE"
+export BURNDVD_DRIVE_SERIAL="$DRIVE_SERIAL"
 
 VOLUME=$( (diskutil info "/dev/$DEVICE" 2>/dev/null \
     | awk -F: '/Volume Name/ {sub(/^[[:space:]]+/, "", $2); print $2; exit}') || true )
@@ -536,7 +807,6 @@ case "$TYPE" in
             BD|DVD) ROOT="$NAS_ROOT/TV Shows/$TITLE" ;;
             *) echo "burndvd: unknown format '$FORMAT' (4K/BD/DVD)." >&2; exit 1 ;;
         esac
-        warn_concurrent_rip "$TITLE" "$SEASON"
         SEASON_DIR="$ROOT/Season $(printf '%02d' "$SEASON")"
         CONTRACT_JSON=$(run_metadata episode-contract \
             --title "$TITLE" --season "$SEASON" --volume "$VOLUME" 2>/dev/null || true)
@@ -569,7 +839,33 @@ print(d["episode_start"], d["expected_disc_episodes"], d["expected_episodes"], d
         else
             DEFAULT_EP=1
             SCAN_SEASON_DIR=$(resolve_nas_dir "$SEASON_DIR")
-            if [ -d "$SCAN_SEASON_DIR" ]; then
+            WAIT_SCAN_S=0
+            [ -t 0 ] && WAIT_SCAN_S=120
+            NEXT_EP_JSON=$(run_metadata next-episode \
+                --title "$TITLE" \
+                --season "$SEASON" \
+                --target-root "$ROOT" \
+                --season-dir "$SCAN_SEASON_DIR" \
+                --media-smb-root "$MEDIA_SMB_ROOT" \
+                --media-nfs-root "$MEDIA_NFS_ROOT" \
+                --wait-scan-s "$WAIT_SCAN_S" || true)
+            if [ -n "$NEXT_EP_JSON" ]; then
+                IFS=$'\t' read -r DEFAULT_EP AUTO_EP_NOTE < <(printf '%s' "$NEXT_EP_JSON" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+ne=int(d.get("next_episode") or 1)
+nh=int(d.get("nas_highest") or 0)
+res=d.get("reservations") or []
+parts=[]
+if nh > 0:
+    parts.append(f"NAS ends at E{nh:02d}")
+for r in res:
+    parts.append("active rip pid %s reserving %s ep(s): E%02d-E%02d" % (r["pid"], r["episode_count"], r["episode_start"], r["episode_end"]))
+note = " + ".join(parts) if res else ""
+print(f"{ne}\t{note}")' 2>/dev/null || printf '1\t\n')
+                if [ -n "${AUTO_EP_NOTE:-}" ]; then
+                    printf '\033[32mAuto episode start: %s (%s)\033[0m\n' "$DEFAULT_EP" "$AUTO_EP_NOTE"
+                fi
+            elif [ -d "$SCAN_SEASON_DIR" ]; then
                 HIGHEST_EP=$( (find "$SCAN_SEASON_DIR" -maxdepth 1 -type f -size +0 \
                     -name '*.mkv' -print 2>/dev/null \
                     | grep -oE "S0*${SEASON}E[0-9]+" \
@@ -581,6 +877,7 @@ print(d["episode_start"], d["expected_disc_episodes"], d["expected_episodes"], d
             fi
         fi
 
+        warn_concurrent_rip "$TITLE" "$SEASON" "$ROOT"
         prompt_value EP_START "Episode start [$DEFAULT_EP]: " "$DEFAULT_EP" 1
         if [ "$CONTRACT_RECOGNIZED" = "1" ] && [ "$EP_START" != "$DEFAULT_EP" ]; then
             echo "burndvd: episode start is contract-bound to $DEFAULT_EP; refusing $EP_START." >&2
@@ -685,6 +982,7 @@ echo "Log:    $LOG"
 echo
 
 BURNDVD_DRUTIL_DRIVE="$DRUTIL_INDEX" BURNDVD_DRIVE_DEVICE="/dev/$DEVICE" \
+    BURNDVD_DRIVE_SERIAL="$DRIVE_SERIAL" \
     nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
     caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
     --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry --verify \

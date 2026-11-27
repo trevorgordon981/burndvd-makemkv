@@ -136,6 +136,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="keep a play-all-only disc as one file instead of cutting on chapters",
     )
     ap.add_argument(
+        "--no-extras",
+        action="store_true",
+        default=(
+            os.environ.get("BURNDVD_NO_EXTRAS", "").strip().lower()
+            in ("1", "true", "yes")
+        ),
+        help="skip ripping bonus/extra titles shorter than TV_MIN_DUR_S on TV discs",
+    )
+    ap.add_argument(
         "--allow-mkvmerge-fallback",
         dest="allow_mkvmerge_fallback",
         action="store_true",
@@ -305,6 +314,7 @@ def main() -> None:
     _FINALIZE_THREADS.clear()
     pending_final_summary: list[tuple[str, int, float, list[str]]] = []
     needs_final_eject = False
+    early_ejected = threading.Event()
 
     while state["current_index"] < len(state["queue"]):
         if _initial_drive_idx is not None:
@@ -818,6 +828,14 @@ def main() -> None:
                 f"{C.D}Staged in {fmt_dur(result['elapsed_s'])}; "
                 f"finalizing to NAS...{C.R}"
             )
+            on_verified_cb = None
+            if not has_more_items and not args.sync_move and not args.no_eject:
+                def _on_verified_eject() -> None:
+                    if not early_ejected.is_set():
+                        early_ejected.set()
+                        eject(args)
+
+                on_verified_cb = _on_verified_eject
             start_background_finalize(
                 disc_args,
                 result,
@@ -826,6 +844,7 @@ def main() -> None:
                 on_complete=on_complete_cb,
                 on_failure=on_failure_cb,
                 on_file_committed=on_file_committed_cb,
+                on_verified=on_verified_cb,
             )
             pending_final_summary.append(
                 (item.title, disc_n, result["elapsed_s"], list(result["files"]))
@@ -943,7 +962,7 @@ def main() -> None:
             print(f"  {fp}")
     if pending_final_summary:
         beep(args, ok=True)
-    if needs_final_eject:
+    if needs_final_eject and not early_ejected.is_set():
         eject(args)
     print(f"\n{C.B}{C.GRN}Queue complete.{C.R}")
 

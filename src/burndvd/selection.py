@@ -444,20 +444,27 @@ def _play_all_structurally_corroborated(
 
 
 def planned_rip_selectors(
-    item: QueueItem, info: dict, title_ids: list[int]
+    item: QueueItem,
+    info: dict,
+    title_ids: list[int],
+    *,
+    skip_extras: bool = False,
 ) -> tuple[list[str], set[int]]:
     """Return `(makemkvcon_selectors, skipped_play_all_ids)`.
 
     Never pre-skips any title in `item.expected_title_ids`, and only pre-skips
     structurally corroborated (>= 3 parts, matching byte totals) play-all titles.
+    When `skip_extras=True` for `tv-season`, omits bonus titles shorter than
+    `TV_MIN_DUR_S` (while still never omitting `item.expected_title_ids`).
     """
     if item.type == "movie":
         return [str(tid) for tid in title_ids], set()
     titles = info.get("titles", {}) if isinstance(info, dict) else {}
     if item.type == "tv-season" and titles:
+        protected_tids = set(item.expected_title_ids or ())
         play_all = play_all_title_ids(info)
+        skippable: set[int] = set()
         if play_all:
-            protected_tids = set(item.expected_title_ids or ())
             non_play_all_eps = [
                 (
                     tid,
@@ -468,7 +475,6 @@ def planned_rip_selectors(
                 if tid not in play_all
                 and parse_duration(title.get(9, "0:00:00")) >= TV_MIN_DUR_S
             ]
-            skippable: set[int] = set()
             for pa_tid in play_all:
                 if pa_tid in protected_tids:
                     continue
@@ -479,15 +485,27 @@ def planned_rip_selectors(
                     pa_dur, pa_bytes, non_play_all_eps
                 ):
                     skippable.add(pa_tid)
-            if skippable:
-                keep_ids = sorted(
-                    tid
-                    for tid, title in titles.items()
-                    if tid not in skippable
-                    and parse_duration(title.get(9, "0:00:00")) >= EXTRAS_MIN_DUR_S
+        if skip_extras:
+            keep_ids = sorted(
+                tid
+                for tid, title in titles.items()
+                if tid not in skippable
+                and (
+                    tid in protected_tids
+                    or parse_duration(title.get(9, "0:00:00")) >= TV_MIN_DUR_S
                 )
-                if keep_ids:
-                    return [str(tid) for tid in keep_ids], skippable
+            )
+            if keep_ids:
+                return [str(tid) for tid in keep_ids], skippable
+        elif skippable:
+            keep_ids = sorted(
+                tid
+                for tid, title in titles.items()
+                if tid not in skippable
+                and parse_duration(title.get(9, "0:00:00")) >= EXTRAS_MIN_DUR_S
+            )
+            if keep_ids:
+                return [str(tid) for tid in keep_ids], skippable
     return ["all"], set()
 
 
@@ -497,6 +515,7 @@ def staging_space_requirement(
     title_ids: list[int],
     *,
     split_playall: bool = True,
+    skip_extras: bool = False,
 ) -> tuple[float, float | None, bool]:
     """Return `(required_gb, selected_gb, used_legacy_fallback)`."""
     legacy_gb = 110.0 if (item.format or "").upper() == "4K" else 60.0
@@ -504,13 +523,18 @@ def staging_space_requirement(
     if item.type == "movie":
         written_ids = list(title_ids)
     else:
-        _, skipped_play_all = planned_rip_selectors(item, info, title_ids)
-        written_ids = [
-            tid
-            for tid, title in titles.items()
-            if tid not in skipped_play_all
-            and parse_duration(title.get(9, "0:00:00")) >= EXTRAS_MIN_DUR_S
-        ]
+        selectors, skipped_play_all = planned_rip_selectors(
+            item, info, title_ids, skip_extras=skip_extras
+        )
+        if selectors != ["all"]:
+            written_ids = [int(s) for s in selectors if str(s).isdigit()]
+        else:
+            written_ids = [
+                tid
+                for tid, title in titles.items()
+                if tid not in skipped_play_all
+                and parse_duration(title.get(9, "0:00:00")) >= EXTRAS_MIN_DUR_S
+            ]
     if not written_ids:
         return legacy_gb, None, True
 

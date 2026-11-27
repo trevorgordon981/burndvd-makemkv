@@ -13,6 +13,7 @@ from pathlib import Path
 
 from burndvd.config import (
     C,
+    DEFAULT_MAKEMKVCON,
     DISKUTIL_BIN,
     DRUTIL_BIN,
     MOUNT_BIN,
@@ -21,6 +22,7 @@ from burndvd.config import (
 
 DRUTIL_DRIVE_ENV = "BURNDVD_DRUTIL_DRIVE"
 DRIVE_DEVICE_ENV = "BURNDVD_DRIVE_DEVICE"
+DRIVE_SERIAL_ENV = "BURNDVD_DRIVE_SERIAL"
 
 _SLIM_TRAY_DRIVE_RE = re.compile(
     r"\b(?:BU\d+N|BP\d+NB\d+|WP\d+NB\d+|SLIM)\b", re.IGNORECASE
@@ -100,6 +102,132 @@ def _explicit_drive_target(
         device_node = os.environ.get(DRIVE_DEVICE_ENV)
 
     return _parse_positive_int(drutil_drive), _normalize_device_node(device_node)
+
+
+def _explicit_drive_serial(
+    target=None,
+    *,
+    drive_serial: str | None = None,
+) -> str | None:
+    """Return explicit hardware serial from kwargs, args, or `BURNDVD_DRIVE_SERIAL`."""
+    device_spec = _extract_device_spec(target)
+    disc_idx = _disc_selector_index(device_spec)
+    is_non_disc = bool(device_spec) and disc_idx is None
+
+    if drive_serial is None and target is not None and not isinstance(target, str):
+        drive_serial = getattr(target, "drive_serial", None)
+    if drive_serial is None and not is_non_disc:
+        drive_serial = os.environ.get(DRIVE_SERIAL_ENV)
+    if isinstance(drive_serial, str):
+        cleaned = drive_serial.strip()
+        return cleaned or None
+    return None
+
+
+def parse_makemkv_drives(output: str) -> list[dict]:
+    """Parse `DRV:` lines from `makemkvcon -r info list` output."""
+    drives: list[dict] = []
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("DRV:"):
+            continue
+        tag, fields = _parse_msg_fields(line)
+        if tag != "DRV" or not fields or len(fields) < 7:
+            continue
+        try:
+            idx = int(fields[0])
+            state = int(fields[1])
+            flags = int(fields[2])
+            disc_flags = int(fields[3])
+        except ValueError:
+            continue
+        drive_desc = fields[4].strip()
+        volume = fields[5].strip()
+        raw_dev = fields[6].strip()
+        device_node = _normalize_device_node(raw_dev)
+        tokens = drive_desc.split()
+        last_tok = tokens[-1] if tokens else ""
+        serial = last_tok if (len(last_tok) >= 6 and last_tok.isalnum()) else ""
+        drives.append(
+            {
+                "index": idx,
+                "state": state,
+                "flags": flags,
+                "disc_flags": disc_flags,
+                "drive_desc": drive_desc,
+                "serial": serial,
+                "volume": volume,
+                "raw_device": raw_dev,
+                "device_node": device_node,
+                "has_media": state == 2,
+            }
+        )
+    return drives
+
+
+def resolve_makemkv_device(args) -> str:
+    """Resolve a `disc:N` selector to the current MakeMKV index for a pinned physical drive.
+
+    When `BURNDVD_DRIVE_DEVICE` / `args.drive_device` or `BURNDVD_DRIVE_SERIAL` /
+    `args.drive_serial` is explicitly set and `args.device` is a `disc:N` selector,
+    queries `[makemkvcon, "-r", "info", "list"]` and matches by normalized `/dev/diskN`
+    (preferred) or by hardware serial with media loaded. Falls back gracefully to
+    `args.device` if no explicit pin is set or if enumeration fails.
+    """
+    device = _extract_device_spec(args)
+    if _disc_selector_index(device) is None:
+        return device
+
+    _, exp_node = _explicit_drive_target(args)
+    exp_serial = _explicit_drive_serial(args)
+    if exp_node is None and exp_serial is None:
+        return device
+
+    makemkvcon = getattr(args, "makemkvcon", None) or DEFAULT_MAKEMKVCON
+    try:
+        r = subprocess.run(
+            [makemkvcon, "-r", "info", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return device
+
+    if r.returncode != 0 and not (r.stdout or "").strip():
+        return device
+    drives = parse_makemkv_drives(r.stdout or "")
+    if not drives:
+        return device
+
+    if exp_node is not None:
+        node_matches = [d for d in drives if d["device_node"] == exp_node]
+        if node_matches:
+            if exp_serial is not None:
+                exact = [
+                    d
+                    for d in node_matches
+                    if d["serial"]
+                    and d["serial"].casefold() == exp_serial.casefold()
+                ]
+                if exact:
+                    return f"disc:{exact[0]['index']}"
+            loaded = [d for d in node_matches if d["has_media"]]
+            chosen = loaded[0] if loaded else node_matches[0]
+            return f"disc:{chosen['index']}"
+
+    if exp_serial is not None:
+        serial_matches = [
+            d
+            for d in drives
+            if d["serial"]
+            and d["serial"].casefold() == exp_serial.casefold()
+            and d["has_media"]
+        ]
+        if serial_matches:
+            return f"disc:{serial_matches[0]['index']}"
+
+    return device
 
 
 def _drutil_status_output(drutil_drive: int | None = None) -> str | None:
