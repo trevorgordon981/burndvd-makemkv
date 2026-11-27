@@ -62,6 +62,7 @@ from burndvd.nas import (
 from burndvd.probe import (
     disc_content_fingerprint,
     disc_label,
+    disc_volume_candidates,
     log_final_durations,
     scan_titles_json,
 )
@@ -632,19 +633,23 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 )
                 append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
                 sys.exit(4)
-            if expected_vol and (
-                not label or _compact(label) != _compact(expected_vol)
-            ):
-                err_msg = (
-                    f"probed disc volume {label!r} does not match expected "
-                    f"volume {expected_vol!r} (disc changed or misrouted)"
+            if expected_vol:
+                exp_compact = _compact(expected_vol)
+                vol_candidates = disc_volume_candidates(info)
+                vol_matched = any(
+                    _compact(cand) == exp_compact for cand in vol_candidates
                 )
-                print(
-                    f"{C.RED}{err_msg}; refusing optical read before staging.{C.R}",
-                    file=sys.stderr,
-                )
-                append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
-                sys.exit(4)
+                if not vol_matched:
+                    err_msg = (
+                        f"probed disc volume {label!r} does not match expected "
+                        f"volume {expected_vol!r} (disc changed or misrouted)"
+                    )
+                    print(
+                        f"{C.RED}{err_msg}; refusing optical read before staging.{C.R}",
+                        file=sys.stderr,
+                    )
+                    append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
+                    sys.exit(4)
             if item.type == "tv-season" and strict_show_intent and not allow_fingerprints:
                 ok_intent, intent_reason = volume_matches_show_intent(
                     label,

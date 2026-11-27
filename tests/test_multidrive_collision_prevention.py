@@ -200,6 +200,17 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
             self.assertEqual(info["pending_plans"], [])
             self.assertEqual(info["reservations"], [])
 
+    def test_expected_volume_matches_cinfo_32_udf_volume_when_cinfo_2_differs(self):
+        from burndvd.probe import disc_volume_candidates
+
+        info = {
+            "cinfo": {2: "MARVEL'S THOR: RAGNAROK", 32: "THOR_RAGNAROK"},
+            "titles": {0: {9: "2:10:00", 11: "62000000000", 2: "THOR_RAGNAROK"}},
+        }
+        cands = disc_volume_candidates(info)
+        self.assertEqual(cands[0], "THOR_RAGNAROK")
+        self.assertIn("MARVEL'S THOR: RAGNAROK", cands)
+
 
 if __name__ == "__main__":
     unittest.main()

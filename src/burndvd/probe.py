@@ -158,6 +158,17 @@ def disc_label(info: dict) -> str:
     return c.get(2) or c.get(32) or c.get(30) or c.get(1) or "(unknown)"
 
 
+def disc_volume_candidates(info: dict) -> tuple[str, ...]:
+    """Return all MakeMKV `CINFO` volume/title identifiers (filesystem volume `32` first)."""
+    c = info.get("cinfo", {})
+    seen: list[str] = []
+    for key in (32, 2, 30, 1):
+        val = (c.get(key) or "").strip()
+        if val and val not in seen:
+            seen.append(val)
+    return tuple(seen)
+
+
 def disc_content_fingerprint(info: dict) -> str:
     """Hash stable disc/title-table identity (SHA-256), excluding drive noise."""
     rows = []
