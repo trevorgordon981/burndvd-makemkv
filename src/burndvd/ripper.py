@@ -260,6 +260,44 @@ def _probe_expected_duration_s(path: str) -> tuple[float | None, str | None]:
     return dur, None
 
 
+_BENIGN_FFMPEG_STDERR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Disney/Marvel 4K UHD seamless-branching TrueHD Atmos splice notice.
+    re.compile(
+        r"^\[truehd @ (?:0x)?[0-9a-fA-F]+\] quant_step_size larger than huff_lsbs$"
+    ),
+    # Standard Dolby Vision / HDR10 4K UHD HEVC mastering boundary notice.
+    re.compile(
+        r"^\[hevc @ (?:0x)?[0-9a-fA-F]+\] PPS changed between slices\.?$"
+    ),
+)
+_FFMPEG_REPEAT_LINE_RE = re.compile(r"^Last message repeated [1-9]\d* times?$")
+
+
+def _filter_benign_ffmpeg_stderr(stderr_txt: str) -> str:
+    """Return non-allowlisted ffmpeg stderr lines (only used when ffmpeg exits 0).
+
+    Allowlists known-benign 4K UHD mastering/branch-splice decoder notices and
+    an immediately following ``Last message repeated N times`` line. Any other
+    diagnostic — including standalone or post-error repeat lines — is preserved
+    so verification fails closed.
+    """
+    unexpected: list[str] = []
+    prev_allowlisted = False
+    for raw_line in (stderr_txt or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if any(pat.match(line) for pat in _BENIGN_FFMPEG_STDERR_PATTERNS):
+            prev_allowlisted = True
+            continue
+        if prev_allowlisted and _FFMPEG_REPEAT_LINE_RE.match(line):
+            prev_allowlisted = False
+            continue
+        prev_allowlisted = False
+        unexpected.append(line)
+    return "\n".join(unexpected)
+
+
 def _verify_single(p: str) -> tuple[bool, str]:
     """Decode-verify a single MKV through strict ffmpeg null muxer and duration checks."""
     r = subprocess.run(
@@ -285,8 +323,9 @@ def _verify_single(p: str) -> tuple[bool, str]:
     stderr_txt = (getattr(r, "stderr", "") or "").strip()
     if r.returncode != 0:
         return False, f"{p}: exit {r.returncode}; {stderr_txt[:240]}"
-    if stderr_txt:
-        return False, f"{p}: ffmpeg decode error: {stderr_txt[:240]}"
+    unexpected_stderr = _filter_benign_ffmpeg_stderr(stderr_txt)
+    if unexpected_stderr:
+        return False, f"{p}: ffmpeg decode error: {unexpected_stderr[:240]}"
     if os.path.isfile(p):
         try:
             if os.path.getsize(p) <= 0:

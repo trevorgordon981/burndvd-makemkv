@@ -187,6 +187,90 @@ class TestStrictMediaVerificationAndCheckrip(unittest.TestCase):
             self.assertFalse(ledger.exists(), "truncated video must never receive a published receipt")
             self.assertTrue(stage.exists(), "staging directory must not be retired when verification fails")
 
+    def test_verify_allows_benign_truehd_uhd_splice_notice_when_rc_zero(self):
+        stderr = (
+            "[truehd @ 0xc793c5180] quant_step_size larger than huff_lsbs\n"
+            "    Last message repeated 8 times\n"
+        )
+        completed = SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+        with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+            ok, err = ripper.verify(["/nonexistent/uhd-movie.mkv"])
+        self.assertTrue(ok, f"benign TrueHD splice notice unexpectedly failed: {err}")
+        self.assertEqual(err, "")
+
+    def test_verify_allows_benign_hevc_pps_change_notice_when_rc_zero(self):
+        stderr = (
+            "[hevc @ 0x7fa1234500] PPS changed between slices.\n"
+            "    Last message repeated 6 times\n"
+        )
+        completed = SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+        with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+            ok, err = ripper.verify(["/nonexistent/uhd-dv.mkv"])
+        self.assertTrue(ok, f"benign HEVC PPS notice unexpectedly failed: {err}")
+        self.assertEqual(err, "")
+
+    def test_verify_allows_multiple_benign_notices_interleaved_when_rc_zero(self):
+        stderr = (
+            "[truehd @ 0x82cf50700] quant_step_size larger than huff_lsbs\n"
+            "    Last message repeated 2 times\n"
+            "[hevc @ 0x8e6df7b80] PPS changed between slices.\n"
+            "    Last message repeated 6 times\n"
+            "[truehd @ 0x82cf50700] quant_step_size larger than huff_lsbs\n"
+        )
+        completed = SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+        with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+            ok, err = ripper.verify(["/nonexistent/uhd-multi.mkv"])
+        self.assertTrue(ok, f"multiple benign notices unexpectedly failed: {err}")
+        self.assertEqual(err, "")
+
+    def test_verify_fails_closed_on_benign_truehd_plus_real_error(self):
+        for real_err in (
+            "[matroska,webm @ 0x1234] File ended prematurely",
+            "[truehd @ 0x1234] Invalid data found when processing input",
+            "[hevc @ 0x1234] Error while decoding stream #0:0: Invalid data found",
+        ):
+            with self.subTest(real_err=real_err):
+                stderr = (
+                    "[truehd @ 0xc793c5180] quant_step_size larger than huff_lsbs\n"
+                    "    Last message repeated 8 times\n"
+                    f"{real_err}\n"
+                )
+                completed = SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+                with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+                    ok, err = ripper.verify(["/nonexistent/corrupt.mkv"])
+                self.assertFalse(ok)
+                self.assertIn("ffmpeg decode error:", err)
+                self.assertIn(real_err, err)
+
+    def test_verify_fails_closed_on_benign_truehd_when_rc_nonzero(self):
+        stderr = (
+            "[truehd @ 0xc793c5180] quant_step_size larger than huff_lsbs\n"
+            "    Last message repeated 8 times\n"
+        )
+        completed = SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+        with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+            ok, err = ripper.verify(["/nonexistent/failed.mkv"])
+        self.assertFalse(ok)
+        self.assertIn("exit 1;", err)
+
+    def test_verify_fails_closed_on_unpaired_or_post_error_repeat_line(self):
+        cases = (
+            "    Last message repeated 3 times\n",
+            "[matroska,webm @ 0x1234] Invalid data found\n"
+            "    Last message repeated 3 times\n",
+            "[truehd @ 0xc793c5180] quant_step_size larger than huff_lsbs\n"
+            "    Last message repeated 2 times\n"
+            "    Last message repeated 3 times\n",
+        )
+        for stderr in cases:
+            with self.subTest(stderr=stderr):
+                completed = SimpleNamespace(returncode=0, stdout="", stderr=stderr)
+                with mock.patch.object(ripper.subprocess, "run", return_value=completed):
+                    ok, err = ripper.verify(["/nonexistent/repeat.mkv"])
+                self.assertFalse(ok)
+                self.assertIn("ffmpeg decode error:", err)
+                self.assertIn("Last message repeated 3 times", err)
+
 
 class TestSubocrLockOwnershipAndFailureIsolation(unittest.TestCase):
     def setUp(self):
