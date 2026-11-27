@@ -710,6 +710,36 @@ def _discover_active_ripqueue_procs() -> list[dict]:
     return out
 
 
+def _self_and_ancestor_pids() -> set[int]:
+    """Return current PID plus its live parent/ancestor chain (excluding PID 1)."""
+    pids = {os.getpid()}
+    ppid = os.getppid()
+    if ppid > 1:
+        pids.add(ppid)
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        parent_of: dict[int, int] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                parent_of[int(parts[0])] = int(parts[1])
+        cur = ppid
+        while cur > 1 and len(pids) < 32:
+            pids.add(cur)
+            nxt = parent_of.get(cur, 0)
+            if nxt <= 1 or nxt in pids:
+                break
+            cur = nxt
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return pids
+
+
 def compute_next_tv_episode(
     *,
     title: str,
@@ -722,6 +752,8 @@ def compute_next_tv_episode(
     active_processes: list[dict] | None = None,
     wait_scan_s: float = 0.0,
     poll_interval_s: float = 2.0,
+    exclude_queue_file: str | None = None,
+    exclude_state_file: str | None = None,
 ) -> dict:
     deadline = time.monotonic() + max(0.0, float(wait_scan_s))
     notified_wait = False
@@ -783,6 +815,10 @@ def compute_next_tv_episode(
                         )
                         next_ep = max(next_ep, ep_start + ep_count)
 
+        excluded_pids = _self_and_ancestor_pids() if active_processes is None else {os.getpid()}
+        excl_state = os.path.realpath(exclude_state_file) if exclude_state_file else ""
+        excl_queue = os.path.realpath(exclude_queue_file) if exclude_queue_file else ""
+
         procs = (
             _discover_active_ripqueue_procs()
             if active_processes is None
@@ -793,11 +829,15 @@ def compute_next_tv_episode(
                 pid = int(proc.get("pid", 0))
             except (TypeError, ValueError):
                 continue
-            if pid <= 0 or pid == os.getpid() or pid in seen_pids:
+            if pid <= 0 or pid in excluded_pids or pid in seen_pids:
                 continue
             rows: list[dict] = []
             sp = str(proc.get("state_file") or "")
             qp = str(proc.get("queue_file") or "")
+            if excl_state and sp and os.path.realpath(sp) == excl_state:
+                continue
+            if excl_queue and qp and os.path.realpath(qp) == excl_queue:
+                continue
             if sp and os.path.isfile(sp):
                 try:
                     st = json.loads(Path(sp).read_text(encoding="utf-8"))

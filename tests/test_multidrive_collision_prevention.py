@@ -165,6 +165,41 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
                 holder.terminate()
                 holder.wait(timeout=5)
 
+    def test_compute_next_tv_episode_ignores_same_queue_or_state_wrapper_parent(self):
+        from burndvd.metadata import compute_next_tv_episode
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            season_dir = tmp_path / "TV Shows" / "Naruto Shippuden" / "Season 01"
+            season_dir.mkdir(parents=True)
+            queue_csv = tmp_path / "queue.csv"
+            queue_csv.write_text(
+                "title,type,season,discs,episode_start,expected_episodes,target_root,format,notes\n"
+                f"Naruto Shippuden,tv-season,1,1,14,0,{tmp_path / 'TV Shows' / 'Naruto Shippuden'},DVD,test\n",
+                encoding="utf-8",
+            )
+            state_json = tmp_path / "state.json"
+            wrapper_procs = [
+                {
+                    "pid": 999991,
+                    "queue_file": str(queue_csv),
+                    "state_file": str(state_json),
+                    "log_file": "",
+                }
+            ]
+            info = compute_next_tv_episode(
+                title="Naruto Shippuden",
+                season=1,
+                target_root=str(tmp_path / "TV Shows" / "Naruto Shippuden"),
+                season_dir=season_dir,
+                slots_dir=tmp_path / "slots",
+                active_processes=wrapper_procs,
+                exclude_queue_file=str(queue_csv),
+                exclude_state_file=str(state_json),
+            )
+            self.assertEqual(info["pending_plans"], [])
+            self.assertEqual(info["reservations"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

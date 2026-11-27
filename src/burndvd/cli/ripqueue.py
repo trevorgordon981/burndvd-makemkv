@@ -759,6 +759,8 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 target_root=str(item.target_root or target.parent),
                 season_dir=target,
                 wait_scan_s=0.0,
+                exclude_queue_file=getattr(args, "queue", None),
+                exclude_state_file=getattr(args, "state", None),
             )
             overlap_err, _ = find_episode_plan_conflict(
                 planned_start,
