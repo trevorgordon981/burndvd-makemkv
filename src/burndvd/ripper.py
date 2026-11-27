@@ -1026,8 +1026,9 @@ def _run_finalize(
                     publish_intents = _upsert_intent(publish_intents, intent_rec)
                     _save_publish_intents(staging, publish_intents)
 
-                    # Phase 2: atomic no-replace publish, deferring staged-source retirement
-                    # until AFTER the commit journal is durably persisted.
+                    # Phase 2: atomic no-replace publish, verifying streamed copied bytes
+                    # against the durable publish-intent SHA-256/size/identity BEFORE rename,
+                    # and deferring staged-source retirement until AFTER commit journal fsync.
                     if protected:
                         move_with_progress_noclobber(
                             src_path,
@@ -1038,6 +1039,9 @@ def _run_finalize(
                             partial_root=partial_root,
                             lock_dir=lock_dir,
                             retire_source=False,
+                            expected_sha256=src_sha256,
+                            expected_size=expected_size,
+                            expected_source_identity=src_identity,
                         )
                     elif allow_movie_overwrite:
                         move_with_progress(
@@ -1046,10 +1050,19 @@ def _run_finalize(
                             label=label,
                             allow_overwrite=True,
                             retire_source=False,
+                            expected_sha256=src_sha256,
+                            expected_size=expected_size,
+                            expected_source_identity=src_identity,
                         )
                     else:
                         move_with_progress(
-                            src_path, dst, label=label, retire_source=False
+                            src_path,
+                            dst,
+                            label=label,
+                            retire_source=False,
+                            expected_sha256=src_sha256,
+                            expected_size=expected_size,
+                            expected_source_identity=src_identity,
                         )
 
                     dst_stat = os.lstat(dst)

@@ -227,16 +227,18 @@ def probe_disc(args) -> dict | None:
         eff_drv_idx = (
             resolved_disc_idx if resolved_disc_idx is not None else want_drv_idx
         )
+        cmd = [
+            args.makemkvcon,
+            "-r",
+            "--cache=128",
+            f"--minlength={EXTRAS_MIN_DUR_S}",
+        ]
+        if resolved_disc_idx is not None:
+            cmd.append("--noscan")
+        cmd.extend(["info", resolved_device])
         try:
             proc = subprocess.Popen(
-                [
-                    args.makemkvcon,
-                    "-r",
-                    "--cache=128",
-                    f"--minlength={EXTRAS_MIN_DUR_S}",
-                    "info",
-                    resolved_device,
-                ],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,

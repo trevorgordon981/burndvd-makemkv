@@ -624,6 +624,24 @@ def retire_staged_source(
     return True
 
 
+def _copy_stream_with_sha256(
+    source_stream, output, *, chunk_size: int = 8 * 1024 * 1024
+) -> tuple[str, int]:
+    """Stream `source_stream` into `output`, fsync, and return `(hex_sha256, bytes_written)`."""
+    digest = hashlib.sha256()
+    written = 0
+    while True:
+        chunk = source_stream.read(chunk_size)
+        if not chunk:
+            break
+        output.write(chunk)
+        digest.update(chunk)
+        written += len(chunk)
+    output.flush()
+    os.fsync(output.fileno())
+    return digest.hexdigest(), written
+
+
 def move_with_progress(
     src: Path,
     dst: Path,
@@ -632,14 +650,18 @@ def move_with_progress(
     *,
     allow_overwrite: bool = False,
     retire_source: bool = True,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+    expected_source_identity: tuple[int, int] | None = None,
 ) -> None:
     """Atomically move a file across filesystems with progress and no-replace by default.
 
-    Copies into an exclusively owned sibling `.partial` file, fsyncs, verifies
-    size/identity, publishes via atomic no-replace rename (or `os.replace` only
-    when `allow_overwrite=True`), and unlinks `src` only after publication. On
-    any failure, cleans up only the owned `.partial` file and never touches a
-    pre-existing destination.
+    Copies into an exclusively owned sibling `.partial` file while computing the
+    streaming SHA-256 of the exact bytes written, fsyncs, verifies size, source
+    identity, and (when provided) `expected_sha256` BEFORE publishing via atomic
+    no-replace rename (or `os.replace` only when `allow_overwrite=True`), and
+    unlinks `src` only after publication. On any failure or digest mismatch,
+    cleans up only the owned `.partial` file and never touches `dst` or retires `src`.
     """
     src, dst = Path(src), Path(dst)
     for target_path in (dst.parent, dst):
@@ -674,6 +696,19 @@ def move_with_progress(
             raise OSError(f"move source is not a regular file: {src}")
         source_identity = (source_stat.st_dev, source_stat.st_ino)
         total = source_stat.st_size
+        if (
+            expected_source_identity is not None
+            and source_identity != expected_source_identity
+        ):
+            raise OSError(
+                f"move source identity changed before copy: {src} "
+                f"(expected {expected_source_identity}, got {source_identity})"
+            )
+        if expected_size is not None and total != expected_size:
+            raise OSError(
+                f"move source size changed before copy: {src} "
+                f"(expected {expected_size}, got {total})"
+            )
     except BaseException:
         os.close(source_fd)
         raise
@@ -721,15 +756,14 @@ def move_with_progress(
 
     done_evt = threading.Event()
     err_box: list[BaseException] = []
+    copy_result: list[tuple[str, int]] = []
 
     def worker():
         try:
             with os.fdopen(source_fd, "rb") as source_stream, os.fdopen(
                 partial_fd, "wb"
             ) as output:
-                shutil.copyfileobj(source_stream, output, length=8 * 1024 * 1024)
-                output.flush()
-                os.fsync(output.fileno())
+                copy_result.append(_copy_stream_with_sha256(source_stream, output))
         except BaseException as e:
             err_box.append(e)
         finally:
@@ -768,15 +802,27 @@ def move_with_progress(
         if err_box:
             raise err_box[0]
 
+        if not copy_result:
+            raise OSError(f"copy worker did not report digest/size for {src}")
+        copied_sha256, copied_bytes = copy_result[0]
         copied = os.lstat(partial)
         guarded_source = os.fstat(source_guard_fd)
-        if (copied.st_dev, copied.st_ino) != partial_identity or copied.st_size != total:
+        if (
+            (copied.st_dev, copied.st_ino) != partial_identity
+            or copied.st_size != total
+            or copied_bytes != total
+        ):
             raise OSError(f"partial copy identity/size changed: {partial}")
         if (
             (guarded_source.st_dev, guarded_source.st_ino) != source_identity
             or guarded_source.st_size != total
         ):
             raise OSError(f"move source identity/size changed: {src}")
+        if expected_sha256 is not None and copied_sha256 != expected_sha256:
+            raise OSError(
+                f"staged source digest mismatch before publish (refusing commit): "
+                f"{src} expected sha256={expected_sha256}, copied sha256={copied_sha256}"
+            )
 
         if allow_overwrite:
             os.replace(partial, dst)
@@ -894,8 +940,12 @@ def move_with_progress_noclobber(
     lock_dir: Path | None = None,
     publish_lock_held: bool = False,
     retire_source: bool = True,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+    expected_source_identity: tuple[int, int] | None = None,
 ) -> None:
-    """Copy to out-of-library `.partial`, fsync, atomically publish no-clobber, retire source."""
+    """Copy to out-of-library `.partial` with streaming SHA-256 verification, fsync,
+    atomically publish no-clobber, and optionally retire source."""
     src, dst = Path(src), Path(dst)
     if partial_root is None:
         raise ValueError("protected TV move requires an out-of-library partial_root")
@@ -922,6 +972,19 @@ def move_with_progress_noclobber(
             raise OSError(f"protected TV source is not a regular file: {src}")
         source_identity = (source_stat.st_dev, source_stat.st_ino)
         total = source_stat.st_size
+        if (
+            expected_source_identity is not None
+            and source_identity != expected_source_identity
+        ):
+            raise OSError(
+                f"protected TV source identity changed before copy: {src} "
+                f"(expected {expected_source_identity}, got {source_identity})"
+            )
+        if expected_size is not None and total != expected_size:
+            raise OSError(
+                f"protected TV source size changed before copy: {src} "
+                f"(expected {expected_size}, got {total})"
+            )
         source_guard_fd = os.dup(source_fd)
     except BaseException:
         os.close(source_fd)
@@ -968,21 +1031,21 @@ def move_with_progress_noclobber(
 
     done_evt = threading.Event()
     err_box: list[BaseException] = []
+    copy_result: list[tuple[str, int]] = []
 
     def worker():
         try:
             with os.fdopen(source_fd, "rb") as source_stream, os.fdopen(
                 partial_fd, "wb"
             ) as output:
-                shutil.copyfileobj(source_stream, output, length=8 * 1024 * 1024)
-                output.flush()
-                os.fsync(output.fileno())
+                copy_result.append(_copy_stream_with_sha256(source_stream, output))
         except BaseException as exc:
             err_box.append(exc)
         finally:
             done_evt.set()
 
-    threading.Thread(target=worker, daemon=True).start()
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
     start = time.time()
     last_size = 0
     last_t = start
@@ -1009,19 +1072,32 @@ def move_with_progress_noclobber(
                 flush=True,
             )
             last_size, last_t = current, now
+        t.join()
         os.close(monitor_fd)
         monitor_fd = None
         if err_box:
             raise err_box[0]
+        if not copy_result:
+            raise OSError(f"protected TV copy worker did not report digest/size for {src}")
+        copied_sha256, copied_bytes = copy_result[0]
         copied = os.lstat(partial)
         guarded_source = os.fstat(source_guard_fd)
-        if (copied.st_dev, copied.st_ino) != partial_identity or copied.st_size != total:
+        if (
+            (copied.st_dev, copied.st_ino) != partial_identity
+            or copied.st_size != total
+            or copied_bytes != total
+        ):
             raise OSError(f"protected TV partial identity/size changed: {partial}")
         if (
             (guarded_source.st_dev, guarded_source.st_ino) != source_identity
             or guarded_source.st_size != total
         ):
             raise OSError(f"protected TV source identity/size changed: {src}")
+        if expected_sha256 is not None and copied_sha256 != expected_sha256:
+            raise OSError(
+                f"protected TV staged source digest mismatch before publish (refusing commit): "
+                f"{src} expected sha256={expected_sha256}, copied sha256={copied_sha256}"
+            )
 
         publish_lock = (
             contextlib.nullcontext()

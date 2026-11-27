@@ -620,6 +620,37 @@ class TestProbeDiscDiagnosticSurfacing(unittest.TestCase):
             self.assertIn("killed on stall", log_text)
             self.assertIn("MSG:2003", log_text)
 
+    def test_probe_disc_passes_noscan_for_concrete_disc_selector_only(self):
+        """Concrete disc:N probes MUST pass --noscan so MakeMKV does not stall waiting
+        on a sibling optical drive that is actively ripping."""
+        seen_cmds: list[list[str]] = []
+
+        def fake_popen(cmd, **kwargs):
+            seen_cmds.append(list(cmd))
+            return _FakePopen(
+                [
+                    'CINFO:2,0,"SAMPLE_DISC"',
+                    'TINFO:0,9,0,"0:42:00"',
+                    'TINFO:0,11,0,"4000000000"',
+                ]
+            )
+
+        args_disc = SimpleNamespace(makemkvcon="/fake/makemkvcon", device="disc:0")
+        args_iso = SimpleNamespace(makemkvcon="/fake/makemkvcon", device="iso:/tmp/sample.iso")
+        with mock.patch.object(probe, "_optical_mounts", return_value=[]), \
+             mock.patch.object(probe, "_drive_idx_from_args", return_value=0), \
+             mock.patch.object(probe, "resolve_makemkv_device", side_effect=lambda a: a.device), \
+             mock.patch.object(probe.subprocess, "Popen", side_effect=fake_popen):
+            info_disc = probe.probe_disc(args_disc)
+            info_iso = probe.probe_disc(args_iso)
+
+        self.assertIsNotNone(info_disc)
+        self.assertIsNotNone(info_iso)
+        self.assertIn("--noscan", seen_cmds[0])
+        self.assertEqual(seen_cmds[0][-2:], ["info", "disc:0"])
+        self.assertNotIn("--noscan", seen_cmds[1])
+        self.assertEqual(seen_cmds[1][-2:], ["info", "iso:/tmp/sample.iso"])
+
 
 if __name__ == "__main__":
     unittest.main()

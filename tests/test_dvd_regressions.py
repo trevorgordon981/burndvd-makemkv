@@ -1676,6 +1676,98 @@ class TestDVD6AndDVD7CheckripAttributionAndJsonSchema(unittest.TestCase):
         self.assertEqual(rows_mismatch[1]["rip"]["pid"], 8801)
 
 
+class TestDVD10PublishIntentByteIntegrity(unittest.TestCase):
+    """DVD-10: Same-size staged mutation after durable publish-intent MUST fail closed."""
+
+    def test_same_size_in_place_staging_mutation_after_intent_fails_closed_for_movie_and_tv(self):
+        """Reproduce the exact DVD-10 counterexample: write 'abc', durably persist
+        publish-intent with sha256('abc'), mutate the same inode in place to 'def'
+        before copy -> finalize fails closed, partial temp is removed, library dst is
+        never created/committed, staging source is NOT retired, and .burndvd-committed.json
+        never records the tampered file."""
+        for mode in ("movie", "tv-protected"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                ripper.clear_finalize_errors()
+                root = Path(tmp)
+                stage = root / "staging"
+                lib = root / "lib"
+                partial_root = root / "partials"
+                stage.mkdir()
+                lib.mkdir()
+                partial_root.mkdir()
+
+                src = stage / "title_t00.mkv"
+                src.write_bytes(b"abc")
+                orig_stat = os.lstat(src)
+                dst = lib / ("Sample Show - S01E01.mkv" if mode == "tv-protected" else "Sample Movie (2024).mkv")
+
+                if mode == "tv-protected":
+                    move_jobs = [
+                        (src, dst, "ep 1", True, None, None, partial_root, None),
+                    ]
+                    item = SimpleNamespace(title="Sample Show", type="tv-season")
+                else:
+                    move_jobs = [(src, dst, "film")]
+                    item = SimpleNamespace(title="Sample Movie (2024)", type="movie")
+
+                args = SimpleNamespace(
+                    state=str(root / "state.json"),
+                    verify=False,
+                    rerip_review=False,
+                    no_subocr=True,
+                    no_sound=True,
+                    overwrite=False,
+                    disc_receipts=str(root / "receipts.jsonl"),
+                )
+                result = {
+                    "files": [str(dst)],
+                    "move_jobs": move_jobs,
+                    "staging": str(stage),
+                }
+
+                real_save_intents = ripper._save_publish_intents
+                mutated = False
+
+                def mutate_same_inode_after_intent(staging_dir, intents):
+                    nonlocal mutated
+                    real_save_intents(staging_dir, intents)
+                    if not mutated and intents:
+                        # Mutate the exact same inode in place with same byte length (abc -> def).
+                        with open(src, "r+b") as fh:
+                            fh.seek(0)
+                            fh.write(b"def")
+                            fh.flush()
+                            os.fsync(fh.fileno())
+                        mutated = True
+
+                log_lines: list[str] = []
+                with mock.patch.object(
+                    ripper, "_save_publish_intents", side_effect=mutate_same_inode_after_intent
+                ), mock.patch.object(ripper, "beep"), mock.patch.object(
+                    ripper, "append_log", side_effect=lambda _a, line: log_lines.append(line)
+                ), mock.patch.object(ripper, "run_subocr_postrip"):
+                    ok = ripper._run_finalize(args, result, item, 1)
+
+                self.assertTrue(mutated)
+                self.assertFalse(ok, f"{mode}: finalize must fail closed on post-intent mutation")
+                # Same inode was mutated in place, never retired.
+                self.assertTrue(src.is_file())
+                self.assertEqual(src.read_bytes(), b"def")
+                after_stat = os.lstat(src)
+                self.assertEqual((after_stat.st_dev, after_stat.st_ino), (orig_stat.st_dev, orig_stat.st_ino))
+                # Library destination MUST NOT exist and no orphan .partial temp files remain.
+                self.assertFalse(dst.exists(), f"{mode}: tampered bytes must NEVER be renamed into library")
+                self.assertEqual(list(lib.glob("*.partial")), [])
+                self.assertEqual(list(partial_root.glob("*.partial")), [])
+                # Commit manifest MUST NOT record the tampered file or stale hash.
+                commit_manifest = stage / ripper._COMMITTED_MANIFEST_NAME
+                self.assertFalse(commit_manifest.exists())
+                self.assertTrue(
+                    any("digest mismatch before publish" in ln for ln in log_lines),
+                    f"expected digest-mismatch error in log: {log_lines}",
+                )
+
+
 class TestDVD5DocsDemoAndCiContract(unittest.TestCase):
     """DVD-5: README documents --watch, dev install, prerequisites, synthetic demo, and CI runs demo."""
 
