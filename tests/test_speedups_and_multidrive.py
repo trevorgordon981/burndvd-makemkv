@@ -612,7 +612,7 @@ class TestNoExtrasSelectionAndCLI(unittest.TestCase):
         self.assertEqual(sels_protected, ["1", "2", "3", "4"])
 
     def test_ripqueue_parser_no_extras_flag_and_env(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, {"BURNDVD_CONFIG": "/nonexistent/burndvd-test.cfg"}, clear=False):
             os.environ.pop("BURNDVD_NO_EXTRAS", None)
             self.assertFalse(ripqueue.build_parser().parse_args([]).no_extras)
             self.assertTrue(ripqueue.build_parser().parse_args(["--no-extras"]).no_extras)

@@ -90,11 +90,80 @@ def normalize_movie_title(value: str) -> str:
     return canonical_fast_title(title) or title
 
 
-def infer_defaults(volume: str) -> tuple[str, str, str]:
+_TV_TRAILING_CLUSTER_RE = re.compile(
+    r"(?i)[\s._-]+(?:(?:season|s|part|pt|p|disc|disk|d|vol(?:ume)?)[\s._-]*\d+)+$"
+)
+_EXPLICIT_SEASON_RE = re.compile(
+    r"(?i)(?:^|[^A-Za-z0-9])(?:S0*(\d+)|Season[\s._-]*0*(\d+))(?:$|[^0-9])"
+)
+_SEASON_DIR_RE = re.compile(r"(?i)^Season\s+0*(\d+)$")
+
+
+def _strip_tv_disc_suffix(volume: str) -> str:
+    """Strip trailing TV disc/part/season/volume tokens from a volume label."""
+    prefix = volume.strip()
+    while True:
+        updated = _TV_TRAILING_CLUSTER_RE.sub("", prefix).strip()
+        if not updated or updated == prefix:
+            break
+        prefix = updated
+    return prefix
+
+
+def _infer_season_from_volume_or_dir(volume: str, show_dir: Path) -> str:
+    """Infer TV season number from explicit volume token or highest NAS Season dir."""
+    season_match = _EXPLICIT_SEASON_RE.search(volume.strip())
+    if season_match:
+        return str(int(season_match.group(1) or season_match.group(2)))
+    highest = 0
+    try:
+        for child in show_dir.iterdir():
+            try:
+                if not child.is_dir():
+                    continue
+            except OSError:
+                continue
+            m = _SEASON_DIR_RE.match(child.name.strip())
+            if m:
+                num = int(m.group(1))
+                if num > highest:
+                    highest = num
+    except OSError:
+        pass
+    return str(highest) if highest > 0 else "1"
+
+
+def infer_defaults(
+    volume: str, *, tv_roots: list[Path | str] | None = None
+) -> tuple[str, str, str]:
     """Infer `(type, season, title)` from an optical disc volume label."""
     got_disc = _GOT_DISC_RE.match(volume.strip())
     if got_disc:
         return "tv-season", got_disc.group(1), "Game of Thrones"
+
+    if tv_roots:
+        vol_prefix = _strip_tv_disc_suffix(volume)
+        target_key = _compact(vol_prefix)
+        if target_key:
+            for root_raw in tv_roots:
+                if not root_raw:
+                    continue
+                root = Path(root_raw)
+                try:
+                    if not root.is_dir():
+                        continue
+                    entries = sorted(root.iterdir(), key=lambda p: p.name.casefold())
+                except OSError:
+                    continue
+                for show_dir in entries:
+                    try:
+                        if not show_dir.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    if _compact(show_dir.name) == target_key:
+                        season = _infer_season_from_volume_or_dir(volume, show_dir)
+                        return "tv-season", season, show_dir.name
 
     spaced = volume.replace("_", " ").strip()
     tv_pat = r"(?i)(S\d+\s*D\d+|Season[\s-]+\d+|Disc[\s-]+\d+|Vol(?:ume)?[\s-]+\d+)"

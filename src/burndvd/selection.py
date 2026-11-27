@@ -209,23 +209,107 @@ def _median(xs: list[float] | list[int]) -> float:
 TV_OUTLIER_MEDIAN_RATIO = max(EP_BONUS_MEDIAN_RATIO, 0.60)
 TV_OUTLIER_MIN_COUNT = max(EP_BONUS_MIN_COUNT, 3)
 
+SEASON_BAND_LOW_RATIO = 0.65
+SEASON_BAND_HIGH_RATIO = 1.45
+SEASON_PLAYALL_RATIO = 1.85
+SEASON_MEDIAN_MIN_S = 600.0
+SEASON_MEDIAN_MAX_S = 7200.0
+_SEASON_EP_MKV_RE = re.compile(r"S\d+E\d+.*\.mkv$", re.IGNORECASE)
+
+
+def _season_episode_bounds(season_median_s: float) -> tuple[float, float, float]:
+    """Return `(low_s, high_s, playall_s)` anchored on an existing season median."""
+    med = float(season_median_s)
+    low = med * SEASON_BAND_LOW_RATIO
+    if med >= TV_MIN_DUR_S:
+        low = max(float(TV_MIN_DUR_S), low)
+    high = med * SEASON_BAND_HIGH_RATIO
+    playall = med * SEASON_PLAYALL_RATIO
+    return low, high, playall
+
+
+def existing_season_median_dur_s(
+    season_dir: Path | str | None,
+    *,
+    sample_limit: int = 5,
+    probe_fn=None,
+) -> float | None:
+    """Return median duration (s) of existing `SxxEyy` episodes in `season_dir`, or None."""
+    if not season_dir or sample_limit <= 0:
+        return None
+    sdir = Path(season_dir)
+    if not sdir.is_dir():
+        return None
+    candidates: list[Path] = []
+    try:
+        for entry in sdir.iterdir():
+            if not _SEASON_EP_MKV_RE.search(entry.name):
+                continue
+            try:
+                if not entry.is_file() or entry.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+            candidates.append(entry)
+    except OSError:
+        return None
+    if len(candidates) < 2:
+        return None
+    candidates.sort(key=lambda p: p.name.casefold())
+    if len(candidates) > sample_limit:
+        if sample_limit == 1:
+            sampled = [candidates[-1]]
+        else:
+            n = len(candidates)
+            idxs = [
+                round(i * (n - 1) / (sample_limit - 1))
+                for i in range(sample_limit)
+            ]
+            sampled = [candidates[idx] for idx in idxs]
+    else:
+        sampled = candidates
+    probe = ffprobe_dur_s if probe_fn is None else probe_fn
+    durs: list[float] = []
+    for path in sampled:
+        try:
+            dur = float(probe(str(path)))
+        except Exception:
+            continue
+        if SEASON_MEDIAN_MIN_S <= dur <= SEASON_MEDIAN_MAX_S:
+            durs.append(dur)
+    if len(durs) < 2:
+        return None
+    return float(_median(durs))
+
 
 def episode_bonus_split(
     cand: list[tuple[int, int]],
     *,
     protected_ids: Iterable[int] | None = None,
     ratio: float | None = None,
+    season_median_s: float | None = None,
 ) -> tuple[list[int], list[int], float | None]:
     """Split episode candidates into `(episode_ids, bonus_ids, threshold_s)`.
 
-    Demotes short duration outliers (`duration_s < 0.60 * median`) to Extras
-    once at least 3 episode candidates establish a reliable runtime cluster.
-    Titles explicitly listed in `protected_ids` (for example, contracted
-    `expected_title_ids`) are never demoted.
+    When `season_median_s` is provided, anchors the episode floor on the
+    existing season median (`max(TV_MIN_DUR_S, 0.65 * season_median_s)` unless
+    `season_median_s < TV_MIN_DUR_S`). Otherwise demotes short duration
+    outliers (`duration_s < 0.60 * median`) to Extras once at least 3 episode
+    candidates establish a reliable runtime cluster. Titles explicitly listed
+    in `protected_ids` (for example, contracted `expected_title_ids`) are
+    never demoted.
     """
+    if not cand:
+        return [], [], None
+    protected = set(protected_ids or ())
+    if season_median_s is not None and season_median_s > 0:
+        low, _high, _playall = _season_episode_bounds(season_median_s)
+        thr = low if ratio is None else float(ratio) * float(season_median_s)
+        eps = sorted(t for t, d in cand if d >= thr or t in protected)
+        bonus = sorted(t for t, d in cand if d < thr and t not in protected)
+        return eps, bonus, thr
     if len(cand) < TV_OUTLIER_MIN_COUNT:
         return sorted(t for t, _ in cand), [], None
-    protected = set(protected_ids or ())
     eff_ratio = TV_OUTLIER_MEDIAN_RATIO if ratio is None else ratio
     thr = eff_ratio * _median([d for _, d in cand])
     eps = sorted(t for t, d in cand if d >= thr or t in protected)
@@ -233,21 +317,28 @@ def episode_bonus_split(
     return eps, bonus, thr
 
 
-def play_all_title_ids(info: dict) -> set[int]:
+def play_all_title_ids(
+    info: dict,
+    *,
+    season_median_s: float | None = None,
+    protected_ids: Iterable[int] | None = None,
+) -> set[int]:
     """Identify titles judged to be 'play all' compilations of episode subsets.
 
     Handles both single and dual equal-length play-alls by filtering eligible
     part lengths per-part (`d >= PLAY_ALL_MIN_RATIO * od`) rather than comparing
-    against `max(others)`.
+    against `max(others)`. When `season_median_s` is provided and the disc has
+    at least one standalone episode in-band, titles exceeding
+    `1.85 * season_median_s` are also classified as play-all (never overriding
+    `protected_ids`).
     """
-    durs = [
+    protected = set(protected_ids or ())
+    all_durs = [
         (tid, parse_duration(t.get(9, "0:00:00")))
         for tid, t in info["titles"].items()
     ]
-    durs = [(tid, d) for tid, d in durs if d >= TV_MIN_DUR_S]
+    durs = [(tid, d) for tid, d in all_durs if d >= TV_MIN_DUR_S]
     out: set[int] = set()
-    if len(durs) < PLAY_ALL_MIN_PARTS + 1:
-        return out
 
     def proper_subset_sum_matches(
         target: int, parts: list[int], min_parts: int
@@ -269,21 +360,38 @@ def play_all_title_ids(info: dict) -> set[int]:
                 return True
         return False
 
-    for tid, d in durs:
-        others = [od for otid, od in durs if otid != tid]
-        eligible = [od for od in others if d >= PLAY_ALL_MIN_RATIO * od]
-        if len(eligible) < PLAY_ALL_MIN_PARTS:
-            continue
-        s_all = sum(eligible)
-        if s_all > 0 and abs(d - s_all) / s_all <= PLAY_ALL_SUM_TOL:
-            out.add(tid)
-            continue
-        if proper_subset_sum_matches(d, eligible, min_parts=3):
-            out.add(tid)
+    if len(durs) >= PLAY_ALL_MIN_PARTS + 1:
+        for tid, d in durs:
+            others = [od for otid, od in durs if otid != tid]
+            eligible = [od for od in others if d >= PLAY_ALL_MIN_RATIO * od]
+            if len(eligible) < PLAY_ALL_MIN_PARTS:
+                continue
+            s_all = sum(eligible)
+            if s_all > 0 and abs(d - s_all) / s_all <= PLAY_ALL_SUM_TOL:
+                out.add(tid)
+                continue
+            if proper_subset_sum_matches(d, eligible, min_parts=3):
+                out.add(tid)
+
+    if season_median_s is not None and season_median_s > 0:
+        low, high, playall_thr = _season_episode_bounds(season_median_s)
+        has_in_band = any(low <= d <= high for _, d in all_durs)
+        if has_in_band:
+            for tid, d in all_durs:
+                if d > playall_thr:
+                    out.add(tid)
+
+    if protected:
+        out.difference_update(protected)
     return out
 
 
-def select_titles(item: QueueItem, info: dict) -> list[int]:
+def select_titles(
+    item: QueueItem,
+    info: dict,
+    *,
+    season_median_s: float | None = None,
+) -> list[int]:
     """Choose the primary title IDs to rip for a movie, double-feature, or TV disc."""
     durs = [
         (tid, parse_duration(t.get(9, "0:00:00")))
@@ -326,36 +434,60 @@ def select_titles(item: QueueItem, info: dict) -> list[int]:
             return [best_tid]
         return [longest_tid]
 
-    play_all = play_all_title_ids(info)
+    protected = set(item.expected_title_ids or ())
+    play_all = play_all_title_ids(
+        info, season_median_s=season_median_s, protected_ids=protected
+    )
+    min_dur: float = float(TV_MIN_DUR_S)
+    if season_median_s is not None and 0 < season_median_s < TV_MIN_DUR_S:
+        min_dur = _season_episode_bounds(season_median_s)[0]
     cand = [
         (tid, dur)
         for tid, dur in durs
-        if dur >= TV_MIN_DUR_S and tid not in play_all
+        if (dur >= min_dur or tid in protected) and tid not in play_all
     ]
     eps, _bonus, _thr = episode_bonus_split(
-        cand, protected_ids=item.expected_title_ids
+        cand,
+        protected_ids=item.expected_title_ids,
+        season_median_s=season_median_s,
     )
     return eps
 
 
-def log_title_audit(args, item: QueueItem, info: dict, title_ids: list[int]) -> None:
+def log_title_audit(
+    args,
+    item: QueueItem,
+    info: dict,
+    title_ids: list[int],
+    *,
+    season_median_s: float | None = None,
+) -> None:
     """Log the disc's full title table and keep/skip rationale to console and state log."""
     chosen = set(title_ids)
     play_all = (
-        play_all_title_ids(info)
+        play_all_title_ids(
+            info,
+            season_median_s=season_median_s,
+            protected_ids=item.expected_title_ids,
+        )
         if item.type not in ("movie", "double-feature")
         else set()
     )
     bonus_gate: set[int] = set()
     if item.type not in ("movie", "double-feature"):
+        min_dur: float = float(TV_MIN_DUR_S)
+        if season_median_s is not None and 0 < season_median_s < TV_MIN_DUR_S:
+            min_dur = _season_episode_bounds(season_median_s)[0]
         _cand = [
             (tid, parse_duration(info["titles"][tid].get(9, "0:00:00")))
             for tid in info["titles"]
-            if parse_duration(info["titles"][tid].get(9, "0:00:00")) >= TV_MIN_DUR_S
+            if parse_duration(info["titles"][tid].get(9, "0:00:00")) >= min_dur
             and tid not in play_all
         ]
         _eps, _bonus_ids, _thr = episode_bonus_split(
-            _cand, protected_ids=item.expected_title_ids
+            _cand,
+            protected_ids=item.expected_title_ids,
+            season_median_s=season_median_s,
         )
         bonus_gate = set(_bonus_ids)
     floor = TV_MIN_DUR_S if item.type != "movie" else 0
@@ -449,21 +581,31 @@ def planned_rip_selectors(
     title_ids: list[int],
     *,
     skip_extras: bool = False,
+    season_median_s: float | None = None,
 ) -> tuple[list[str], set[int]]:
     """Return `(makemkvcon_selectors, skipped_play_all_ids)`.
 
     Never pre-skips any title in `item.expected_title_ids`, and only pre-skips
-    structurally corroborated (>= 3 parts, matching byte totals) play-all titles.
-    When `skip_extras=True` for `tv-season`, omits bonus titles shorter than
-    `TV_MIN_DUR_S` (while still never omitting `item.expected_title_ids`).
+    structurally corroborated (>= 3 parts, matching byte totals) play-all titles
+    or titles exceeding `1.85 * season_median_s` when an existing season median
+    anchors real in-band episodes. When `skip_extras=True` for `tv-season`,
+    omits bonus titles shorter than the episode floor (while still never
+    omitting `item.expected_title_ids`).
     """
     if item.type == "movie":
         return [str(tid) for tid in title_ids], set()
     titles = info.get("titles", {}) if isinstance(info, dict) else {}
     if item.type == "tv-season" and titles:
         protected_tids = set(item.expected_title_ids or ())
-        play_all = play_all_title_ids(info)
+        play_all = play_all_title_ids(
+            info, season_median_s=season_median_s, protected_ids=protected_tids
+        )
         skippable: set[int] = set()
+        season_bounds = (
+            _season_episode_bounds(season_median_s)
+            if (season_median_s is not None and season_median_s > 0)
+            else None
+        )
         if play_all:
             non_play_all_eps = [
                 (
@@ -475,6 +617,14 @@ def planned_rip_selectors(
                 if tid not in play_all
                 and parse_duration(title.get(9, "0:00:00")) >= TV_MIN_DUR_S
             ]
+            has_in_band_ep = False
+            if season_bounds is not None:
+                low_s, high_s, _pa_s = season_bounds
+                has_in_band_ep = any(
+                    low_s <= parse_duration(title.get(9, "0:00:00")) <= high_s
+                    for tid, title in titles.items()
+                    if tid not in play_all
+                )
             for pa_tid in play_all:
                 if pa_tid in protected_tids:
                     continue
@@ -485,14 +635,23 @@ def planned_rip_selectors(
                     pa_dur, pa_bytes, non_play_all_eps
                 ):
                     skippable.add(pa_tid)
+                elif (
+                    season_bounds is not None
+                    and has_in_band_ep
+                    and pa_dur > season_bounds[2]
+                ):
+                    skippable.add(pa_tid)
         if skip_extras:
+            ep_floor = (
+                season_bounds[0] if season_bounds is not None else float(TV_MIN_DUR_S)
+            )
             keep_ids = sorted(
                 tid
                 for tid, title in titles.items()
                 if tid not in skippable
                 and (
                     tid in protected_tids
-                    or parse_duration(title.get(9, "0:00:00")) >= TV_MIN_DUR_S
+                    or parse_duration(title.get(9, "0:00:00")) >= ep_floor
                 )
             )
             if keep_ids:
@@ -516,6 +675,7 @@ def staging_space_requirement(
     *,
     split_playall: bool = True,
     skip_extras: bool = False,
+    season_median_s: float | None = None,
 ) -> tuple[float, float | None, bool]:
     """Return `(required_gb, selected_gb, used_legacy_fallback)`."""
     legacy_gb = 110.0 if (item.format or "").upper() == "4K" else 60.0
@@ -524,7 +684,11 @@ def staging_space_requirement(
         written_ids = list(title_ids)
     else:
         selectors, skipped_play_all = planned_rip_selectors(
-            item, info, title_ids, skip_extras=skip_extras
+            item,
+            info,
+            title_ids,
+            skip_extras=skip_extras,
+            season_median_s=season_median_s,
         )
         if selectors != ["all"]:
             written_ids = [int(s) for s in selectors if str(s).isdigit()]

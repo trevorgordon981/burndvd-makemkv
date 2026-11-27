@@ -96,6 +96,7 @@ from burndvd.selection import (
     _alt_playlist_duplicate,
     episode_bonus_split,
     existing_content_collision,
+    existing_season_median_dur_s,
     movie_filename,
     partition_episode_contract,
     planned_rip_selectors,
@@ -964,6 +965,47 @@ def resolve_fallback_title_mapping(
     return proven
 
 
+def _is_fatal_drive_loss(reason: str) -> bool:
+    """Return True when a MakeMKV error reflects whole-drive/disc loss rather than one bad title."""
+    low = (reason or "").casefold()
+    return (
+        "failed to open disc" in low
+        or "no disc inserted" in low
+        or "cannot open device" in low
+    )
+
+
+def _log_missing_episode(
+    *,
+    show_title: str,
+    season: int,
+    episode: int,
+    title_id: int,
+    error: str,
+) -> Path | None:
+    """Append a skipped-episode record to the missing-episodes ledger."""
+    log_path = Path(
+        os.environ.get(
+            "BURNDVD_MISSING_EPISODES_LOG",
+            str(Path.home() / ".cache" / "burndvd" / "missing-episodes.log"),
+        )
+    )
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    ep_code = f"S{int(season):02d}E{int(episode):02d}"
+    clean_err = re.sub(r"[\r\n]+", " ", str(error or "")).strip()
+    line = (
+        f"{ts} | {show_title} | Season {int(season):02d} | {ep_code} | "
+        f"t{int(title_id):02d} | {clean_err}\n"
+    )
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        return log_path
+    except OSError:
+        return None
+
+
 def rip(
     args,
     item: QueueItem,
@@ -972,13 +1014,23 @@ def rip(
     target_dir: Path,
     state: dict,
     disc_n: int,
+    *,
+    season_median_s: float | None = None,
 ):
     """Rip one disc to local staging, optionally falling back to mkvmerge for
     unencrypted BDs on MakeMKV failure, then publish safely to NAS."""
     preverify_holder: dict = {"pool": None, "transferred": False}
     try:
         ok, payload = _rip_impl(
-            args, item, info, title_ids, target_dir, state, disc_n, preverify_holder
+            args,
+            item,
+            info,
+            title_ids,
+            target_dir,
+            state,
+            disc_n,
+            preverify_holder,
+            season_median_s=season_median_s,
         )
         if not ok:
             clear_tv_slot_reservation(os.getpid())
@@ -998,6 +1050,8 @@ def _rip_impl(
     state: dict,
     disc_n: int,
     preverify_holder: dict,
+    *,
+    season_median_s: float | None = None,
 ):
     if item.type == "tv-season" and getattr(args, "overwrite", False):
         return False, "--overwrite is forbidden for TV in every mode"
@@ -1060,6 +1114,12 @@ def _rip_impl(
             f"low disk space at target: {free_gb:.1f}GB free, need {args.min_free_gb}GB",
         )
 
+    if season_median_s is None and item.type == "tv-season":
+        if getattr(args, "_season_median_computed", False):
+            season_median_s = getattr(args, "_season_median_s", None)
+        else:
+            season_median_s = existing_season_median_dur_s(target_dir)
+
     LOCAL_STAGING_BASE.mkdir(parents=True, exist_ok=True)
     local_free_gb = shutil.disk_usage(LOCAL_STAGING_BASE).free / 1e9
     skip_extras = bool(getattr(args, "no_extras", False))
@@ -1069,6 +1129,7 @@ def _rip_impl(
         title_ids,
         split_playall=not getattr(args, "no_split_playall", False),
         skip_extras=skip_extras,
+        season_median_s=season_median_s,
     )
     active_other_rips = 0
     try:
@@ -1118,7 +1179,11 @@ def _rip_impl(
     if item.type == "movie" and len(title_ids) != 1:
         return False, f"movie rip expects 1 title, got {title_ids}"
     selectors, skipped_play_all = planned_rip_selectors(
-        item, info, title_ids, skip_extras=skip_extras
+        item,
+        info,
+        title_ids,
+        skip_extras=skip_extras,
+        season_median_s=season_median_s,
     )
     if (
         item.type == "tv-season"
@@ -1154,6 +1219,18 @@ def _rip_impl(
     stall_sec = stall_timeout_for(item.format)
     fail_reason = None
     multi_sel = len(selectors) > 1
+    is_contract_bound_tv = bool(
+        item.expected_disc_episodes > 0 or item.expected_title_ids
+    )
+    allow_skip_bad_titles = (
+        item.type == "tv-season"
+        and multi_sel
+        and not getattr(args, "rerip_review", False)
+        and not is_contract_bound_tv
+        and getattr(args, "skip_bad_titles", True)
+    )
+    skipped_bad_titles: list[int] = []
+    skipped_bad_title_records: list[tuple[int | None, str]] = []
 
     do_preverify = bool(getattr(args, "verify", False)) and multi_sel
     preverify_pool: concurrent.futures.ThreadPoolExecutor | None = (
@@ -1193,6 +1270,7 @@ def _rip_impl(
 
     for sel_idx, selector in enumerate(selectors, 1):
         sel_start = time.time()
+        before_mkvs = set(staging.glob("*.mkv"))
         resolved_device = resolve_makemkv_device(args)
         cmd = [
             args.makemkvcon,
@@ -1349,6 +1427,31 @@ def _rip_impl(
                         f"{failed} failed (partial)"
                     )
         if fail_reason is not None:
+            if allow_skip_bad_titles and not _is_fatal_drive_loss(fail_reason):
+                failed_tid = int(selector) if str(selector).isdigit() else None
+                for cand_mkv in set(staging.glob("*.mkv")) - before_mkvs:
+                    try:
+                        cand_mkv.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if failed_tid is not None:
+                    skipped_bad_titles.append(failed_tid)
+                skipped_bad_title_records.append((failed_tid, fail_reason))
+                tid_tag = (
+                    f"t{failed_tid:02d}" if failed_tid is not None else str(selector)
+                )
+                print(
+                    f"{C.YLW}Skipping bad title {tid_tag}; continuing remaining titles... "
+                    f"({fail_reason}){C.R}",
+                    flush=True,
+                )
+                append_log(
+                    args,
+                    f"SKIP_BAD_TITLE {item.title} S{item.season:02d}D{disc_n} "
+                    f"{tid_tag} :: {fail_reason}",
+                )
+                fail_reason = None
+                continue
             break
         if preverify_pool is not None:
             for new_mkv in sorted(staging.glob("*.mkv")):
@@ -1366,6 +1469,13 @@ def _rip_impl(
     used_fallback = False
     fallback_file_playlists: dict[str, str] = {}
     rips: list[Path] = []
+
+    if fail_reason is None and skipped_bad_title_records:
+        if not list(staging.glob("*.mkv")):
+            fail_reason = (
+                f"all {len(selectors)} titles failed; last error: "
+                f"{skipped_bad_title_records[-1][1]}"
+            )
 
     if fail_reason is not None:
         # Automatic mkvmerge unencrypted-BD fallback (enabled by default for BD/4K).
@@ -1679,7 +1789,15 @@ def _rip_impl(
         proven_fallback_map: dict[Path, int] = {}
 
         rips = split_chaptered_playall(args, rips, staging)
-        play_all = set() if used_fallback else play_all_title_ids(info)
+        play_all = (
+            set()
+            if used_fallback
+            else play_all_title_ids(
+                info,
+                season_median_s=season_median_s,
+                protected_ids=item.expected_title_ids,
+            )
+        )
         episode_rips = [
             p
             for p in rips
@@ -1750,7 +1868,11 @@ def _rip_impl(
             print(f"{C.D}  review attempt: {_review_dir}{C.R}")
 
         _gcand = [(title_num_from_filename(pp.name), _src_dur_s(pp)) for pp in episode_rips]
-        _gkeep, _gbonus, _gthr = episode_bonus_split(_gcand)
+        _gkeep, _gbonus, _gthr = episode_bonus_split(
+            _gcand,
+            protected_ids=item.expected_title_ids,
+            season_median_s=season_median_s,
+        )
         if _gbonus:
             _gbonus_set = set(_gbonus)
             _gdemoted = [
@@ -2018,8 +2140,23 @@ def _rip_impl(
                         f"refusing publication; RIP PRESERVED at {staging}",
                     )
 
+        skipped_bad_episode_records = [
+            (tid, err)
+            for tid, err in skipped_bad_title_records
+            if tid is not None and tid in title_ids
+        ]
         rips = episode_rips
         if not rips:
+            if skipped_bad_episode_records:
+                return _salvage_and_fail(
+                    args,
+                    item,
+                    info,
+                    disc_n,
+                    staging,
+                    target_dir,
+                    f"all episode titles failed; last error: {skipped_bad_episode_records[-1][1]}",
+                )
             print(f"{C.YLW}  No titles >= {TV_MIN_DUR_S}s — extras-only disc.{C.R}")
             early_payload: dict = {"elapsed_s": elapsed, "files": finals}
             if used_fallback:
@@ -2034,19 +2171,68 @@ def _rip_impl(
             _attach_preverify(early_payload)
             return True, early_payload
 
+        skipped_bad_episodes: list[dict] = []
         with season_dir_lock(target_dir, what="rename"):
             start_ep = starting_ep(item, disc_n, state, target_dir=target_dir)
             proposed = []
-            for i, src in enumerate(rips):
-                ep = start_ep + i
-                tnum = title_num_from_filename(src.name)
-                dur_str = (
-                    info.get("titles", {}).get(tnum, {}).get(9, "?:??:??")
-                    if (tnum is not None and not used_fallback)
-                    else fmt_dur(_src_dur_s(src))
+            use_exact_title_slots = bool(
+                skipped_bad_episode_records and not used_fallback and title_ids
+            )
+            if use_exact_title_slots:
+                tid_order = {tid: idx for idx, tid in enumerate(title_ids)}
+                ordered_rips = sorted(
+                    rips,
+                    key=lambda p: (
+                        tid_order.get(title_num_from_filename(p.name), len(title_ids)),
+                        p.name,
+                    ),
                 )
-                size_gb = src.stat().st_size / 1e9
-                proposed.append((src, ep, tnum, dur_str, size_gb))
+                used_slots: set[int] = set()
+                next_fallback_slot = len(title_ids)
+                for src in ordered_rips:
+                    tnum = title_num_from_filename(src.name)
+                    if (
+                        tnum is not None
+                        and tnum in tid_order
+                        and tid_order[tnum] not in used_slots
+                    ):
+                        slot_idx = tid_order[tnum]
+                    else:
+                        while next_fallback_slot in used_slots:
+                            next_fallback_slot += 1
+                        slot_idx = next_fallback_slot
+                        next_fallback_slot += 1
+                    used_slots.add(slot_idx)
+                    ep = start_ep + slot_idx
+                    dur_str = (
+                        info.get("titles", {}).get(tnum, {}).get(9, "?:??:??")
+                        if tnum is not None
+                        else fmt_dur(_src_dur_s(src))
+                    )
+                    size_gb = src.stat().st_size / 1e9
+                    proposed.append((src, ep, tnum, dur_str, size_gb))
+                for bad_tid, bad_err in skipped_bad_episode_records:
+                    bad_slot = tid_order[bad_tid]
+                    bad_ep = start_ep + bad_slot
+                    skipped_bad_episodes.append(
+                        {
+                            "title_id": bad_tid,
+                            "episode": bad_ep,
+                            "episode_code": f"S{item.season:02d}E{bad_ep:02d}",
+                            "error": bad_err,
+                        }
+                    )
+            else:
+                for i, src in enumerate(rips):
+                    ep = start_ep + i
+                    tnum = title_num_from_filename(src.name)
+                    dur_str = (
+                        info.get("titles", {}).get(tnum, {}).get(9, "?:??:??")
+                        if (tnum is not None and not used_fallback)
+                        else fmt_dur(_src_dur_s(src))
+                    )
+                    size_gb = src.stat().st_size / 1e9
+                    proposed.append((src, ep, tnum, dur_str, size_gb))
 
             print(f"\n{C.B}Proposed episode mapping (disc {disc_n}/{item.discs}):{C.R}")
             for src, ep, tnum, dur_str, size_gb in proposed:
@@ -2107,7 +2293,26 @@ def _rip_impl(
                         f"protected TV publication failed: {emit_error}; RIP "
                         f"PRESERVED at {staging}",
                     )
-                record_episode_count(item, disc_n, len(proposed), state)
+                if skipped_bad_episodes:
+                    max_ep = max(ep for _, ep, _, _, _ in proposed)
+                    consumed_slots = max(len(title_ids), max_ep - start_ep + 1)
+                    record_episode_count(item, disc_n, consumed_slots, state)
+                    for rec in skipped_bad_episodes:
+                        log_path = _log_missing_episode(
+                            show_title=item.title,
+                            season=item.season,
+                            episode=rec["episode"],
+                            title_id=rec["title_id"],
+                            error=rec["error"],
+                        )
+                        print(
+                            f"{C.YLW}  MISSING EPISODE: {rec['episode_code']} "
+                            f"(t{rec['title_id']:02d}) — logged to "
+                            f"{log_path or 'missing-episodes.log'}{C.R}",
+                            flush=True,
+                        )
+                else:
+                    record_episode_count(item, disc_n, len(proposed), state)
             else:
                 try:
                     manual_dir = tv_review_capture_dir(
@@ -2183,6 +2388,8 @@ def _rip_impl(
         payload["used_fallback"] = True
     if item.type == "tv-season" and route_to_review:
         payload["routed_to_review"] = True
+    if item.type == "tv-season" and skipped_bad_episodes:
+        payload["skipped_bad_episodes"] = skipped_bad_episodes
     if getattr(args, "sync_move", False):
         shutil.rmtree(staging, ignore_errors=True)
         return True, payload

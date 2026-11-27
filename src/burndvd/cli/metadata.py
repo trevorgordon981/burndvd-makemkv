@@ -22,6 +22,7 @@ def main() -> int:
 
     defaults = subparsers.add_parser("defaults")
     defaults.add_argument("volume")
+    defaults.add_argument("--tv-root", action="append", default=[])
 
     normalize = subparsers.add_parser("normalize-movie")
     normalize.add_argument("title")
@@ -60,7 +61,11 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command == "defaults":
-        print("\n".join(infer_defaults(args.volume)))
+        print(
+            "\n".join(
+                infer_defaults(args.volume, tv_roots=args.tv_root or None)
+            )
+        )
         return 0
     if args.command == "normalize-movie":
         print(normalize_movie_title(args.title))

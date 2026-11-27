@@ -110,6 +110,55 @@ SUBOCR_LOCK_PATH = Path(
     )
 )
 
+USER_CONFIG_ENV = "BURNDVD_CONFIG"
+USER_CONFIG_DEFAULT = Path.home() / ".config" / "burndvd" / "config"
+
+
+def load_user_config(path: Path | str | None = None) -> dict[str, str]:
+    """Load simple `key=value` user preferences from `~/.config/burndvd/config`."""
+    if path is not None:
+        cfg_path = Path(path)
+    else:
+        env_path = os.environ.get(USER_CONFIG_ENV, "").strip()
+        cfg_path = (
+            Path(env_path)
+            if env_path
+            else (Path.home() / ".config" / "burndvd" / "config")
+        )
+    try:
+        raw = cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[str, str] = {}
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, val = stripped.split("=", 1)
+        key = key.strip().lower()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+
+def config_bool(cfg: dict[str, str], key: str, default: bool = False) -> bool:
+    """Parse a boolean setting from a loaded user config mapping."""
+    if not isinstance(cfg, dict):
+        return bool(default)
+    raw = cfg.get(key.strip().lower())
+    if raw is None:
+        return bool(default)
+    norm = str(raw).strip().lower()
+    if norm in ("1", "true", "yes", "on"):
+        return True
+    if norm in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
 # --- Ripping, probing, and selection thresholds ---
 STAGING_GROWTH_FACTOR = 1.05
 STAGING_HEADROOM_GB = 8.0

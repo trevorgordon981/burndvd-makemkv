@@ -20,7 +20,9 @@ from burndvd.config import (
     NONINTERACTIVE_RETRY_DELAY_S,
     PHYSICAL_PROBE_RETRY_DELAY_S,
     TV_MIN_DUR_S,
+    config_bool,
     fmt_dur,
+    load_user_config,
 )
 from burndvd.drive import (
     _drive_identity,
@@ -76,10 +78,18 @@ from burndvd.ripper import (
 from burndvd.selection import (
     automatic_review_contract_error,
     bound_physical_disc,
+    existing_season_median_dur_s,
     log_title_audit,
     loose_match,
     select_titles,
 )
+
+
+def _default_no_extras() -> bool:
+    env_val = os.environ.get("BURNDVD_NO_EXTRAS")
+    if env_val is not None and env_val.strip() != "":
+        return env_val.strip().lower() in ("1", "true", "yes", "on")
+    return config_bool(load_user_config(), "no_extras", default=False)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -137,12 +147,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--no-extras",
+        dest="no_extras",
         action="store_true",
-        default=(
-            os.environ.get("BURNDVD_NO_EXTRAS", "").strip().lower()
-            in ("1", "true", "yes")
-        ),
+        default=_default_no_extras(),
         help="skip ripping bonus/extra titles shorter than TV_MIN_DUR_S on TV discs",
+    )
+    ap.add_argument(
+        "--with-extras",
+        dest="no_extras",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        help="include bonus/extra titles on TV discs (overrides --no-extras, env, and user config)",
     )
     ap.add_argument(
         "--allow-mkvmerge-fallback",
@@ -578,8 +593,21 @@ def main() -> None:
                 print("Eject and try again.")
                 continue
 
-        title_ids = select_titles(item, info)
-        log_title_audit(args, item, info, title_ids)
+        season_median_s = (
+            existing_season_median_dur_s(target)
+            if item.type == "tv-season"
+            else None
+        )
+        disc_args._season_median_s = season_median_s
+        disc_args._season_median_computed = True
+        if season_median_s is not None:
+            print(
+                f"  {C.D}Season duration anchor: median {fmt_dur(season_median_s)}{C.R}"
+            )
+        title_ids = select_titles(item, info, season_median_s=season_median_s)
+        log_title_audit(
+            args, item, info, title_ids, season_median_s=season_median_s
+        )
         if not title_ids:
             print(
                 f"{C.RED}No suitable titles on disc (TV floor: {TV_MIN_DUR_S}s).{C.R}"

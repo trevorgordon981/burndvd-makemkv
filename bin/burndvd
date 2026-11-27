@@ -191,7 +191,10 @@ burndvd — smart single-disc wrapper around burndvd-queue / ripqueue.py
 Usage:
   burndvd [OPTS...]               Detect inserted disc, confirm 1-3 prompts, and rip detached
   burndvd --drive <diskN|serial>  Target a specific optical drive by device node or serial
+  burndvd --watch --show TITLE --season N [OPTS...]
+                                  Zero-babysit 2-drive box-set watch daemon
   burndvd --no-extras             Skip ripping TV bonus/extra titles shorter than TV_MIN_DUR_S
+  burndvd --with-extras           Rip TV bonus/extra titles even when config sets no_extras=true
   burndvd --rerip-review          Capture a known TV disc into isolated out-of-library review
   burndvd --queue FILE [OPTS...]  Pass-through to burndvd-queue for multi-disc CSV queues
   burndvd doctor [--json]         Check binaries, optical drive, NAS mounts, space, and OCR
@@ -199,7 +202,9 @@ Usage:
 
 Options:
   --drive <diskN|serial>          Target a specific physical drive (e.g. disk5 or DRVSER00001)
+  --watch [OPTS...]               Run 2-drive box-set watch daemon (pass --watch --help for options)
   --no-extras                     Skip bonus/extra titles shorter than TV_MIN_DUR_S on TV discs
+  --with-extras                   Override sticky config no_extras=true and rip extras
   --rerip-review                  Route a known TV disc to review quarantine (published SxxExx unchanged)
   --queue FILE [OPTS...]          Run multi-disc CSV queue via burndvd-queue (accepts burndvd-queue flags
                                   such as --non-interactive, --on-fail, --verify, --device, --no-eject,
@@ -211,6 +216,7 @@ Environment variables:
   BURNDVD_DRIVE_DEVICE            Verified /dev/diskN device node exported to burndvd-queue
   BURNDVD_DRIVE_SERIAL            Verified optical drive hardware serial exported to burndvd-queue
   BURNDVD_NO_EXTRAS               Set to 1 to skip TV bonus/extra titles by default
+  BURNDVD_CONFIG                  User config file path (default: ~/.config/burndvd/config)
   BURNDVD_MEDIA_ROOT              SMB media library root (default: /Volumes/Media)
   BURNDVD_NFS_MEDIA_ROOT          NFS media library root (default: /private/nas/media)
   BURNDVD_LOG_DIR                 Log directory (default: ~/logs)
@@ -253,6 +259,15 @@ if [ "${1:-}" = "doctor" ]; then
     PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
         exec python3 -m burndvd.cli.doctor "$@"
 fi
+if [ "${1:-}" = "--watch" ] || [ "${1:-}" = "watch" ]; then
+    shift
+    if [ -x "$HOME/.pyenv/shims/python3" ]; then
+        PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
+            exec "$HOME/.pyenv/shims/python3" -m burndvd.cli.watch "$@"
+    fi
+    PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
+        exec python3 -m burndvd.cli.watch "$@"
+fi
 if [ "$HAS_QUEUE_ARG" = "0" ]; then
     for arg in "$@"; do
         if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
@@ -284,6 +299,18 @@ else
                 ;;
             --no-extras)
                 append_ripqueue_mode_arg_once "--no-extras"
+                shift
+                ;;
+            --with-extras)
+                _filtered_args=()
+                if [ "${#RIPQUEUE_MODE_ARGS[@]}" -gt 0 ]; then
+                    for _ex in "${RIPQUEUE_MODE_ARGS[@]}"; do
+                        [ "$_ex" = "--no-extras" ] && continue
+                        _filtered_args+=("$_ex")
+                    done
+                fi
+                RIPQUEUE_MODE_ARGS=(${_filtered_args[@]+"${_filtered_args[@]}"})
+                append_ripqueue_mode_arg_once "--with-extras"
                 shift
                 ;;
             --drive)
@@ -754,8 +781,11 @@ case "$DISC_TYPE" in
         ;;
 esac
 
+_DEFAULTS_NAS_ROOT=$(resolve_nas_root)
 { read -r DEFAULT_TYPE; read -r DEFAULT_SEASON; read -r DEFAULT_TITLE; } \
-    < <(run_metadata defaults "$VOLUME")
+    < <(run_metadata defaults "$VOLUME" \
+        --tv-root "$_DEFAULTS_NAS_ROOT/TV Shows" \
+        --tv-root "$_DEFAULTS_NAS_ROOT/TV Shows 4K")
 
 cat <<EOF
 Detected disc:
