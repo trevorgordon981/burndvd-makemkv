@@ -424,6 +424,41 @@ def _sha256_file(path: Path) -> tuple[str, int]:
     return h.hexdigest(), total
 
 
+def _compute_publish_identity(
+    src_path: Path,
+    *,
+    max_attempts: int = 3,
+    retry_delay_s: float = 0.05,
+) -> tuple[str, int, tuple[int, int]]:
+    """Compute required `(sha256, byte_size, (dev, ino))` before publish, retrying transient I/O errors.
+
+    Fails closed by raising `OSError` if the staged source cannot be stat'd and
+    hashed reliably, preventing un-hashed publication that would defeat
+    crash-recovery reconciliation.
+    """
+    attempts = max(1, int(max_attempts))
+    last_exc: OSError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            src_stat = os.lstat(src_path)
+            if not stat.S_ISREG(src_stat.st_mode):
+                raise OSError(f"staged source is not a regular file: {src_path}")
+            src_identity = (int(src_stat.st_dev), int(src_stat.st_ino))
+            src_sha256, expected_size = _sha256_file(src_path)
+            if not src_sha256:
+                raise OSError(f"empty pre-publish hash for staged source: {src_path}")
+            return src_sha256, int(expected_size), src_identity
+        except OSError as exc:
+            last_exc = exc
+            if exc.errno == errno.ENOENT or attempt >= attempts:
+                break
+            if retry_delay_s > 0:
+                time.sleep(retry_delay_s)
+    raise OSError(
+        f"pre-publish identity hash failed for {src_path} after {attempts} attempt(s): {last_exc}"
+    ) from last_exc
+
+
 def _fsync_dir(dir_path: Path) -> None:
     """Best-effort fsync of a directory entry on POSIX filesystems."""
     try:
@@ -969,35 +1004,26 @@ def _run_finalize(
                         files = [
                             str(dst) if fp == str(orig_dst) else fp for fp in files
                         ]
-                    expected_size: int | None = None
-                    src_sha256: str | None = None
-                    src_identity: tuple[int, int] | None = None
-                    try:
-                        src_stat = os.lstat(src_path)
-                        src_identity = (int(src_stat.st_dev), int(src_stat.st_ino))
-                        src_sha256, expected_size = _sha256_file(src_path)
-                    except OSError:
-                        expected_size = None
-                        src_sha256 = None
-                        src_identity = None
-
-                    # Phase 1: durably fsync per-file publish intent BEFORE publishing
-                    # so a crash between atomic rename and commit manifest can reconcile
-                    # via verified content identity without clobbering or self-colliding.
-                    if src_sha256 is not None and expected_size is not None:
-                        intent_rec = {
-                            "src": str(src_path),
-                            "orig_dst": str(orig_dst),
-                            "dst": str(dst),
-                            "size": int(expected_size),
-                            "sha256": src_sha256,
-                            "src_dev": src_identity[0] if src_identity else None,
-                            "src_ino": src_identity[1] if src_identity else None,
-                            "label": str(label),
-                            "created_at": time.time(),
-                        }
-                        publish_intents = _upsert_intent(publish_intents, intent_rec)
-                        _save_publish_intents(staging, publish_intents)
+                    # Phase 1: compute required staged-source identity (retrying transient
+                    # read errors) and durably fsync per-file publish intent BEFORE any
+                    # destination mutation/publish so a crash between atomic rename and
+                    # commit manifest always reconciles via verified content identity.
+                    src_sha256, expected_size, src_identity = _compute_publish_identity(
+                        src_path
+                    )
+                    intent_rec = {
+                        "src": str(src_path),
+                        "orig_dst": str(orig_dst),
+                        "dst": str(dst),
+                        "size": int(expected_size),
+                        "sha256": src_sha256,
+                        "src_dev": src_identity[0],
+                        "src_ino": src_identity[1],
+                        "label": str(label),
+                        "created_at": time.time(),
+                    }
+                    publish_intents = _upsert_intent(publish_intents, intent_rec)
+                    _save_publish_intents(staging, publish_intents)
 
                     # Phase 2: atomic no-replace publish, deferring staged-source retirement
                     # until AFTER the commit journal is durably persisted.

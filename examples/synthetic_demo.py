@@ -67,8 +67,9 @@ def _demo_watch_mode(root: Path) -> None:
         "\n".join(
             [
                 'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","RANDOM_MOVIE_2024","/dev/rdisk5"',
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_S01_D1","/dev/rdisk6"',
-                'DRV:2,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00003","STARLIGHT_S01_D2","/dev/rdisk7"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00004","STARLIGHT_D1","/dev/rdisk8"',
+                'DRV:2,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk6"',
+                'DRV:3,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00003","STARLIGHT_BRIGADE_S01_D2","/dev/rdisk7"',
             ]
         )
     )
@@ -134,7 +135,7 @@ def _demo_watch_mode(root: Path) -> None:
     for line in watch_out.getvalue().splitlines():
         print(f"  {line}")
     print(
-        f"  [OK] Unrelated disc rejected; 2 valid discs serialized E4+ and E7+ "
+        f"  [OK] Unrelated & partial-prefix discs rejected; 2 exact-match discs serialized E4+ and E7+ "
         f"in distinct attempt dirs with start_new_session=True.\n"
     )
     for w in spawned:
@@ -221,7 +222,7 @@ def _demo_checkrip_dashboard(root: Path) -> None:
             "drive_serial": "DRVSER00002",
             "title": "Starlight Brigade",
             "season": 1,
-            "volume": "STARLIGHT_S01_D1",
+            "volume": "STARLIGHT_BRIGADE_S01_D1",
             "episode_range": "S01E04-E06",
             "log_path": None,
             "staging": str(root / "stg6"),
@@ -233,14 +234,14 @@ def _demo_checkrip_dashboard(root: Path) -> None:
             "model": "HL-DT-ST BD-RE BU40N 1.03",
             "media_type": "BD-ROM",
             "device": "/dev/disk5",
-            "volume": "STARLIGHT_S01_D1",
+            "volume": "STARLIGHT_BRIGADE_S01_D1",
         },
         {
             "slot": 2,
             "model": "HL-DT-ST BD-RE BU40N 1.03",
             "media_type": "BD-ROM",
             "device": "/dev/disk6",
-            "volume": "STARLIGHT_S01_D1",
+            "volume": "STARLIGHT_BRIGADE_S01_D1",
         },
     ]
     with mock.patch.object(checkrip, "active_rips", return_value=fake_rips), \

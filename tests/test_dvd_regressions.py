@@ -1,4 +1,4 @@
-"""Targeted regression tests covering DVD-1 through DVD-7 acceptance criteria.
+"""Targeted regression tests covering DVD-1 through DVD-9 acceptance criteria.
 
 100% hardware-free: never touches real optical drives, MakeMKV binaries, or live NAS mounts.
 """
@@ -277,6 +277,162 @@ class TestDVD1WatchStrictBindingAndPreStagingRevalidation(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 4)
             self.assertEqual(rip_called, [])
             self.assertIn("--allow-fingerprint", stderr_buf.getvalue())
+
+    def test_dvd1_unattended_watch_rejects_partial_title_and_acronym_without_allowlist(self):
+        """DVD-1 residual: partial prefix (STARLIGHT_D1) and acronym (DBS_P10_D1) must NOT be admitted unattended."""
+        # Direct unit checks on volume_matches_show_intent
+        ok_partial, reason_partial = metadata.volume_matches_show_intent(
+            "STARLIGHT_D1", "Starlight Brigade", 1
+        )
+        self.assertFalse(ok_partial)
+        self.assertIn("partially matches", reason_partial)
+
+        ok_acronym, reason_acronym = metadata.volume_matches_show_intent(
+            "DBS_P10_D1", "Dragon Ball Super", 1
+        )
+        self.assertFalse(ok_acronym)
+        self.assertIn("partially matches", reason_acronym)
+
+        # Exact normalized full show title IS admitted
+        ok_exact, _ = metadata.volume_matches_show_intent(
+            "STARLIGHT_BRIGADE_S01_D1", "Starlight Brigade", 1
+        )
+        self.assertTrue(ok_exact)
+
+        # Explicit allowlist admits partial/alias volume cleanly
+        ok_allow, _ = metadata.volume_matches_show_intent(
+            "STARLIGHT_D1", "Starlight Brigade", 1, allowed_volumes=("STARLIGHT_D*",)
+        )
+        self.assertTrue(ok_allow)
+
+        # Interactive confirmation opt-in retains partial matching when allow_partial=True
+        ok_interactive, _ = metadata.volume_matches_show_intent(
+            "STARLIGHT_D1", "Starlight Brigade", 1, allow_partial=True
+        )
+        self.assertTrue(ok_interactive)
+
+        # End-to-end BoxSetWatcher: STARLIGHT_D1 & STARLIGHT_S01_D1 under Starlight Brigade -> zero launches/artifacts
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_root = root / "TV Shows" / "Starlight Brigade"
+            (target_root / "Season 01").mkdir(parents=True)
+            work_dir = root / "work"
+            partial_drives = _drv_output(
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_S01_D1","/dev/rdisk6"',
+            )
+            spawned: list[_FakeChildProc] = []
+            out_buf = io.StringIO()
+            cfg = WatchConfig(
+                show="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                poll_interval=0.05,
+                scan_wait=0.2,
+                log_dir=root / "logs",
+                work_dir=work_dir,
+                slots_dir=root / "slots",
+            )
+            watcher = BoxSetWatcher(
+                cfg,
+                list_drives_fn=lambda: partial_drives,
+                spawn_fn=lambda cmd, **kw: spawned.append(_FakeChildProc(91501, cmd, **kw)) or spawned[-1],
+                discover_procs_fn=lambda: [],
+                notify_fn=lambda _m: False,
+                out=out_buf,
+            )
+            self.assertEqual(watcher.poll_once(), [])
+            self.assertEqual(spawned, [])
+            self.assertFalse(work_dir.exists() and list(work_dir.rglob("*.csv")))
+            self.assertIn("REJECTED STARLIGHT_D1", out_buf.getvalue())
+            self.assertIn("REJECTED STARLIGHT_S01_D1", out_buf.getvalue())
+
+            # With explicit --allow-volume, STARLIGHT_D1 IS admitted cleanly
+            cfg_allow = WatchConfig(
+                show="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                poll_interval=0.05,
+                scan_wait=0.2,
+                log_dir=root / "logs2",
+                work_dir=root / "work2",
+                slots_dir=root / "slots2",
+                allowed_volumes=("STARLIGHT_D1",),
+            )
+            spawned2: list[_FakeChildProc] = []
+
+            def fake_spawn2(cmd, **kw):
+                proc = _FakeChildProc(91601 + len(spawned2), cmd, **kw)
+                proc.finish(0)
+                spawned2.append(proc)
+                return proc
+
+            watcher2 = BoxSetWatcher(
+                cfg_allow,
+                list_drives_fn=lambda: partial_drives,
+                spawn_fn=fake_spawn2,
+                discover_procs_fn=lambda: [],
+                notify_fn=lambda _m: False,
+                out=io.StringIO(),
+            )
+            launched2 = watcher2.poll_once()
+            self.assertEqual(len(launched2), 1)
+            self.assertEqual(launched2[0].volume, "STARLIGHT_D1")
+            watcher2.reap_finished()
+
+    def test_dvd1_ripqueue_strict_match_rejects_partial_title_probed_disc_before_staging(self):
+        """DVD-1 child revalidation: ripqueue --strict-disc-match rejects partial-prefix STARLIGHT_D1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            q = root / "queue.csv"
+            st = root / "state.json"
+            target_root = root / "TV Shows" / "Starlight Brigade"
+            (target_root / "Season 01").mkdir(parents=True)
+            metadata.write_queue(
+                q,
+                title="Starlight Brigade",
+                item_type="tv-season",
+                season="1",
+                episode_start="1",
+                target_root=str(target_root),
+                media_format="BD",
+                notes="watch:DRVSER00001:STARLIGHT_D1",
+            )
+            partial_info = {
+                "cinfo": {2: "STARLIGHT_D1"},
+                "titles": {0: {9: "0:42:00", 11: "2000000000"}},
+            }
+            rip_called = []
+            argv = [
+                "burndvd-queue",
+                "--queue", str(q),
+                "--state", str(st),
+                "--makemkvcon", sys.executable,
+                "--device", "iso:/fake",
+                "--non-interactive",
+                "--no-eject",
+                "--no-sound",
+                "--no-subocr",
+                "--strict-disc-match",
+            ]
+            stderr_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(sys, "argv", argv))
+                stack.enter_context(mock.patch.object(ripqueue.signal, "signal"))
+                stack.enter_context(mock.patch.object(ripqueue, "check_key_expiry"))
+                stack.enter_context(
+                    mock.patch.object(ripqueue, "wait_for_disc", return_value=("disc", partial_info))
+                )
+                stack.enter_context(
+                    mock.patch.object(ripqueue, "rip", side_effect=lambda *a, **k: rip_called.append(1))
+                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr_buf):
+                    with self.assertRaises(SystemExit) as ctx:
+                        ripqueue.main()
+
+            self.assertEqual(ctx.exception.code, 4)
+            self.assertEqual(rip_called, [])
+            self.assertIn("partially matches", stderr_buf.getvalue())
 
 
 class TestDVD2PublishJournalCrashRecovery(unittest.TestCase):
@@ -578,6 +734,158 @@ class TestDVD2PublishJournalCrashRecovery(unittest.TestCase):
             self.assertTrue(src1.is_file())
             self.assertTrue(src2.is_file())
 
+    def test_dvd8_transient_prehash_oserror_retries_before_publish_and_preserves_crash_recovery(self):
+        """DVD-8: Single transient prehash OSError is retried before mutation so intent exists on crash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            lib = root / "library"
+            stage.mkdir()
+            lib.mkdir()
+
+            src1 = stage / "ep1.mkv"
+            src2 = stage / "ep2.mkv"
+            src1.write_bytes(b"EPISODE-ONE-TRANSIENT")
+            src2.write_bytes(b"EPISODE-TWO-TRANSIENT")
+            dst1 = lib / "Show - S01E01.mkv"
+            dst2 = lib / "Show - S01E02.mkv"
+
+            args = self._base_args(root)
+            item = SimpleNamespace(title="Show", type="movie")
+            result = {
+                "files": [str(dst1), str(dst2)],
+                "move_jobs": [(src1, dst1, "ep1"), (src2, dst2, "ep2")],
+                "staging": str(stage),
+            }
+
+            real_sha = ripper._sha256_file
+            sha_calls = [0]
+
+            def flaky_once_sha(path):
+                sha_calls[0] += 1
+                if sha_calls[0] == 1:
+                    raise OSError(errno.EIO, "transient prehash read error")
+                return real_sha(path)
+
+            with mock.patch.object(ripper, "_sha256_file", side_effect=flaky_once_sha), \
+                 mock.patch.object(ripper, "_save_committed_manifest", side_effect=OSError("crash before manifest")), \
+                 mock.patch.object(ripper, "beep"), \
+                 mock.patch.object(ripper, "append_log"), \
+                 mock.patch.object(ripper, "run_subocr_postrip"):
+                ok1 = ripper._run_finalize(args, result, item, 1)
+
+            self.assertFalse(ok1)
+            self.assertGreaterEqual(sha_calls[0], 2, "prehash must retry transient OSError before publish")
+            self.assertTrue(dst1.is_file())
+            self.assertTrue((stage / ripper._PUBLISH_INTENT_NAME).is_file(), "intent MUST be written before publish")
+            self.assertTrue(src1.is_file())
+            self.assertFalse(dst2.exists())
+
+            # Fresh replay reconciles dst1 via intent and publishes dst2 cleanly (zero self-collision!).
+            fresh = {
+                "files": [str(dst1), str(dst2)],
+                "move_jobs": [(src1, dst1, "ep1"), (src2, dst2, "ep2")],
+                "staging": str(stage),
+            }
+            with mock.patch.object(ripper, "beep"), \
+                 mock.patch.object(ripper, "append_log"), \
+                 mock.patch.object(ripper, "run_subocr_postrip"):
+                ok2 = ripper._run_finalize(args, fresh, item, 1)
+
+            self.assertTrue(ok2)
+            self.assertEqual(dst1.read_bytes(), b"EPISODE-ONE-TRANSIENT")
+            self.assertEqual(dst2.read_bytes(), b"EPISODE-TWO-TRANSIENT")
+            self.assertFalse(stage.exists())
+
+    def test_dvd8_persistent_prehash_failure_aborts_fail_closed_before_any_publish(self):
+        """DVD-8: Persistent prehash failure MUST abort before rename/publish (never publish un-hashed files)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            lib = root / "library"
+            stage.mkdir()
+            lib.mkdir()
+
+            src1 = stage / "ep1.mkv"
+            src2 = stage / "ep2.mkv"
+            src1.write_bytes(b"EPISODE-ONE-SAFE")
+            src2.write_bytes(b"EPISODE-TWO-SAFE")
+            dst1 = lib / "Show - S01E01.mkv"
+            dst2 = lib / "Show - S01E02.mkv"
+
+            args = self._base_args(root)
+            item = SimpleNamespace(title="Show", type="movie")
+            result = {
+                "files": [str(dst1), str(dst2)],
+                "move_jobs": [(src1, dst1, "ep1"), (src2, dst2, "ep2")],
+                "staging": str(stage),
+            }
+
+            move_calls = []
+            with mock.patch.object(ripper, "_sha256_file", side_effect=OSError(errno.EIO, "persistent read error")), \
+                 mock.patch.object(ripper, "move_with_progress", side_effect=lambda *a, **k: move_calls.append(a)), \
+                 mock.patch.object(ripper, "beep"), \
+                 mock.patch.object(ripper, "append_log"), \
+                 mock.patch.object(ripper, "run_subocr_postrip"):
+                ok1 = ripper._run_finalize(args, result, item, 1)
+
+            self.assertFalse(ok1)
+            self.assertEqual(move_calls, [], "must NEVER publish/move when prehash fails")
+            self.assertFalse(dst1.exists())
+            self.assertFalse(dst2.exists())
+            self.assertTrue(src1.is_file())
+            self.assertTrue(src2.is_file())
+            self.assertFalse((stage / ripper._PUBLISH_INTENT_NAME).exists())
+
+            # Once I/O recovers, replay succeeds cleanly with both files published.
+            fresh = {
+                "files": [str(dst1), str(dst2)],
+                "move_jobs": [(src1, dst1, "ep1"), (src2, dst2, "ep2")],
+                "staging": str(stage),
+            }
+            with mock.patch.object(ripper, "beep"), \
+                 mock.patch.object(ripper, "append_log"), \
+                 mock.patch.object(ripper, "run_subocr_postrip"):
+                ok2 = ripper._run_finalize(args, fresh, item, 1)
+
+            self.assertTrue(ok2)
+            self.assertEqual(dst1.read_bytes(), b"EPISODE-ONE-SAFE")
+            self.assertEqual(dst2.read_bytes(), b"EPISODE-TWO-SAFE")
+            self.assertFalse(stage.exists())
+
+    def test_dvd8_intent_write_failure_aborts_before_any_publish(self):
+        """DVD-8: Failure to persist publish-intent journal MUST abort before rename/publish."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            lib = root / "library"
+            stage.mkdir()
+            lib.mkdir()
+
+            src1 = stage / "ep1.mkv"
+            src1.write_bytes(b"EPISODE-ONE-INTENT")
+            dst1 = lib / "Show - S01E01.mkv"
+
+            args = self._base_args(root)
+            item = SimpleNamespace(title="Show", type="movie")
+            result = {
+                "files": [str(dst1)],
+                "move_jobs": [(src1, dst1, "ep1")],
+                "staging": str(stage),
+            }
+            move_calls = []
+            with mock.patch.object(ripper, "_save_publish_intents", side_effect=OSError(errno.ENOSPC, "intent write failed")), \
+                 mock.patch.object(ripper, "move_with_progress", side_effect=lambda *a, **k: move_calls.append(a)), \
+                 mock.patch.object(ripper, "beep"), \
+                 mock.patch.object(ripper, "append_log"), \
+                 mock.patch.object(ripper, "run_subocr_postrip"):
+                ok = ripper._run_finalize(args, result, item, 1)
+
+            self.assertFalse(ok)
+            self.assertEqual(move_calls, [])
+            self.assertFalse(dst1.exists())
+            self.assertTrue(src1.is_file())
+
 
 class TestDVD3IndependentWatchersUniquenessAndLock(unittest.TestCase):
     """DVD-3: Independent watchers in the same second/volume must not collide on files or E1."""
@@ -592,10 +900,10 @@ class TestDVD3IndependentWatchersUniquenessAndLock(unittest.TestCase):
             slots_dir = root / "slots"
 
             drive1 = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_S01_D1","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk5"'
             )
             drive2 = _drv_output(
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_S01_D1","/dev/rdisk6"'
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk6"'
             )
             frozen_now = lambda: datetime.datetime(2026, 11, 26, 12, 0, 0)
             spawned: list[_FakeChildProc] = []
@@ -654,7 +962,7 @@ class TestDVD3IndependentWatchersUniquenessAndLock(unittest.TestCase):
 
             launched2_deferred = w2.poll_once()
             self.assertEqual(launched2_deferred, [])
-            self.assertIn("deferring STARLIGHT_S01_D1", w2_out.getvalue())
+            self.assertIn("deferring STARLIGHT_BRIGADE_S01_D1", w2_out.getvalue())
 
             # 2) Once Watcher 1's child publishes slot reservation (E1..E4), Watcher 2 launches at E5
             # with completely distinct attempt directory, queue/state/log paths (even in same second + same volume!).
@@ -685,6 +993,236 @@ class TestDVD3IndependentWatchersUniquenessAndLock(unittest.TestCase):
             w1.reap_finished()
             w2.reap_finished()
 
+    def test_dvd9_paired_watchers_with_matching_explicit_e1_reject_overlap(self):
+        """DVD-9 counterexample: paired watchers with matching explicit E1 override MUST NOT both launch for E1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_root = root / "TV Shows" / "Starlight Brigade"
+            (target_root / "Season 01").mkdir(parents=True)
+            work_dir = root / "work"
+            log_dir = root / "logs"
+            slots_dir = root / "slots"
+
+            drive1 = _drv_output(
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk5"'
+            )
+            drive2 = _drv_output(
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_S01_D2","/dev/rdisk6"'
+            )
+            spawned: list[_FakeChildProc] = []
+
+            def fake_spawn(cmd, **kw):
+                proc = _FakeChildProc(pid=95201 + len(spawned), cmd=cmd, **kw)
+                spawned.append(proc)
+                return proc
+
+            cfg1 = WatchConfig(
+                show="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                episode_start=1,
+                poll_interval=0.05,
+                scan_wait=0.05,
+                log_dir=log_dir,
+                work_dir=work_dir,
+                slots_dir=slots_dir,
+            )
+            cfg2 = WatchConfig(
+                show="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                episode_start=1,
+                poll_interval=0.05,
+                scan_wait=0.05,
+                log_dir=log_dir,
+                work_dir=work_dir,
+                slots_dir=slots_dir,
+            )
+
+            w1 = BoxSetWatcher(
+                cfg1,
+                list_drives_fn=lambda: drive1,
+                spawn_fn=fake_spawn,
+                discover_procs_fn=lambda: [],
+                notify_fn=lambda _m: False,
+                out=io.StringIO(),
+            )
+            w2_out = io.StringIO()
+            w2 = BoxSetWatcher(
+                cfg2,
+                list_drives_fn=lambda: drive2,
+                spawn_fn=fake_spawn,
+                discover_procs_fn=lambda: [],
+                notify_fn=lambda _m: False,
+                out=w2_out,
+            )
+
+            launched1 = w1.poll_once()
+            self.assertEqual(len(launched1), 1)
+            self.assertEqual(launched1[0].episode_start, 1)
+
+            # Second watcher with identical explicit episode_start=1 MUST reject overlap before spawning!
+            launched2 = w2.poll_once()
+            self.assertEqual(launched2, [])
+            self.assertEqual(len(spawned), 1)
+            self.assertIn("REJECTED STARLIGHT_BRIGADE_S01_D2", w2_out.getvalue())
+            self.assertIn("overlaps active scanning rip", w2_out.getvalue())
+            self.assertEqual(len(list(work_dir.glob("attempt-*"))), 1)
+
+            for p in spawned:
+                p.finish(0)
+            w1.reap_finished()
+            w2.reap_finished()
+
+    def test_dvd9_explicit_override_rejects_reserved_and_existing_but_allows_vacant_ranges(self):
+        """DVD-9: Reject overlaps with active slot reservations & existing files; preserve vacant-range overrides."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_root = root / "TV Shows" / "Starlight Brigade"
+            season_dir = target_root / "Season 01"
+            season_dir.mkdir(parents=True)
+            # Pre-existing E01, E02, and E10 on disk; E03..E09 are vacant, except active rip reserves E05..E08.
+            for ep in (1, 2, 10):
+                (season_dir / f"Starlight Brigade - S01E{ep:02d}.mkv").write_bytes(b"existing")
+
+            slots_dir = root / "slots"
+            metadata.write_tv_slot_reservation(
+                pid=95301,
+                title="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                episode_start=5,
+                episode_count=4,  # Reserves E05..E08
+                slots_dir=slots_dir,
+            )
+
+            drive = _drv_output(
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk5"'
+            )
+
+            def _try_override(ep_start: int):
+                spawned: list[_FakeChildProc] = []
+                out_buf = io.StringIO()
+                cfg = WatchConfig(
+                    show="Starlight Brigade",
+                    season=1,
+                    target_root=str(target_root),
+                    episode_start=ep_start,
+                    poll_interval=0.05,
+                    scan_wait=0.05,
+                    log_dir=root / f"logs-{ep_start}",
+                    work_dir=root / f"work-{ep_start}",
+                    slots_dir=slots_dir,
+                )
+                with mock.patch.object(metadata, "_pid_alive", side_effect=lambda p: p == 95301):
+                    w = BoxSetWatcher(
+                        cfg,
+                        list_drives_fn=lambda: drive,
+                        spawn_fn=lambda cmd, **kw: spawned.append(_FakeChildProc(95400 + ep_start, cmd, **kw)) or spawned[-1],
+                        discover_procs_fn=lambda: [],
+                        notify_fn=lambda _m: False,
+                        out=out_buf,
+                    )
+                    launched = w.poll_once()
+                    for p in spawned:
+                        p.finish(0)
+                    w.reap_finished()
+                return launched, out_buf.getvalue()
+
+            # E01 & E10 already exist on disk -> rejected
+            l1, out1 = _try_override(1)
+            self.assertEqual(l1, [])
+            self.assertIn("already exists in season directory", out1)
+
+            l10, out10 = _try_override(10)
+            self.assertEqual(l10, [])
+            self.assertIn("already exists in season directory", out10)
+
+            # E06 overlaps active reservation E05..E08 -> rejected
+            l6, out6 = _try_override(6)
+            self.assertEqual(l6, [])
+            self.assertIn("overlaps active rip pid 95301 reservation E5-E8", out6)
+
+            # E03 is a VACANT gap (not on disk, not in E05..E08) -> admitted!
+            l3, out3 = _try_override(3)
+            self.assertEqual(len(l3), 1)
+            self.assertEqual(l3[0].episode_start, 3)
+
+            # E09 is VACANT between E05..E08 and E10 -> admitted!
+            l9, out9 = _try_override(9)
+            self.assertEqual(len(l9), 1)
+            self.assertEqual(l9[0].episode_start, 9)
+
+    def test_dvd9_ripqueue_rejects_explicit_queue_episode_overlap_with_active_rip_before_staging(self):
+        """DVD-9: Direct burndvd-queue with overlapping queue episode_start rejects before rip()/staging."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            q = root / "queue.csv"
+            st = root / "state.json"
+            slots_dir = root / "slots"
+            target_root = root / "TV Shows" / "Starlight Brigade"
+            (target_root / "Season 01").mkdir(parents=True)
+            metadata.write_queue(
+                q,
+                title="Starlight Brigade",
+                item_type="tv-season",
+                season="1",
+                episode_start="2",
+                target_root=str(target_root),
+                media_format="BD",
+                notes="manual",
+            )
+            # Active concurrent rip reserves E01..E04
+            metadata.write_tv_slot_reservation(
+                pid=95501,
+                title="Starlight Brigade",
+                season=1,
+                target_root=str(target_root),
+                episode_start=1,
+                episode_count=4,
+                slots_dir=slots_dir,
+            )
+            info = {
+                "cinfo": {2: "STARLIGHT_BRIGADE_S01_D1"},
+                "titles": {
+                    0: {9: "0:42:00", 11: "2000000000"},
+                    1: {9: "0:43:00", 11: "2000000000"},
+                },
+            }
+            rip_called = []
+            argv = [
+                "burndvd-queue",
+                "--queue", str(q),
+                "--state", str(st),
+                "--makemkvcon", sys.executable,
+                "--device", "iso:/fake",
+                "--non-interactive",
+                "--no-eject",
+                "--no-sound",
+                "--no-subocr",
+            ]
+            stderr_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {metadata.ACTIVE_TV_SLOTS_ENV: str(slots_dir)}))
+                stack.enter_context(mock.patch.object(metadata, "_pid_alive", side_effect=lambda p: p == 95501))
+                stack.enter_context(mock.patch.object(metadata, "_discover_active_ripqueue_procs", return_value=[]))
+                stack.enter_context(mock.patch.object(sys, "argv", argv))
+                stack.enter_context(mock.patch.object(ripqueue.signal, "signal"))
+                stack.enter_context(mock.patch.object(ripqueue, "check_key_expiry"))
+                stack.enter_context(
+                    mock.patch.object(ripqueue, "wait_for_disc", return_value=("disc", info))
+                )
+                stack.enter_context(
+                    mock.patch.object(ripqueue, "rip", side_effect=lambda *a, **k: rip_called.append(1))
+                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr_buf):
+                    with self.assertRaises(SystemExit) as ctx:
+                        ripqueue.main()
+
+            self.assertEqual(ctx.exception.code, 4)
+            self.assertEqual(rip_called, [], "rip() must never be entered on overlapping active reservation")
+            self.assertIn("overlaps active rip pid 95501 reservation E1-E4", stderr_buf.getvalue())
+
 
 class TestDVD4ChildSessionIsolationAndPTYCtrlC(unittest.TestCase):
     """DVD-4: Ctrl-C on a real foreground PTY stops watcher while session-isolated child survives."""
@@ -695,7 +1233,7 @@ class TestDVD4ChildSessionIsolationAndPTYCtrlC(unittest.TestCase):
             target_root = root / "TV Shows" / "Starlight Brigade"
             (target_root / "Season 01").mkdir(parents=True)
             drive = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_S01_D1","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_S01_D1","/dev/rdisk5"'
             )
             seen_kwargs: list[dict] = []
 
@@ -751,7 +1289,7 @@ class TestDVD4ChildSessionIsolationAndPTYCtrlC(unittest.TestCase):
                 "from burndvd.drive import parse_makemkv_drives\n"
                 "from burndvd.watch import BoxSetWatcher, WatchConfig\n"
                 "drives = parse_makemkv_drives("
-                "'DRV:0,2,999,12,\"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001\",\"STARLIGHT_S01_D1\",\"/dev/rdisk5\"')\n"
+                "'DRV:0,2,999,12,\"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001\",\"STARLIGHT_BRIGADE_S01_D1\",\"/dev/rdisk5\"')\n"
                 f"cfg = WatchConfig(show='Starlight Brigade', season=1, target_root={str(target_root)!r}, "
                 f"poll_interval=0.1, scan_wait=1.0, ripqueue_py={str(fake_ripqueue)!r}, "
                 f"log_dir=pathlib.Path({str(root / 'logs')!r}), "
@@ -1039,6 +1577,103 @@ class TestDVD6AndDVD7CheckripAttributionAndJsonSchema(unittest.TestCase):
         self.assertNotIn("pid", v2)
         self.assertEqual(v2["rips"][0]["pid"], 7777)
         self.assertEqual(v2["drives"][0]["pid"], 7777)
+
+    def test_checkrip_avoids_duplicate_empty_ready_row_when_makemkv_unmounts_active_drive(self):
+        """When MakeMKV auto-unmounts /dev/diskN during active ripping, drutil reports device=None; no extra bogus READY row."""
+        # Case 1: Single active rip on Drive 1 (unmounted by MakeMKV: device=None, volume=None), Drive 2 idle
+        fake_rips = [
+            {
+                "pid": 8801,
+                "state": "/tmp/s1.json",
+                "queue": None,
+                "device": "disc:0",
+                "drive_device": "/dev/disk5",
+                "drive_serial": "DRVSER00001",
+                "title": "Starlight Brigade",
+                "season": 1,
+                "volume": "STARLIGHT_BRIGADE_S01_D1",
+                "episode_range": "S01E01-E04",
+                "log_path": None,
+                "staging": "/tmp/stg1",
+            }
+        ]
+        unmounted_drives = [
+            {
+                "slot": 1,
+                "model": "HL-DT-ST BD-RE BU40N 1.03",
+                "media_type": "BD-ROM",
+                "device": None,
+                "volume": "STARLIGHT_BRIGADE_S01_D1",
+            },
+            {
+                "slot": 2,
+                "model": "HL-DT-ST BD-RE BU40N 1.03",
+                "media_type": None,
+                "device": None,
+                "volume": None,
+            },
+        ]
+        with mock.patch.object(checkrip, "active_rips", return_value=fake_rips), \
+             mock.patch.object(checkrip, "active_watchers", return_value=[]), \
+             mock.patch.object(checkrip, "connected_optical_drives", return_value=unmounted_drives), \
+             mock.patch.object(checkrip, "_active_claim_devices", return_value={}), \
+             mock.patch.object(checkrip, "measure_rip_speeds", return_value={"/tmp/stg1": 18.5}):
+            buf_txt = io.StringIO()
+            with mock.patch.object(sys, "argv", ["checkrip"]), contextlib.redirect_stdout(buf_txt):
+                self.assertEqual(checkrip.main(), 0)
+            txt = buf_txt.getvalue()
+            self.assertIn("Optical Drives (1/2 ripping)", txt)
+            self.assertIn("Drive 1  /dev/disk5 (DRVSER00001)  RIPPING", txt)
+            self.assertIn("Drive 2  (empty)     IDLE", txt)
+            self.assertNotIn("READY", txt)
+
+            buf_json = io.StringIO()
+            with mock.patch.object(sys, "argv", ["checkrip", "--json"]), contextlib.redirect_stdout(buf_json):
+                self.assertEqual(checkrip.main(), 0)
+            j = json.loads(buf_json.getvalue())
+            self.assertEqual(len(j["drives"]), 2)
+            self.assertEqual(j["drives"][0]["slot"], 1)
+            self.assertEqual(j["drives"][0]["device"], "/dev/disk5")
+            self.assertEqual(j["drives"][0]["status"], "RIPPING")
+            self.assertEqual(j["drives"][0]["pid"], 8801)
+            self.assertEqual(j["drives"][1]["status"], "IDLE")
+
+        # Case 2: Both drives actively ripping & auto-unmounted by MakeMKV (device=None, volume=None)
+        both_rips = [
+            {
+                "pid": 8801,
+                "device": "disc:0",
+                "drive_device": "/dev/disk5",
+                "drive_serial": "DRVSER00001",
+                "volume": "DISC_ONE",
+                "stage": "RIPPING",
+            },
+            {
+                "pid": 8802,
+                "device": "disc:1",
+                "drive_device": "/dev/disk6",
+                "drive_serial": "DRVSER00002",
+                "volume": "DISC_TWO",
+                "stage": "RIPPING",
+            },
+        ]
+        both_unmounted = [
+            {"slot": 1, "media_type": "BD-ROM", "device": None, "volume": None},
+            {"slot": 2, "media_type": "BD-ROM", "device": None, "volume": None},
+        ]
+        rows = checkrip._match_drives_to_rips(both_unmounted, both_rips)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["rip"]["pid"], 8801)
+        self.assertEqual(rows[1]["rip"]["pid"], 8802)
+
+        # Case 3: Unmounted drive with contradicting explicit volume MUST NOT be misattributed!
+        mismatch_drives = [
+            {"slot": 1, "media_type": "BD-ROM", "device": None, "volume": "DIFFERENT_DISC"},
+        ]
+        rows_mismatch = checkrip._match_drives_to_rips(mismatch_drives, [both_rips[0]])
+        self.assertEqual(len(rows_mismatch), 2)
+        self.assertIsNone(rows_mismatch[0]["rip"])
+        self.assertEqual(rows_mismatch[1]["rip"]["pid"], 8801)
 
 
 class TestDVD5DocsDemoAndCiContract(unittest.TestCase):

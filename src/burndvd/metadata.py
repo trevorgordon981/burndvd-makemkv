@@ -232,13 +232,17 @@ def volume_matches_show_intent(
     season: int,
     *,
     allowed_volumes: Iterable[str] = (),
+    allow_partial: bool = False,
 ) -> tuple[bool, str]:
     """Verify an optical disc volume label matches a configured TV show/season intent.
 
-    Returns `(True, reason)` only when the disc volume is explicitly bound to
-    `show`/`season` (or matches an explicit per-season `allowed_volumes` entry).
-    Rejects empty/unlabeled discs, mismatched explicit seasons, and unrelated
-    media so unattended Watch mode cannot queue arbitrary discs under a show.
+    In unattended mode (`allow_partial=False`, default), returns `(True, reason)`
+    ONLY when the disc volume matches the full normalized show title (after
+    stripping trailing season/disc/part/volume suffixes) or matches an explicit
+    per-season `allowed_volumes` entry. Rejects empty/unlabeled discs, mismatched
+    explicit seasons, unrelated media, and ambiguous partial-title prefixes/acronyms.
+
+    Set `allow_partial=True` only for interactive confirmation heuristics.
     """
     raw_vol = (volume or "").strip()
     if not raw_vol:
@@ -287,18 +291,30 @@ def volume_matches_show_intent(
 
     show_words = _words(show)
     vol_words = _words(vol_stem)
-    if (
+    is_partial_prefix = bool(
         vol_words
         and len(vol_words) <= len(show_words)
         and show_words[: len(vol_words)] == vol_words
         and len("".join(vol_words)) >= 6
-    ):
-        return True, "leading show-title word prefix match"
-
+    )
+    is_tv_acronym = False
     if has_tv_suffix and len(show_words) >= 3:
         acronym = "".join(w[0] for w in show_words if w)
         if len(acronym) >= 3 and compact_stem == acronym:
+            is_tv_acronym = True
+
+    if allow_partial:
+        if is_partial_prefix:
+            return True, "leading show-title word prefix match"
+        if is_tv_acronym:
             return True, "TV acronym match with disc/part suffix"
+
+    if is_partial_prefix or is_tv_acronym:
+        return (
+            False,
+            f"volume {raw_vol!r} only partially matches {show!r} S{int(season):02d} "
+            f"(pass --allow-volume {raw_vol!r} to admit explicitly)",
+        )
 
     return (
         False,
@@ -466,16 +482,17 @@ def write_tv_slot_reservation(
         return None
 
 
-def scan_season_highest_episode(
+def scan_season_existing_episodes(
     season_dir: Path | str | None, season: int
-) -> int:
+) -> set[int]:
+    """Return the set of non-empty published episode numbers in `season_dir`."""
     if not season_dir:
-        return 0
+        return set()
     sdir = Path(season_dir)
     if not sdir.is_dir():
-        return 0
+        return set()
     pat = re.compile(rf"S0*{int(season)}E(\d+)", re.IGNORECASE)
-    highest = 0
+    found: set[int] = set()
     try:
         for entry in sdir.iterdir():
             if not entry.name.lower().endswith(".mkv"):
@@ -487,12 +504,108 @@ def scan_season_highest_episode(
                 continue
             m = pat.search(entry.name)
             if m:
-                ep = int(m.group(1))
-                if ep > highest:
-                    highest = ep
+                found.add(int(m.group(1)))
     except OSError:
-        return highest
-    return highest
+        return found
+    return found
+
+
+def scan_season_highest_episode(
+    season_dir: Path | str | None, season: int
+) -> int:
+    existing = scan_season_existing_episodes(season_dir, season)
+    return max(existing, default=0)
+
+
+def find_episode_plan_conflict(
+    episode_start: int,
+    *,
+    episode_count: int | None = None,
+    existing_episodes: Iterable[int] = (),
+    reservations: Iterable[dict] = (),
+    pending_plans: Iterable[dict] = (),
+    check_existing: bool = True,
+) -> tuple[str | None, list[int]]:
+    """Validate an explicit episode start (and optional count) against active/existing episodes.
+
+    Returns `(conflict_reason, blocking_pending_pids)`:
+      - `conflict_reason` is non-None when the requested episode range definitely
+        overlaps an active reservation, a pending scan with a colliding start, or
+        (when `check_existing=True`) an already-published episode on disk.
+      - `blocking_pending_pids` lists active scanning rips whose start is strictly
+        earlier than `episode_start` and whose episode count is not yet known, so
+        the caller must wait for their slot reservation (or defer) before launching.
+      - Returns `(None, [])` when the requested range is vacant.
+    """
+    start = int(episode_start)
+    if start < 1:
+        return f"invalid episode_start E{start}", []
+    end = (
+        start + int(episode_count) - 1
+        if episode_count is not None and int(episode_count) > 0
+        else None
+    )
+    req_label = f"E{start}-E{end}" if end is not None and end != start else f"E{start}"
+
+    for res in reservations or ():
+        try:
+            r_start = int(res.get("episode_start", 0))
+            r_end = int(res.get("episode_end", 0))
+            r_pid = int(res.get("pid", 0))
+        except (TypeError, ValueError):
+            continue
+        if r_start <= 0 or r_end < r_start:
+            continue
+        overlaps = (
+            (start <= r_end and r_start <= end)
+            if end is not None
+            else (r_start <= start <= r_end)
+        )
+        if overlaps:
+            return (
+                f"explicit episode plan {req_label} overlaps active rip pid {r_pid} "
+                f"reservation E{r_start}-E{r_end}",
+                [],
+            )
+
+    blocking_pending: list[int] = []
+    for plan in pending_plans or ():
+        try:
+            p_pid = int(plan.get("pid", 0))
+            p_start = int(plan.get("episode_start", 0))
+        except (TypeError, ValueError):
+            continue
+        if p_pid <= 0 or p_start <= 0:
+            continue
+        if (end is not None and start <= p_start <= end) or (
+            end is None and p_start == start
+        ):
+            return (
+                f"explicit episode plan {req_label} overlaps active scanning rip "
+                f"pid {p_pid} starting at E{p_start}",
+                [],
+            )
+        if p_start < start:
+            blocking_pending.append(p_pid)
+
+    if check_existing:
+        existing_set = {int(e) for e in (existing_episodes or ()) if int(e) > 0}
+        if end is not None:
+            overlap = sorted(existing_set & set(range(start, end + 1)))
+            if overlap:
+                ep_list = ", ".join(f"E{e}" for e in overlap)
+                return (
+                    f"explicit episode plan {req_label} overlaps existing season "
+                    f"episode(s) {ep_list}",
+                    [],
+                )
+        elif start in existing_set:
+            return (
+                f"explicit episode plan {req_label} already exists in season directory",
+                [],
+            )
+
+    return None, blocking_pending
 
 
 def _norm_media_root(p: str, smb: str, nfs: str) -> str:
@@ -613,11 +726,15 @@ def compute_next_tv_episode(
     deadline = time.monotonic() + max(0.0, float(wait_scan_s))
     notified_wait = False
     while True:
-        nas_highest = scan_season_highest_episode(season_dir, int(season))
+        existing_episodes = sorted(
+            scan_season_existing_episodes(season_dir, int(season))
+        )
+        nas_highest = existing_episodes[-1] if existing_episodes else 0
         next_ep = nas_highest + 1
         reservations: list[dict] = []
         seen_pids: set[int] = set()
         pending_scan_pids: list[int] = []
+        pending_plans: list[dict] = []
 
         sdir = active_tv_slots_dir(slots_dir)
         if sdir.is_dir():
@@ -735,12 +852,21 @@ def compute_next_tv_episode(
                 next_ep = max(next_ep, ep_start + ep_count)
             else:
                 pending_scan_pids.append(pid)
+                pending_plans.append(
+                    {
+                        "pid": pid,
+                        "episode_start": ep_start,
+                        "source": "pending_queue",
+                    }
+                )
 
         result = {
             "next_episode": next_ep,
             "nas_highest": nas_highest,
+            "existing_episodes": existing_episodes,
             "reservations": reservations,
             "pending_scan_pids": pending_scan_pids,
+            "pending_plans": pending_plans,
         }
         if not pending_scan_pids or time.monotonic() >= deadline:
             return result

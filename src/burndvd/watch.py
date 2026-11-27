@@ -49,6 +49,8 @@ from burndvd.metadata import (
     _norm_media_root,
     compute_next_tv_episode,
     episode_contract,
+    find_episode_plan_conflict,
+    scan_season_existing_episodes,
     volume_matches_show_intent,
     write_queue,
 )
@@ -916,16 +918,93 @@ class BoxSetWatcher:
             expected_title_ids = ""
             expected_physical_disc = ""
 
-            if self._first_episode_override is not None:
-                ep_start = int(self._first_episode_override)
+            if self._first_episode_override is not None or contract is not None:
+                if self._first_episode_override is not None:
+                    ep_start = int(self._first_episode_override)
+                    plan_count: int | None = None
+                else:
+                    assert contract is not None
+                    ep_start = int(contract["episode_start"])
+                    plan_count = int(contract["expected_disc_episodes"])
+                    expected_episodes = str(contract["expected_episodes"])
+                    expected_disc_episodes = str(contract["expected_disc_episodes"])
+                    expected_title_ids = ",".join(
+                        str(x) for x in contract["expected_title_ids"]
+                    )
+                    expected_physical_disc = str(contract["disc"])
+
+                known_procs = self._known_active_processes()
+                ep_info = self._compute_next_ep_fn(
+                    title=self.config.show,
+                    season=int(self.config.season),
+                    target_root=self.config.target_root,
+                    season_dir=self.config.season_dir,
+                    slots_dir=self.config.slots_dir,
+                    media_smb_root=self.config.media_smb_root,
+                    media_nfs_root=self.config.media_nfs_root,
+                    active_processes=known_procs,
+                    wait_scan_s=0.0,
+                    poll_interval_s=min(
+                        2.0, max(0.05, float(self.config.poll_interval))
+                    ),
+                )
+                existing_eps = ep_info.get("existing_episodes")
+                if existing_eps is None:
+                    existing_eps = scan_season_existing_episodes(
+                        self.config.season_dir, int(self.config.season)
+                    )
+                conflict, blocking_pending = find_episode_plan_conflict(
+                    ep_start,
+                    episode_count=plan_count,
+                    existing_episodes=existing_eps,
+                    reservations=ep_info.get("reservations") or (),
+                    pending_plans=ep_info.get("pending_plans") or (),
+                    check_existing=True,
+                )
+                if conflict is None and blocking_pending and float(self.config.scan_wait) > 0:
+                    ep_info = self._compute_next_ep_fn(
+                        title=self.config.show,
+                        season=int(self.config.season),
+                        target_root=self.config.target_root,
+                        season_dir=self.config.season_dir,
+                        slots_dir=self.config.slots_dir,
+                        media_smb_root=self.config.media_smb_root,
+                        media_nfs_root=self.config.media_nfs_root,
+                        active_processes=self._known_active_processes(),
+                        wait_scan_s=float(self.config.scan_wait),
+                        poll_interval_s=min(
+                            2.0, max(0.05, float(self.config.poll_interval))
+                        ),
+                    )
+                    existing_eps = ep_info.get("existing_episodes")
+                    if existing_eps is None:
+                        existing_eps = scan_season_existing_episodes(
+                            self.config.season_dir, int(self.config.season)
+                        )
+                    conflict, blocking_pending = find_episode_plan_conflict(
+                        ep_start,
+                        episode_count=plan_count,
+                        existing_episodes=existing_eps,
+                        reservations=ep_info.get("reservations") or (),
+                        pending_plans=ep_info.get("pending_plans") or (),
+                        check_existing=True,
+                    )
+                if conflict is not None:
+                    self.rejected_discs[drive_key] = volume
+                    self._emit(
+                        f"Drive {drive_key} ({device_node}) REJECTED {volume} — "
+                        f"{conflict}; refusing overlapping launch"
+                    )
+                    return None
+                if blocking_pending:
+                    pids_s = ", ".join(str(p) for p in blocking_pending)
+                    self._emit(
+                        f"Drive {drive_key} ({device_node}) WAITING — concurrent scan "
+                        f"pid(s) {pids_s} could overlap E{ep_start}+ and did not publish slot "
+                        f"within {int(self.config.scan_wait)}s; deferring {volume}"
+                    )
+                    return None
                 pending_scan_pids: list[int] = []
-            elif contract is not None:
-                ep_start = int(contract["episode_start"])
-                expected_episodes = str(contract["expected_episodes"])
-                expected_disc_episodes = str(contract["expected_disc_episodes"])
-                expected_title_ids = ",".join(str(x) for x in contract["expected_title_ids"])
-                expected_physical_disc = str(contract["disc"])
-                pending_scan_pids = []
             else:
                 known_procs = self._known_active_processes()
                 ep_info = self._compute_next_ep_fn(

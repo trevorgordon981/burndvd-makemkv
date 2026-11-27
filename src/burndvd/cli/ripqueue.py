@@ -32,7 +32,12 @@ from burndvd.drive import (
     check_key_expiry,
     eject,
 )
-from burndvd.metadata import _compact, volume_matches_show_intent
+from burndvd.metadata import (
+    _compact,
+    compute_next_tv_episode,
+    find_episode_plan_conflict,
+    volume_matches_show_intent,
+)
 from burndvd.models import (
     QueueItem,
     load_or_init,
@@ -48,6 +53,7 @@ from burndvd.nas import (
     compute_target_dir,
     resolve_nas_path,
     season_dir_lock,
+    starting_ep,
 )
 from burndvd.probe import (
     disc_content_fingerprint,
@@ -713,6 +719,34 @@ def main() -> None:
             continue
 
         print(f"  Selected {len(title_ids)} title(s): {title_ids}")
+
+        if (
+            item.type == "tv-season"
+            and item.season > 0
+            and not disc_args.rerip_review
+        ):
+            planned_start = starting_ep(item, disc_n, state, target_dir=target)
+            ep_info = compute_next_tv_episode(
+                title=item.title,
+                season=int(item.season),
+                target_root=str(item.target_root or target.parent),
+                season_dir=target,
+                wait_scan_s=0.0,
+            )
+            overlap_err, _ = find_episode_plan_conflict(
+                planned_start,
+                episode_count=len(title_ids),
+                reservations=ep_info.get("reservations") or (),
+                pending_plans=ep_info.get("pending_plans") or (),
+                check_existing=False,
+            )
+            if overlap_err:
+                print(
+                    f"{C.RED}{overlap_err}; refusing overlapping launch before staging.{C.R}",
+                    file=sys.stderr,
+                )
+                append_log(args, f"EPISODE_OVERLAP {item.title} :: {overlap_err}")
+                sys.exit(4)
 
         cur_item_idx = state["current_index"]
         cur_disc_idx = state["disc_index_in_item"]

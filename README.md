@@ -80,11 +80,12 @@ python3 examples/synthetic_demo.py
 == 1. Watch Mode: Strict Disc Binding, Multi-Drive Slot Serialization & Ctrl-C Isolation ==
   [HH:MM:SS] Watch mode started: Starlight Brigade S01 (BD, no-extras) -> .../nas/TV Shows/Starlight Brigade
   [HH:MM:SS] Drive DRVSER00001 (/dev/disk5) REJECTED RANDOM_MOVIE_2024 — volume 'RANDOM_MOVIE_2024' does not match configured show 'Starlight Brigade' S01; refusing unattended launch
-  [HH:MM:SS] Drive DRVSER00002 (/dev/disk6) STARTED STARLIGHT_S01_D1 -> E4+ (pid 41001, log: ...)
-  [HH:MM:SS] Drive DRVSER00003 (/dev/disk7) STARTED STARLIGHT_S01_D2 -> E7+ (pid 41002, log: ...)
+  [HH:MM:SS] Drive DRVSER00004 (/dev/disk8) REJECTED STARLIGHT_D1 — volume 'STARLIGHT_D1' only partially matches 'Starlight Brigade' S01 (pass --allow-volume 'STARLIGHT_D1' to admit explicitly); refusing unattended launch
+  [HH:MM:SS] Drive DRVSER00002 (/dev/disk6) STARTED STARLIGHT_BRIGADE_S01_D1 -> E4+ (pid 41001, log: ...)
+  [HH:MM:SS] Drive DRVSER00003 (/dev/disk7) STARTED STARLIGHT_BRIGADE_S01_D2 -> E7+ (pid 41002, log: ...)
   [HH:MM:SS] Stopping watch mode (no new discs will start). 2 active rip(s) left running safely:
   ...
-  [OK] Unrelated disc rejected; 2 valid discs serialized E4+ and E7+ in distinct attempt dirs with start_new_session=True.
+  [OK] Unrelated & partial-prefix discs rejected; 2 exact-match discs serialized E4+ and E7+ in distinct attempt dirs with start_new_session=True.
 
 == 2. Crash-Recovery Publish Journal: Fault Between Publish & Manifest ==
   Injected crash after atomic publish of S01E04 and before .burndvd-committed.json write:
@@ -94,8 +95,8 @@ python3 examples/synthetic_demo.py
 
 == 3. Multi-Drive checkrip: Duplicate-Label Isolation & Stable Versioned JSON ==
   schema_version=1 top-level pid=42001 speed_mbps=19.8
-    Drive 1 /dev/disk5: status=READY pid=None volume=STARLIGHT_S01_D1
-    Drive 2 /dev/disk6: status=RIPPING pid=42001 volume=STARLIGHT_S01_D1
+    Drive 1 /dev/disk5: status=READY pid=None volume=STARLIGHT_BRIGADE_S01_D1
+    Drive 2 /dev/disk6: status=RIPPING pid=42001 volume=STARLIGHT_BRIGADE_S01_D1
   [OK] Duplicate volume label did not steal /dev/disk6's rip; legacy flat JSON keys preserved.
 
 Synthetic demo completed successfully (zero optical hardware touched).
@@ -166,9 +167,9 @@ ocr_mkv("/Volumes/Media/TV Shows/Example Show/Season 01/Example Show - S01E01.mk
 
 ## Data-Safety Guarantees
 
-- **Strict Watch-Mode Disc Binding:** Unattended `burndvd --watch` rejects unlabeled discs, mismatched seasons, and unrelated volume labels before creating any queue file, supports explicit `--allow-volume` / `--allow-fingerprint` allowlists, and revalidates the MakeMKV-probed physical disc inside `burndvd-queue` before staging.
-- **Two-Phase Crash-Recoverable Publication:** Before atomic publication, `_run_finalize` `fsync`s a per-file SHA-256 publish intent journal, publishes via `renameatx_np(RENAME_EXCL)` / `os.link()`, `fsync`s `.burndvd-committed.json`, and retires the staged source only after durable commit. Crashes at any rename/journal/retire boundary reconcile via verified content identity without clobbering or self-colliding; foreign/tampered destinations fail closed.
-- **Collision-Free Concurrent Watchers & Session Isolation:** Independent watchers coordinate under an atomic per-season `flock` + in-process registry, allocate exclusive `attempt-*` directories and `O_EXCL` log files, and spawn child workers with `start_new_session=True` so foreground terminal Ctrl-C stops only the watcher.
+- **Strict Watch-Mode Disc Binding:** Unattended `burndvd --watch` requires an exact full normalized show label (after stripping trailing season/disc/part/vol tokens) or an explicit `--allow-volume` / `--allow-fingerprint` allowlist, rejecting unlabeled discs, mismatched seasons, unrelated volumes, and ambiguous partial-title prefixes/acronyms before creating any queue file, and revalidates the MakeMKV-probed physical disc inside `burndvd-queue` before staging.
+- **Two-Phase Crash-Recoverable Publication:** Before any destination mutation or atomic publication, `_run_finalize` retries transient staged-source hash reads and fails closed if the required SHA-256 identity or `fsync`d publish-intent journal cannot be written, then publishes via `renameatx_np(RENAME_EXCL)` / `os.link()`, `fsync`s `.burndvd-committed.json`, and retires the staged source only after durable commit. Crashes at any rename/journal/retire boundary reconcile via verified content identity without clobbering or self-colliding; foreign/tampered destinations fail closed.
+- **Collision-Free Concurrent Watchers & Session Isolation:** Independent watchers coordinate under an atomic per-season `flock` + in-process registry, validate explicit `--episode-start` overrides against active reservations, pending scans, and existing season episodes (preserving overrides only for vacant ranges), allocate exclusive `attempt-*` directories and `O_EXCL` log files, and spawn child workers with `start_new_session=True` so foreground terminal Ctrl-C stops only the watcher.
 - **PID-Bound Slot Claims & Host-Local Locks:** Concurrent multi-drive rips coordinate via host-local `flock` unified across SMB/NFS mount views and inode-checked `.burndvd-claim` files with dead-PID recovery.
 - **Durable Physical-Disc Receipt Ledger:** SHA-256 title-table fingerprints are recorded to an `flock`+`fsync` JSONL ledger only after `ffmpeg` decode verification passes, blocking accidental duplicate disc publication.
 - **Isolated Review Quarantine & Slim-Tray Protection:** Re-rips of occupied TV episode ranges route into fingerprint-scoped directories outside all TV libraries; non-motorized slim drives (e.g. LG BU40N) skip tray-eject respins.
@@ -215,7 +216,7 @@ examples/            synthetic_demo.py (zero-hardware demo) & subocr-shows.json
 - **External decryption keys & license:** Encrypted Blu-ray/UHD discs require a working MakeMKV installation and valid MakeMKV key/registration; `burndvd` intentionally fails closed on `AACS/`-protected discs rather than bypassing encryption in fallback mode.
 - **Physical drive mechanics:** Non-motorized slim-tray optical drives (such as the LG BU40N) cannot close their own trays after eject and require manual disc swap/close.
 - **Physically damaged media:** Unreadable sectors can still fail optical reads; `burndvd` preserves exact non-shifted episode numbering when skipping a bad title on uncontracted discs and fails closed on contract-bound discs.
-- **Uncontracted TV volume naming:** Without an explicit `--allow-volume` or `--allow-fingerprint` allowlist, unattended Watch mode requires disc volume labels to match the configured show (normalized name, leading word prefix >= 6 chars, or 3+ word acronym with TV disc/part suffix) and not conflict on season number.
+- **Uncontracted TV volume naming:** Without an explicit `--allow-volume` or `--allow-fingerprint` allowlist, unattended Watch mode requires disc volume labels to match the full normalized show title (after stripping trailing `Sxx`/`Disc`/`Part`/`Vol` tokens) and not conflict on season number; abbreviated labels, partial prefixes, and acronyms must be allowlisted explicitly via `--allow-volume`.
 
 ## License
 

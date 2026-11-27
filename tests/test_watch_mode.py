@@ -69,8 +69,8 @@ class TestWatchModeSimultaneousTwoDrives(unittest.TestCase):
             work_dir = root / "work"
 
             two_drives_loaded = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_P10_D1","/dev/rdisk5"',
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_P10_D2","/dev/rdisk6"',
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_P10_D1","/dev/rdisk5"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_P10_D2","/dev/rdisk6"',
             )
             two_drives_empty = _drv_output(
                 'DRV:0,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","",""',
@@ -178,10 +178,10 @@ class TestWatchModeSimultaneousTwoDrives(unittest.TestCase):
 
             # Verify status output lines
             text = out_buf.getvalue()
-            self.assertIn("Drive DRVSER00001 (/dev/disk5) STARTED STARLIGHT_P10_D1 -> E118+", text)
-            self.assertIn("Drive DRVSER00002 (/dev/disk6) STARTED STARLIGHT_P10_D2 -> E125+", text)
-            self.assertIn("Drive DRVSER00001 FINISHED STARLIGHT_P10_D1 (exit 0", text)
-            self.assertIn("Drive DRVSER00002 FINISHED STARLIGHT_P10_D2 (exit 0", text)
+            self.assertIn("Drive DRVSER00001 (/dev/disk5) STARTED STARLIGHT_BRIGADE_P10_D1 -> E118+", text)
+            self.assertIn("Drive DRVSER00002 (/dev/disk6) STARTED STARLIGHT_BRIGADE_P10_D2 -> E125+", text)
+            self.assertIn("Drive DRVSER00001 FINISHED STARLIGHT_BRIGADE_P10_D1 (exit 0", text)
+            self.assertIn("Drive DRVSER00002 FINISHED STARLIGHT_BRIGADE_P10_D2 (exit 0", text)
 
     def test_episode_start_override_applies_only_to_first_disc(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -191,8 +191,8 @@ class TestWatchModeSimultaneousTwoDrives(unittest.TestCase):
             slots_dir = root / "slots"
 
             two_drives = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"',
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_D2","/dev/rdisk6"',
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_D2","/dev/rdisk6"',
             )
             spawned: list[_FakeChildProc] = []
 
@@ -247,8 +247,8 @@ class TestWatchModeSimultaneousTwoDrives(unittest.TestCase):
             target_root = root / "TV Shows" / "Starlight Brigade"
             (target_root / "Season 01").mkdir(parents=True)
             two_drives = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"',
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_D2","/dev/rdisk6"',
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_D2","/dev/rdisk6"',
             )
             spawned: list[_FakeChildProc] = []
 
@@ -281,7 +281,7 @@ class TestWatchModeSimultaneousTwoDrives(unittest.TestCase):
             self.assertEqual(len(launched), 1)
             self.assertEqual(launched[0].drive_key, "DRVSER00001")
             self.assertNotIn("DRVSER00002", watcher.handled_discs)
-            self.assertIn("deferring STARLIGHT_D2", out_buf.getvalue())
+            self.assertIn("deferring STARLIGHT_BRIGADE_D2", out_buf.getvalue())
 
 
 class TestHandledDiscsAntiReripGuard(unittest.TestCase):
@@ -294,13 +294,13 @@ class TestHandledDiscsAntiReripGuard(unittest.TestCase):
             (target_root / "Season 01").mkdir(parents=True)
 
             disc1 = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"'
             )
             empty = _drv_output(
                 'DRV:0,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","",""'
             )
             disc2 = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D2","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D2","/dev/rdisk5"'
             )
 
             # Poll timeline:
@@ -359,11 +359,11 @@ class TestHandledDiscsAntiReripGuard(unittest.TestCase):
             self.assertEqual(summary.completed, 2)
             self.assertEqual(summary.failed, 1)
             self.assertEqual(summary.succeeded, 1)
-            self.assertEqual(summary.results[0].volume, "STARLIGHT_D1")
+            self.assertEqual(summary.results[0].volume, "STARLIGHT_BRIGADE_D1")
             self.assertEqual(summary.results[0].returncode, 2)
-            self.assertEqual(summary.results[1].volume, "STARLIGHT_D2")
+            self.assertEqual(summary.results[1].volume, "STARLIGHT_BRIGADE_D2")
             self.assertEqual(summary.results[1].returncode, 0)
-            self.assertIn("FAILED STARLIGHT_D1 (exit 2", out_buf.getvalue())
+            self.assertIn("FAILED STARLIGHT_BRIGADE_D1 (exit 2", out_buf.getvalue())
             self.assertEqual(len(slack_msgs), 2)
             self.assertIn("FAILED", slack_msgs[0])
             self.assertIn("finished", slack_msgs[1])
@@ -425,7 +425,7 @@ class TestExtrasFlagsConfigAndCli(unittest.TestCase):
 
             # Verify --no-extras flag & BURNDVD_NO_EXTRAS env pass-through to ripqueue
             one_drive = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"'
             )
             target_root = root / "TV Shows" / "Starlight Brigade"
             (target_root / "Season 01").mkdir(parents=True)
@@ -479,8 +479,8 @@ class TestExtrasFlagsConfigAndCli(unittest.TestCase):
             target_root = root / "TV Shows" / "Starlight Brigade"
             (target_root / "Season 01").mkdir(parents=True)
             two_drives = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"',
-                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_D2","/dev/rdisk6"',
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"',
+                'DRV:1,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00002","STARLIGHT_BRIGADE_D2","/dev/rdisk6"',
             )
             spawned: list[_FakeChildProc] = []
 
@@ -520,7 +520,7 @@ class TestExtrasFlagsConfigAndCli(unittest.TestCase):
             target_root = root / "TV Shows" / "Starlight Brigade"
             (target_root / "Season 01").mkdir(parents=True)
             one_drive = _drv_output(
-                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_D1","/dev/rdisk5"'
+                'DRV:0,2,999,12,"BD-RE HL-DT-ST BD-RE BU40N 1.03 DRVSER00001","STARLIGHT_BRIGADE_D1","/dev/rdisk5"'
             )
 
             def fake_spawn(cmd, *, stdin=None, stdout=None, stderr=None, env=None):

@@ -1045,10 +1045,19 @@ def _match_drives_to_rips(drives: list[dict], rendered: list[dict]) -> list[dict
     Pass 2: Volume-label fallback ONLY for unmatched drives and unmatched rips
             with NO known hardware identity, and ONLY when the volume label is
             unambiguous (1-to-1) across both unmatched sets.
+    Pass 2b: Reconcile MakeMKV-unmounted loaded drives (`media_type` set, no
+            `device` or `serial` reported by `drutil`) against remaining unmatched
+            rips via unambiguous volume, `disc:N` -> slot `N+1`, or sole 1-to-1
+            pairing (never contradicting an explicit volume or mounted `/dev/diskN`).
     Pass 3: Append any remaining unmatched rips as standalone rows.
     """
     matched_rip_ids: set[int] = set()
     matched_by_drive: dict[int, dict] = {}
+
+    def _volumes_compatible(drive_vol: str | None, rip_vol: str | None) -> bool:
+        dv = (drive_vol or "").strip().lower()
+        rv = (rip_vol or "").strip().lower()
+        return not (dv and rv and dv != rv)
 
     # Pass 1: Global hardware-identity pass (serial, then normalized device node).
     for idx, d in enumerate(drives):
@@ -1103,6 +1112,78 @@ def _match_drives_to_rips(drives: list[dict], rendered: list[dict]) -> list[dict
                 matched_by_drive[idx] = item
                 matched_rip_ids.add(item["pid"])
                 break
+
+    # Pass 2b: On macOS, MakeMKV auto-unmounts `/dev/diskN` while ripping, so
+    # `drutil status` reports the physical drive with `media_type` present but
+    # `device=None` and `serial=None`. Reconcile those unmounted loaded drives
+    # with remaining unmatched rips so checkrip does not emit a duplicate
+    # `Drive N (empty) READY` row alongside the active rip row.
+    unmounted_drive_idxs = [
+        i
+        for i in range(len(drives))
+        if i not in matched_by_drive
+        and drives[i].get("media_type")
+        and not _norm_device_node(drives[i].get("device"))
+        and not (drives[i].get("serial") or "").strip()
+    ]
+    remaining_rips = [item for item in rendered if item["pid"] not in matched_rip_ids]
+    if unmounted_drive_idxs and remaining_rips:
+        # 2b-i: Unambiguous 1-to-1 volume match on unmounted loaded drives.
+        u_drive_vols: dict[str, int] = {}
+        for idx in unmounted_drive_idxs:
+            vol = (drives[idx].get("volume") or "").strip().lower()
+            if vol:
+                u_drive_vols[vol] = u_drive_vols.get(vol, 0) + 1
+        u_rip_vols: dict[str, int] = {}
+        for item in remaining_rips:
+            vol = (item.get("volume") or "").strip().lower()
+            if vol:
+                u_rip_vols[vol] = u_rip_vols.get(vol, 0) + 1
+        for idx in list(unmounted_drive_idxs):
+            vol = (drives[idx].get("volume") or "").strip().lower()
+            if not vol or u_drive_vols.get(vol, 0) != 1 or u_rip_vols.get(vol, 0) != 1:
+                continue
+            for item in remaining_rips:
+                if item["pid"] in matched_rip_ids:
+                    continue
+                if (item.get("volume") or "").strip().lower() == vol:
+                    matched_by_drive[idx] = item
+                    matched_rip_ids.add(item["pid"])
+                    break
+
+        # 2b-ii: MakeMKV `disc:K` selector -> `drutil` slot `K + 1` for remaining unmounted drives.
+        unmounted_drive_idxs = [i for i in unmounted_drive_idxs if i not in matched_by_drive]
+        remaining_rips = [item for item in rendered if item["pid"] not in matched_rip_ids]
+        for idx in list(unmounted_drive_idxs):
+            d = drives[idx]
+            slot = d.get("slot")
+            if not isinstance(slot, int) or slot < 1:
+                continue
+            expected_sel = f"disc:{slot - 1}"
+            candidates = [
+                item
+                for item in remaining_rips
+                if item["pid"] not in matched_rip_ids
+                and (item.get("device") or "").strip().lower() == expected_sel
+                and _volumes_compatible(d.get("volume"), item.get("volume"))
+            ]
+            if len(candidates) == 1:
+                matched_by_drive[idx] = candidates[0]
+                matched_rip_ids.add(candidates[0]["pid"])
+
+        # 2b-iii: Sole remaining unmounted loaded drive paired 1-to-1 with sole remaining rip.
+        unmounted_drive_idxs = [i for i in unmounted_drive_idxs if i not in matched_by_drive]
+        remaining_rips = [item for item in rendered if item["pid"] not in matched_rip_ids]
+        if (
+            len(unmounted_drive_idxs) == 1
+            and len(remaining_rips) == 1
+            and _volumes_compatible(
+                drives[unmounted_drive_idxs[0]].get("volume"),
+                remaining_rips[0].get("volume"),
+            )
+        ):
+            matched_by_drive[unmounted_drive_idxs[0]] = remaining_rips[0]
+            matched_rip_ids.add(remaining_rips[0]["pid"])
 
     drive_rows: list[dict] = [
         {"drive": d, "rip": matched_by_drive.get(idx)}
@@ -1268,7 +1349,12 @@ def main() -> int:
                     drive_summary.append(
                         {
                             "slot": d["slot"],
-                            "device": d.get("device"),
+                            "device": d.get("device")
+                            or (
+                                (r_item.get("drive_device") or r_item.get("device"))
+                                if r_item
+                                else None
+                            ),
                             "media_type": d.get("media_type"),
                             "volume": d.get("volume") or (r_item.get("volume") if r_item else None),
                             "status": st,
