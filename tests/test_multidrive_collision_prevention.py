@@ -701,6 +701,265 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
             self.assertIn("RIP_REFUSED", log_text)
             self.assertIn("DRIVE_SLOT_BUSY", log_text)
 
+    def test_mixed_drive_pins_node_only_vs_serial_only_block_probe_and_rip(self):
+        """DVD-mixed-drive-pins regression:
+        A process pinned by device_node only and another pinned by serial only
+        reaching the SAME physical drive (even on remapped slots and mixed-case
+        serials) MUST lock the full resolved identity union (slot + node +
+        uppercased serial) and block concurrent probe_disc and rip_disc."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_dir = root / "locks"
+            fake_mkv = str(root / "fake-makemkv")
+            parent_row = 'DRV:0,2,999,12,"FAKE ABCDEF123456","THOR","/dev/rdisk6"\n'
+            child_row = 'DRV:1,2,999,12,"FAKE ABCDEF123456","THOR","/dev/rdisk6"\n'
+            other_row = 'DRV:1,2,999,12,"FAKE OTHER123456","OTHER","/dev/rdisk7"\n'
+
+            parent_args = SimpleNamespace(
+                device="disc:0",
+                makemkvcon=fake_mkv,
+                drive_device="/dev/rdisk6",
+                drive_serial=None,
+            )
+            child_serial_args = SimpleNamespace(
+                device="disc:1",
+                makemkvcon=fake_mkv,
+                drive_device=None,
+                drive_serial="abcdef123456",
+            )
+            other_args = SimpleNamespace(
+                device="disc:1",
+                makemkvcon=fake_mkv,
+                drive_device="/dev/disk7",
+                drive_serial="OTHER123456",
+            )
+
+            def _enum(row_text):
+                def _run(cmd, **_):
+                    assert cmd == [fake_mkv, "-r", "info", "list"], cmd
+                    return SimpleNamespace(returncode=0, stdout=row_text, stderr="")
+                return _run
+
+            probe_checks: dict[str, object] = {}
+
+            def parent_probe_popen(cmd, **_):
+                probe_checks["parent_locks"] = sorted(p.name for p in lock_dir.glob("*.lock"))
+                # Child pinned by lowercase serial-only on remapped disc:1 MUST be blocked.
+                with drive.slot_lock_scope(), \
+                     mock.patch.object(drive.subprocess, "run", side_effect=_enum(child_row)), \
+                     mock.patch.object(probe.subprocess, "Popen") as child_popen:
+                    with self.assertRaises(drive.DriveSlotConflictError):
+                        probe.probe_disc(child_serial_args)
+                    child_popen.assert_not_called()
+                    probe_checks["child_probe_blocked"] = True
+
+                # Child rip_disc pinned by serial-only on remapped disc:1 MUST also be blocked.
+                item = QueueItem(
+                    title="Sample Movie (2024)",
+                    type="movie",
+                    discs=1,
+                    target_root=str(root / "lib"),
+                    format="DVD",
+                )
+                info = {
+                    "cinfo": {2: "SAMPLE_MOVIE", 32: "SAMPLE_MOVIE"},
+                    "titles": {0: {9: "1:45:00", 11: "100000", 2: "SAMPLE_MOVIE"}},
+                }
+                rip_child_args = SimpleNamespace(
+                    makemkvcon=fake_mkv,
+                    device="disc:1",
+                    drive_device=None,
+                    drive_serial="abcdef123456",
+                    state=str(root / "child-state.json"),
+                    overwrite=False,
+                    min_free_gb=0,
+                    no_extras=False,
+                    no_split_playall=False,
+                    verify=False,
+                    sync_move=True,
+                    allow_mkvmerge_fallback=False,
+                    non_interactive=True,
+                )
+                with drive.slot_lock_scope(), \
+                     mock.patch.object(drive.subprocess, "run", side_effect=_enum(child_row)), \
+                     mock.patch.object(ripper, "resolve_nas_path", side_effect=lambda p, **_: p), \
+                     mock.patch.object(ripper, "_free_gb", return_value=500.0), \
+                     mock.patch.object(ripper, "LOCAL_STAGING_BASE", root / "stage"), \
+                     mock.patch.object(ripper.subprocess, "Popen") as child_rip_popen:
+                    with self.assertRaises(drive.DriveSlotConflictError):
+                        ripper.rip_disc(rip_child_args, item, info, [0], root / "lib", {}, 1)
+                    child_rip_popen.assert_not_called()
+                    probe_checks["child_rip_blocked"] = True
+
+                # A genuinely different physical drive on disc:1 MUST still dispatch cleanly.
+                with drive.slot_lock_scope(), \
+                     mock.patch.object(drive.subprocess, "run", side_effect=_enum(other_row)), \
+                     mock.patch.object(
+                         probe.subprocess,
+                         "Popen",
+                         return_value=SimpleNamespace(
+                             stdout=io.StringIO(
+                                 'CINFO:2,0,"OTHER"\nTINFO:0,9,0,"1:30:00"\nTINFO:0,11,0,"1000"\n'
+                             ),
+                             returncode=0,
+                             wait=lambda timeout=None: 0,
+                             terminate=lambda: None,
+                             kill=lambda: None,
+                         ),
+                     ) as other_popen:
+                    other_info = probe.probe_disc(other_args)
+                    self.assertIsNotNone(other_info)
+                    other_popen.assert_called_once()
+                    probe_checks["other_drive_dispatched"] = True
+
+                return SimpleNamespace(
+                    stdout=io.StringIO(
+                        'CINFO:2,0,"THOR"\nTINFO:0,9,0,"1:54:00"\nTINFO:0,11,0,"1000"\n'
+                    ),
+                    returncode=0,
+                    wait=lambda timeout=None: 0,
+                    terminate=lambda: None,
+                    kill=lambda: None,
+                )
+
+            with mock.patch.dict(os.environ, {"BURNDVD_LOCK_DIR": str(lock_dir)}, clear=False), \
+                 mock.patch.object(probe, "_drive_idx_from_args", return_value=None), \
+                 mock.patch.object(probe, "_optical_mounts", return_value=[]), \
+                 mock.patch.object(drive.subprocess, "run", side_effect=_enum(parent_row)), \
+                 mock.patch.object(probe.subprocess, "Popen", side_effect=parent_probe_popen):
+                with drive.slot_lock_scope():
+                    info = probe.probe_disc(parent_args)
+
+            self.assertIsNotNone(info)
+            self.assertEqual(
+                probe_checks["parent_locks"],
+                ["dev-disk6.lock", "disc-0.lock", "serial-ABCDEF123456.lock"],
+            )
+            self.assertTrue(probe_checks["child_probe_blocked"])
+            self.assertTrue(probe_checks["child_rip_blocked"])
+            self.assertTrue(probe_checks["other_drive_dispatched"])
+
+    def test_scan_and_probe_acquire_lock_before_prelock_unmount_and_retain_through_recovery(self):
+        """DVD-scan-prelock-actions regression:
+        1. Busy `--scan` and direct `probe_disc` MUST exit 4 / raise DriveSlotConflictError
+           with ZERO pkill / diskutil unmount dispatches before conflict.
+        2. Unbusy `probe_disc` MUST already hold the drive lock before initial unmount and
+           keep holding it through recovery unmount and retry Popen."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_dir = root / "locks"
+            fake = root / "fake-makemkv"
+            fake.touch()
+            commands: list[list[str]] = []
+
+            def record_cmd(cmd, **_):
+                commands.append(list(cmd))
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            # Part 1a: ripqueue --scan against a busy disc:0 lock does ZERO subprocess.run calls.
+            with mock.patch.dict(os.environ, {"BURNDVD_LOCK_DIR": str(lock_dir)}, clear=False), \
+                 mock.patch.object(subprocess, "run", side_effect=record_cmd), \
+                 mock.patch.object(subprocess, "Popen", side_effect=AssertionError("unexpected launch")), \
+                 mock.patch.object(ripqueue, "_drive_idx_from_args", return_value=None), \
+                 mock.patch.object(probe, "_drive_idx_from_args", return_value=1), \
+                 mock.patch.object(probe, "_optical_mounts", return_value=["/dev/disk6"]), \
+                 mock.patch.object(drive, "_drutil_disk_node", return_value="/dev/disk6"), \
+                 mock.patch.object(
+                     sys,
+                     "argv",
+                     [
+                         "ripqueue",
+                         "--scan",
+                         "--device",
+                         "disc:0",
+                         "--state",
+                         str(root / "state.json"),
+                         "--makemkvcon",
+                         str(fake),
+                     ],
+                 ), \
+                 drive.slot_lock_scope(), \
+                 drive.disc_slot_lock("disc:0"):
+                with self.assertRaises(SystemExit) as ctx:
+                    ripqueue.main()
+            self.assertEqual(ctx.exception.code, 4)
+            self.assertEqual(commands, [])
+
+            # Part 1b: direct probe_disc() against a busy disc:0 lock ALSO runs zero unmounts.
+            direct_args = SimpleNamespace(
+                device="disc:0",
+                makemkvcon=str(fake),
+                state=str(root / "direct-state.json"),
+            )
+            with mock.patch.dict(os.environ, {"BURNDVD_LOCK_DIR": str(lock_dir)}, clear=False), \
+                 mock.patch.object(probe, "_drive_idx_from_args", return_value=1), \
+                 mock.patch.object(probe, "_optical_mounts", return_value=["/dev/disk6"]), \
+                 mock.patch.object(probe, "unmount_blocking_volume") as mock_unmount, \
+                 mock.patch.object(probe.subprocess, "Popen") as mock_popen, \
+                 drive.slot_lock_scope(), \
+                 drive.disc_slot_lock("disc:0"):
+                with drive.slot_lock_scope():
+                    with self.assertRaises(drive.DriveSlotConflictError):
+                        probe.probe_disc(direct_args)
+            mock_unmount.assert_not_called()
+            mock_popen.assert_not_called()
+
+            # Part 2: Unbusy probe_disc holds the lock during initial unmount, first Popen,
+            # recovery unmount, and retry Popen, then releases it cleanly on exit.
+            events: list[tuple[str, bool]] = []
+            popen_calls = 0
+
+            def _is_disc0_locked_from_other_scope() -> bool:
+                with drive.slot_lock_scope():
+                    try:
+                        with drive.disc_slot_lock("disc:0", lock_dir=lock_dir):
+                            return False
+                    except drive.DriveSlotConflictError:
+                        return True
+
+            def fake_unmount(rdisk, drive_idx=None):
+                events.append((f"unmount:{rdisk}", _is_disc0_locked_from_other_scope()))
+                return True
+
+            def fake_recovery_popen(cmd, **_):
+                nonlocal popen_calls
+                popen_calls += 1
+                events.append((f"popen:{popen_calls}", _is_disc0_locked_from_other_scope()))
+                if popen_calls == 1:
+                    out = 'DRV:0,2,999,12,"FAKE","THOR","/dev/rdisk6"\n'
+                else:
+                    out = (
+                        'CINFO:2,0,"THOR"\n'
+                        'TINFO:0,9,0,"1:54:00"\n'
+                        'TINFO:0,11,0,"100000"\n'
+                    )
+                return SimpleNamespace(
+                    stdout=io.StringIO(out),
+                    returncode=0,
+                    wait=lambda timeout=None: 0,
+                    terminate=lambda: None,
+                    kill=lambda: None,
+                )
+
+            with mock.patch.dict(os.environ, {"BURNDVD_LOCK_DIR": str(lock_dir)}, clear=False), \
+                 mock.patch.object(probe, "_drive_idx_from_args", return_value=0), \
+                 mock.patch.object(probe, "_optical_mounts", return_value=["/dev/disk6"]), \
+                 mock.patch.object(probe, "unmount_blocking_volume", side_effect=fake_unmount), \
+                 mock.patch.object(probe.subprocess, "Popen", side_effect=fake_recovery_popen), \
+                 drive.slot_lock_scope():
+                info = probe.probe_disc(direct_args)
+
+            self.assertIsNotNone(info)
+            self.assertEqual(popen_calls, 2)
+            # Every single unmount and Popen happened while disc:0 was locked.
+            self.assertTrue(events)
+            for label, locked in events:
+                self.assertTrue(locked, f"{label} ran without holding disc:0 lock")
+            self.assertIn(("unmount:None", True), events)
+            self.assertIn(("unmount:/dev/rdisk6", True), events)
+            # Lock released cleanly after probe_disc returns.
+            self.assertFalse(_is_disc0_locked_from_other_scope())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -278,7 +278,10 @@ def main() -> None:
     if args.scan:
         try:
             with slot_lock_scope():
-                sys.exit(scan_titles_json(args))
+                resolved_device = resolve_makemkv_device(args)
+                args.device = resolved_device
+                with disc_slot_lock(args.device, target=args):
+                    sys.exit(scan_titles_json(args))
         except DriveSlotConflictError as exc:
             print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
             append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")

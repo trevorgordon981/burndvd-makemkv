@@ -226,15 +226,7 @@ def probe_disc(args) -> dict | None:
     target_drive_idx = _drive_idx_from_args(args)
     want_drv_idx = target_drive_idx if target_drive_idx is not None else 0
 
-    def _run_once():
-        if _optical_mounts():
-            unmount_blocking_volume(None, drive_idx=target_drive_idx)
-        try:
-            resolved_device = resolve_makemkv_device(args)
-        except DriveSlotConflictError as exc:
-            print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
-            append_log(args, f"PROBE_REFUSED  {exc}")
-            return None, None, None, None, [], getattr(args, "device", "")
+    def _exec_probe(resolved_device: str):
         resolved_disc_idx = _disc_selector_index(resolved_device)
         eff_drv_idx = (
             resolved_disc_idx if resolved_disc_idx is not None else want_drv_idx
@@ -249,88 +241,82 @@ def probe_disc(args) -> dict | None:
             cmd.append("--noscan")
         cmd.extend(["info", resolved_device])
         try:
-            with disc_slot_lock(resolved_device, target=args):
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except OSError:
+            return None, None, None, None, [], resolved_device
+
+        q: queue.Queue = queue.Queue()
+        threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
+
+        lines: list[str] = []
+        last_line_t = time.time()
+        start = time.time()
+        last_status_t = 0.0
+        titles_added = 0
+        killed = False
+        kill_reason = ""
+        stall_s = PROBE_STALL_S
+        hard_s = PROBE_HARD_S
+        slow_mode = False
+        while True:
+            now = time.time()
+            if now - start > hard_s:
+                proc.kill()
+                killed = True
+                kill_reason = f"killed after hard timeout ({int(now - start)}s)"
+                break
+            if now - last_line_t > stall_s:
+                proc.kill()
+                killed = True
+                kill_reason = f"killed on stall ({int(now - last_line_t)}s without output)"
+                break
+            if now - last_status_t >= 10:
+                tag = " (slow-mode VOB scan)" if slow_mode else ""
+                print(
+                    f"  {C.D}probing... {int(now - start)}s elapsed, "
+                    f"{titles_added} title(s) found{tag}{C.R}",
+                    flush=True,
+                )
+                last_status_t = now
+            try:
+                kind, payload = q.get(timeout=2)
+            except queue.Empty:
+                continue
+            if kind == "eof":
+                break
+            if kind == "line":
+                line = payload.rstrip()
+                lines.append(line)
+                last_line_t = now
+                global _LAST_PROBE_ACTIVITY
+                _LAST_PROBE_ACTIVITY = now
+                if "MSG:3028" in line:
+                    titles_added += 1
+                    if stall_s < 180:
+                        stall_s = 180
+                if not slow_mode and "MSG:3042" in line:
+                    slow_mode = True
+                    stall_s = 300
+                    hard_s = max(hard_s, 1800)
+                    print(
+                        f"  {C.YLW}disc has corrupt IFO — falling back to "
+                        f"VOB scan, this is slow but should finish{C.R}",
+                        flush=True,
                     )
-                except OSError:
-                    return None, None, None, None, [], resolved_device
-
-                q: queue.Queue = queue.Queue()
-                threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
-
-                lines: list[str] = []
-                last_line_t = time.time()
-                start = time.time()
-                last_status_t = 0.0
-                titles_added = 0
-                killed = False
-                kill_reason = ""
-                stall_s = PROBE_STALL_S
-                hard_s = PROBE_HARD_S
-                slow_mode = False
-                while True:
-                    now = time.time()
-                    if now - start > hard_s:
-                        proc.kill()
-                        killed = True
-                        kill_reason = f"killed after hard timeout ({int(now - start)}s)"
-                        break
-                    if now - last_line_t > stall_s:
-                        proc.kill()
-                        killed = True
-                        kill_reason = f"killed on stall ({int(now - last_line_t)}s without output)"
-                        break
-                    if now - last_status_t >= 10:
-                        tag = " (slow-mode VOB scan)" if slow_mode else ""
-                        print(
-                            f"  {C.D}probing... {int(now - start)}s elapsed, "
-                            f"{titles_added} title(s) found{tag}{C.R}",
-                            flush=True,
-                        )
-                        last_status_t = now
-                    try:
-                        kind, payload = q.get(timeout=2)
-                    except queue.Empty:
-                        continue
-                    if kind == "eof":
-                        break
-                    if kind == "line":
-                        line = payload.rstrip()
-                        lines.append(line)
-                        last_line_t = now
-                        global _LAST_PROBE_ACTIVITY
-                        _LAST_PROBE_ACTIVITY = now
-                        if "MSG:3028" in line:
-                            titles_added += 1
-                            if stall_s < 180:
-                                stall_s = 180
-                        if not slow_mode and "MSG:3042" in line:
-                            slow_mode = True
-                            stall_s = 300
-                            hard_s = max(hard_s, 1800)
-                            print(
-                                f"  {C.YLW}disc has corrupt IFO — falling back to "
-                                f"VOB scan, this is slow but should finish{C.R}",
-                                flush=True,
-                            )
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-        except DriveSlotConflictError as exc:
-            print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
-            append_log(args, f"PROBE_REFUSED  {exc}")
-            raise
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
         if killed and not any(
             line.startswith(("CINFO:", "TINFO:")) for line in lines
@@ -378,36 +364,64 @@ def probe_disc(args) -> dict | None:
                     pass
         return (cinfo, titles, msgs), msg_codes, rdisk, proc, lines, resolved_device
 
-    result, codes, rdisk, _, raw_lines, resolved_device = _run_once()
-    if (result is None or not result[1]) and _optical_mounts():
-        if unmount_blocking_volume(rdisk, drive_idx=target_drive_idx):
-            result, codes, rdisk, _, raw_lines, resolved_device = _run_once()
-    if result is None:
+    try:
+        resolved_device = resolve_makemkv_device(args)
+    except DriveSlotConflictError as exc:
+        print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
+        append_log(args, f"PROBE_REFUSED  {exc}")
         return None
-    cinfo, titles, msgs = result
-    if titles:
-        return {"cinfo": cinfo, "titles": titles, "msgs": msgs}
-    if msgs_indicate_aacs_lock(msgs):
-        return {"error": "AACS_LOCKED", "msgs": msgs}
-    diag_codes = (codes or set()) & {3042, 2003, 5010}
-    has_diag_text = any(_PROBE_DIAG_TEXT_RE.search(m) for m in msgs)
-    if diag_codes or has_diag_text:
-        diag = _format_probe_diagnostics(raw_lines)
-        if diag:
-            print(
-                f"  {C.YLW}probe diagnostic ({resolved_device}): {diag}{C.R}",
-                flush=True,
+
+    try:
+        with disc_slot_lock(resolved_device, target=args):
+            if _optical_mounts():
+                unmount_blocking_volume(None, drive_idx=target_drive_idx)
+            result, codes, rdisk, _, raw_lines, resolved_device = _exec_probe(
+                resolved_device
             )
-            append_log(args, f"PROBE_DIAG  {resolved_device}  {diag}")
-    if diag_codes:
-        if target_drive_idx is not None and not disc_present(args):
+            if (result is None or not result[1]) and _optical_mounts():
+                if unmount_blocking_volume(rdisk, drive_idx=target_drive_idx):
+                    try:
+                        retry_device = resolve_makemkv_device(args)
+                    except DriveSlotConflictError as exc:
+                        print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
+                        append_log(args, f"PROBE_REFUSED  {exc}")
+                        return None
+                    with disc_slot_lock(retry_device, target=args):
+                        if _optical_mounts():
+                            unmount_blocking_volume(None, drive_idx=target_drive_idx)
+                        result, codes, rdisk, _, raw_lines, resolved_device = (
+                            _exec_probe(retry_device)
+                        )
+            if result is None:
+                return None
+            cinfo, titles, msgs = result
+            if titles:
+                return {"cinfo": cinfo, "titles": titles, "msgs": msgs}
+            if msgs_indicate_aacs_lock(msgs):
+                return {"error": "AACS_LOCKED", "msgs": msgs}
+            diag_codes = (codes or set()) & {3042, 2003, 5010}
+            has_diag_text = any(_PROBE_DIAG_TEXT_RE.search(m) for m in msgs)
+            if diag_codes or has_diag_text:
+                diag = _format_probe_diagnostics(raw_lines)
+                if diag:
+                    print(
+                        f"  {C.YLW}probe diagnostic ({resolved_device}): {diag}{C.R}",
+                        flush=True,
+                    )
+                    append_log(args, f"PROBE_DIAG  {resolved_device}  {diag}")
+            if diag_codes:
+                if target_drive_idx is not None and not disc_present(args):
+                    return None
+                return {
+                    "error": "PHYSICAL_DISC_TROUBLE",
+                    "codes": sorted(diag_codes),
+                    "msgs": msgs,
+                }
             return None
-        return {
-            "error": "PHYSICAL_DISC_TROUBLE",
-            "codes": sorted(diag_codes),
-            "msgs": msgs,
-        }
-    return None
+    except DriveSlotConflictError as exc:
+        print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
+        append_log(args, f"PROBE_REFUSED  {exc}")
+        raise
 
 
 def scan_titles_json(args) -> int:

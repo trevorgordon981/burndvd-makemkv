@@ -43,6 +43,42 @@ class DriveSlotConflictError(RuntimeError):
     """Raised when a MakeMKV `disc:N` slot belongs to another busy/foreign drive."""
 
 
+class ResolvedMakemkvDevice(str):
+    """`str` subclass carrying resolved MakeMKV `DRV:` physical drive identity."""
+
+    device_node: str | None
+    serial: str | None
+
+    def __new__(
+        cls,
+        device: str,
+        *,
+        device_node: str | None = None,
+        serial: str | None = None,
+    ):
+        obj = super().__new__(cls, device)
+        obj.device_node = _normalize_device_node(device_node)
+        obj.serial = _normalize_drive_serial(serial)
+        return obj
+
+
+def _normalize_drive_serial(serial: str | None) -> str | None:
+    """Normalize a hardware drive serial to stripped uppercase, or None if blank."""
+    if not isinstance(serial, str):
+        return None
+    cleaned = serial.strip()
+    return cleaned.upper() if cleaned else None
+
+
+def _resolved_device_from_row(row: dict) -> ResolvedMakemkvDevice:
+    """Build a `ResolvedMakemkvDevice` carrying slot, normalized node, and normalized serial."""
+    return ResolvedMakemkvDevice(
+        f"disc:{row['index']}",
+        device_node=row.get("device_node"),
+        serial=row.get("serial"),
+    )
+
+
 def _disc_lock_dir(lock_dir: Path | None = None) -> Path:
     if lock_dir is not None:
         return Path(lock_dir)
@@ -79,16 +115,22 @@ def disc_slot_lock(
     target=None,
     drive_device: str | None = None,
     drive_serial: str | None = None,
+    resolved_device_node: str | None = None,
+    resolved_serial: str | None = None,
 ):
     """Acquire exclusive non-blocking OS flocks for a MakeMKV `disc:N` slot and physical drive.
 
     Prevents concurrent `ripqueue` / `burndvd` sessions from targeting the same
-    optical drive slot or physical drive simultaneously. Re-entrant within the
-    same logical lock scope for already-held lock paths so nested `probe_disc`
-    and `rip_disc` calls on the already-locked slot succeed without self-deadlock,
-    while any other process, scope, or remapped slot locked by another opener
-    raises `DriveSlotConflictError` immediately via `LOCK_EX | LOCK_NB`.
-    Non-`disc:N` selectors (such as `iso:` or `file:`) are no-ops.
+    optical drive slot or physical drive simultaneously. Derives canonical lock
+    keys from the resolved slot plus ALL known physical identity attributes
+    (explicitly pinned and `DRV:`-resolved normalized device nodes and
+    case-folded serials), acquired in deterministic sorted path order.
+    Re-entrant within the same logical lock scope for already-held lock paths so
+    nested `probe_disc` and `rip_disc` calls on the already-locked slot succeed
+    without self-deadlock, while any other process, scope, or remapped slot
+    locked by another opener raises `DriveSlotConflictError` immediately via
+    `LOCK_EX | LOCK_NB`. Non-`disc:N` selectors (such as `iso:` or `file:`) are
+    no-ops.
     """
     idx = _disc_selector_index(device_spec)
     if idx is None:
@@ -99,24 +141,35 @@ def disc_slot_lock(
     slot_lock_path = base / f"disc-{idx}.lock"
 
     _, exp_dev = _explicit_drive_target(target, device_node=drive_device)
-    exp_serial = _explicit_drive_serial(target, drive_serial=drive_serial)
+    exp_serial = _normalize_drive_serial(
+        _explicit_drive_serial(target, drive_serial=drive_serial)
+    )
+    res_dev = _normalize_device_node(
+        resolved_device_node or getattr(device_spec, "device_node", None)
+    )
+    res_serial = _normalize_drive_serial(
+        resolved_serial or getattr(device_spec, "serial", None)
+    )
+
+    device_nodes = sorted({d for d in (exp_dev, res_dev) if d})
+    serials = sorted({s for s in (exp_serial, res_serial) if s})
 
     lock_specs: list[tuple[str, Path]] = [(f"MakeMKV slot {device_spec}", slot_lock_path)]
-    if exp_dev:
-        dev_slug = exp_dev.removeprefix("/dev/")
-        lock_specs.append((f"physical drive {exp_dev}", base / f"dev-{dev_slug}.lock"))
-    if exp_serial:
-        serial_slug = _sanitize_lock_slug(exp_serial)
+    for dev in device_nodes:
+        dev_slug = dev.removeprefix("/dev/")
+        lock_specs.append((f"physical drive {dev}", base / f"dev-{dev_slug}.lock"))
+    for ser in serials:
+        serial_slug = _sanitize_lock_slug(ser)
         if serial_slug:
             lock_specs.append(
-                (f"drive serial {exp_serial}", base / f"serial-{serial_slug}.lock")
+                (f"drive serial {ser}", base / f"serial-{serial_slug}.lock")
             )
 
     meta = f"pid={os.getpid()} slot={device_spec}"
-    if exp_dev:
-        meta += f" dev={exp_dev}"
-    if exp_serial:
-        meta += f" serial={exp_serial}"
+    if device_nodes:
+        meta += f" dev={','.join(device_nodes)}"
+    if serials:
+        meta += f" serial={','.join(serials)}"
 
     held = _HELD_SLOT_LOCKS_VAR.get()
     if held is None:
@@ -591,10 +644,10 @@ def resolve_makemkv_device(args) -> str:
                     and d["serial"].casefold() == exp_serial.casefold()
                 ]
                 if exact:
-                    return f"disc:{exact[0]['index']}"
+                    return _resolved_device_from_row(exact[0])
             loaded = [d for d in node_matches if d["has_media"]]
             chosen = loaded[0] if loaded else node_matches[0]
-            return f"disc:{chosen['index']}"
+            return _resolved_device_from_row(chosen)
 
     if drives and exp_serial is not None:
         serial_matches = [
@@ -605,7 +658,7 @@ def resolve_makemkv_device(args) -> str:
             and d["has_media"]
         ]
         if serial_matches:
-            return f"disc:{serial_matches[0]['index']}"
+            return _resolved_device_from_row(serial_matches[0])
 
     # Fallback safety: check active drive-claims and running ripqueue/makemkvcon
     # processes so we NEVER hand a busy/foreign disc:K to a different physical drive.
@@ -633,15 +686,21 @@ def resolve_makemkv_device(args) -> str:
             foreign_indices.add(d["index"])
 
     if orig_idx not in foreign_indices:
+        matching_orig = next(
+            (d for d in present_drives if d["index"] == orig_idx),
+            None,
+        )
+        if matching_orig is not None:
+            return _resolved_device_from_row(matching_orig)
         return device
 
     if present_drives:
         candidates = [d for d in present_drives if d["index"] not in foreign_indices]
         loaded_candidates = [d for d in candidates if d["has_media"]]
         if len(loaded_candidates) == 1:
-            return f"disc:{loaded_candidates[0]['index']}"
+            return _resolved_device_from_row(loaded_candidates[0])
         if len(candidates) == 1 and exp_node is not None:
-            return f"disc:{candidates[0]['index']}"
+            return _resolved_device_from_row(candidates[0])
     else:
         drutil_drives = _drutil_list_drives()
         total_slots = max(
