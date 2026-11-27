@@ -245,6 +245,37 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
+def _self_and_ancestor_pids() -> set[int]:
+    """Return current PID plus its live parent/ancestor chain (excluding PID 1)."""
+    pids = {os.getpid()}
+    ppid = os.getppid()
+    if ppid > 1:
+        pids.add(ppid)
+    try:
+        r = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            parent_of: dict[int, int] = {}
+            for line in (r.stdout or "").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    parent_of[int(parts[0])] = int(parts[1])
+            cur = ppid
+            while cur > 1 and len(pids) < 32:
+                pids.add(cur)
+                nxt = parent_of.get(cur, 0)
+                if nxt <= 1 or nxt in pids:
+                    break
+                cur = nxt
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return pids
+
+
 def _active_process_lines() -> list[tuple[int, str]]:
     """Return `[(pid, cmdline), ...]` from `ps -Ao pid=,args=` (best-effort)."""
     try:
@@ -302,7 +333,7 @@ def active_busy_disc_claims(
     procs = _active_process_lines()
     busy: dict[int, dict[str, str]] = {}
     self_states: set[str] = set()
-    self_pids: set[int] = set()
+    self_pids: set[int] = _self_and_ancestor_pids()
     self_discs: set[int] = set()
     if exclude_state:
         self_states.add(exclude_state)

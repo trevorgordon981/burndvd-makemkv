@@ -211,6 +211,22 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
         self.assertEqual(cands[0], "THOR_RAGNAROK")
         self.assertIn("MARVEL'S THOR: RAGNAROK", cands)
 
+    def test_active_busy_disc_claims_ignores_ancestor_wrapper_pids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_procs = [
+                (90010, "/bin/bash /path/bin/burndvd --internal-pty-run /log caffeinate ripqueue.py --device disc:1"),
+                (90011, "/opt/homebrew/bin/makemkvcon -r mkv disc:0 0 /tmp/stage"),
+            ]
+            with mock.patch.object(drive, "_active_process_lines", return_value=fake_procs), \
+                 mock.patch.object(drive, "_self_and_ancestor_pids", return_value={os.getpid(), 90010}):
+                busy = drive.active_busy_disc_claims(
+                    exclude_device_node="/dev/disk5",
+                    exclude_pid=os.getpid(),
+                    claim_dir=Path(tmp) / "empty-claims",
+                )
+            self.assertNotIn(1, busy)
+            self.assertIn(0, busy)
+
 
 if __name__ == "__main__":
     unittest.main()
