@@ -227,9 +227,9 @@ def _probe_expected_duration_s(path: str) -> tuple[float | None, str | None]:
     except (OSError, subprocess.SubprocessError) as exc:
         return None, f"ffprobe failed: {exc}"
     if probe.returncode != 0:
-        return None, f"ffprobe exit {probe.returncode}; {(probe.stderr or "").strip()[:200]}"
+        return None, f"ffprobe exit {probe.returncode}; {(probe.stderr or '').strip()[:200]}"
     if (probe.stderr or "").strip():
-        return None, f"ffprobe error: {(probe.stderr or "").strip()[:200]}"
+        return None, f"ffprobe error: {(probe.stderr or '').strip()[:200]}"
     try:
         data = json.loads(probe.stdout or "{}")
     except (ValueError, TypeError):
