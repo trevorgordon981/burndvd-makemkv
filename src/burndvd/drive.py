@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import queue
 import re
@@ -38,6 +40,60 @@ _DUMMY_KEYCHECK_DISC_IDX = 9999
 
 class DriveSlotConflictError(RuntimeError):
     """Raised when a MakeMKV `disc:N` slot belongs to another busy/foreign drive."""
+
+
+def _disc_lock_dir(lock_dir: Path | None = None) -> Path:
+    if lock_dir is not None:
+        return Path(lock_dir)
+    env_dir = os.environ.get("BURNDVD_LOCK_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir)
+    return Path.home() / ".cache" / "burndvd" / "locks"
+
+
+@contextlib.contextmanager
+def disc_slot_lock(device_spec: str, *, lock_dir: Path | None = None):
+    """Acquire an exclusive non-blocking OS flock for a MakeMKV `disc:N` slot.
+
+    Prevents two concurrent `ripqueue` / `burndvd` processes from ever targeting
+    the same optical drive slot simultaneously. Non-`disc:N` selectors (such as
+    `iso:` or `file:`) are no-ops.
+    """
+    idx = _disc_selector_index(device_spec)
+    if idx is None:
+        yield None
+        return
+    base = _disc_lock_dir(lock_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / f"disc-{idx}.lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            fh.seek(0)
+            holder = fh.read().strip() or "another active rip process"
+            raise DriveSlotConflictError(
+                f"MakeMKV slot {device_spec} is already locked ({holder})"
+            ) from exc
+        fh.seek(0)
+        fh.truncate()
+        dev_env = os.environ.get(DRIVE_DEVICE_ENV, "").strip()
+        ser_env = os.environ.get(DRIVE_SERIAL_ENV, "").strip()
+        meta = f"pid={os.getpid()} slot={device_spec}"
+        if dev_env:
+            meta += f" dev={dev_env}"
+        if ser_env:
+            meta += f" serial={ser_env}"
+        fh.write(meta + "\n")
+        fh.flush()
+        yield lock_path
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
 
 
 def append_log(args, line: str) -> None:

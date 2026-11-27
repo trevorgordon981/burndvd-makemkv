@@ -1274,11 +1274,17 @@ echo "Target: $ROOT"
 echo "Log:    $LOG"
 echo
 
+EXPECTED_VOL_ARGS=()
+if [ -n "$VOLUME" ]; then
+    EXPECTED_VOL_ARGS=(--expected-volume "$VOLUME")
+fi
+
 BURNDVD_DRUTIL_DRIVE="$DRUTIL_INDEX" BURNDVD_DRIVE_DEVICE="/dev/$DEVICE" \
     BURNDVD_DRIVE_SERIAL="$DRIVE_SERIAL" \
     nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
     caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
     --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry --verify \
+    ${EXPECTED_VOL_ARGS[@]+"${EXPECTED_VOL_ARGS[@]}"} \
     ${RIPQUEUE_MODE_ARGS[@]+"${RIPQUEUE_MODE_ARGS[@]}"} \
     </dev/null >/dev/null 2>&1 &
 RIP_LAUNCHER=$!

@@ -169,14 +169,17 @@ def automatic_review_contract_error(item: QueueItem, info: dict) -> str | None:
 def loose_match(label: str, expected: str) -> bool:
     """Fuzzy substring match between disc volume label and expected item title."""
     norm = lambda s: re.sub(r"[^a-z0-9]+", "", s.lower())
-    a, b = norm(label), norm(expected)
+    expected_no_year = re.sub(r"\s*\(\d{4}\)\s*$", "", expected or "")
+    a = norm(label)
+    b = norm(expected)
+    b_no_year = norm(expected_no_year)
     if not a or not b:
         return False
-    if a == b:
+    if a == b or (b_no_year and a == b_no_year):
         return True
     if len(a) < 6 or len(b) < 6:
         return False
-    return a in b or b in a
+    return a in b or b in a or (bool(b_no_year) and len(b_no_year) >= 6 and (a in b_no_year or b_no_year in a))
 
 
 def partition_episode_contract(

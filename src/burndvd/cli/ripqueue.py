@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import os
 import shutil
@@ -25,12 +26,15 @@ from burndvd.config import (
     load_user_config,
 )
 from burndvd.drive import (
+    DriveSlotConflictError,
     _drive_identity,
     _drive_idx_from_args,
     append_log,
     beep,
     check_key_expiry,
+    disc_slot_lock,
     eject,
+    resolve_makemkv_device,
 )
 from burndvd.metadata import (
     _compact,
@@ -280,6 +284,24 @@ def main() -> None:
         sys.exit(1)
 
     warn_state_location(args.state)
+    try:
+        resolved_device = resolve_makemkv_device(args)
+    except DriveSlotConflictError as exc:
+        print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
+        append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")
+        sys.exit(4)
+    args.device = resolved_device
+
+    try:
+        with disc_slot_lock(args.device):
+            _run_queue_session(args, _initial_drive_idx, _initial_drive_id)
+    except DriveSlotConflictError as exc:
+        print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
+        append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")
+        sys.exit(4)
+
+
+def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
     check_key_expiry(args)
 
     items = load_queue(Path(args.queue))
@@ -569,13 +591,15 @@ def main() -> None:
         disc_args = argparse.Namespace(**vars(args))
         disc_args.current_disc_fingerprint = fingerprint
 
-        # Pre-staging physical disc intent revalidation (strict watch / allowlist guard).
+        # Pre-staging physical disc intent revalidation (strict watch / allowlist / auto-built guard).
         is_watch_row = (item.notes or "").startswith("watch:")
         expected_vol = (getattr(args, "expected_volume", None) or "").strip()
         if not expected_vol and is_watch_row:
             note_parts = (item.notes or "").split(":", 2)
             if len(note_parts) == 3:
                 expected_vol = note_parts[2].strip()
+        if not expected_vol and (item.notes or "").startswith("auto-built from "):
+            expected_vol = (item.notes or "")[len("auto-built from ") :].strip()
         allow_volumes = tuple(
             str(v).strip()
             for v in (getattr(args, "allow_volumes", None) or ())
@@ -586,11 +610,14 @@ def main() -> None:
             for fp in (getattr(args, "allow_fingerprints", None) or ())
             if str(fp).strip()
         }
-        strict_disc_match = bool(
+        strict_show_intent = bool(
             getattr(args, "strict_disc_match", False)
-            or expected_vol
             or is_watch_row
             or allow_volumes
+        )
+        strict_disc_match = bool(
+            strict_show_intent
+            or expected_vol
             or allow_fingerprints
         )
         if strict_disc_match:
@@ -618,7 +645,7 @@ def main() -> None:
                 )
                 append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
                 sys.exit(4)
-            if item.type == "tv-season" and not allow_fingerprints:
+            if item.type == "tv-season" and strict_show_intent and not allow_fingerprints:
                 ok_intent, intent_reason = volume_matches_show_intent(
                     label,
                     item.title,
