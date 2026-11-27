@@ -35,6 +35,7 @@ from burndvd.drive import (
     disc_slot_lock,
     eject,
     resolve_makemkv_device,
+    slot_lock_scope,
 )
 from burndvd.metadata import (
     _compact,
@@ -275,7 +276,13 @@ def main() -> None:
         sys.exit(1)
 
     if args.scan:
-        sys.exit(scan_titles_json(args))
+        try:
+            with slot_lock_scope():
+                sys.exit(scan_titles_json(args))
+        except DriveSlotConflictError as exc:
+            print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
+            append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")
+            sys.exit(4)
 
     if not args.queue:
         print(
@@ -286,16 +293,11 @@ def main() -> None:
 
     warn_state_location(args.state)
     try:
-        resolved_device = resolve_makemkv_device(args)
-    except DriveSlotConflictError as exc:
-        print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
-        append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")
-        sys.exit(4)
-    args.device = resolved_device
-
-    try:
-        with disc_slot_lock(args.device):
-            _run_queue_session(args, _initial_drive_idx, _initial_drive_id)
+        with slot_lock_scope():
+            resolved_device = resolve_makemkv_device(args)
+            args.device = resolved_device
+            with disc_slot_lock(args.device, target=args):
+                _run_queue_session(args, _initial_drive_idx, _initial_drive_id)
     except DriveSlotConflictError as exc:
         print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
         append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")

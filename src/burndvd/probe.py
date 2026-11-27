@@ -29,6 +29,7 @@ from burndvd.drive import (
     _optical_mounts,
     append_log,
     disc_present,
+    disc_slot_lock,
     resolve_makemkv_device,
     unmount_blocking_volume,
 )
@@ -248,82 +249,88 @@ def probe_disc(args) -> dict | None:
             cmd.append("--noscan")
         cmd.extend(["info", resolved_device])
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except OSError:
-            return None, None, None, None, [], resolved_device
-
-        q: queue.Queue = queue.Queue()
-        threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
-
-        lines: list[str] = []
-        last_line_t = time.time()
-        start = time.time()
-        last_status_t = 0.0
-        titles_added = 0
-        killed = False
-        kill_reason = ""
-        stall_s = PROBE_STALL_S
-        hard_s = PROBE_HARD_S
-        slow_mode = False
-        while True:
-            now = time.time()
-            if now - start > hard_s:
-                proc.kill()
-                killed = True
-                kill_reason = f"killed after hard timeout ({int(now - start)}s)"
-                break
-            if now - last_line_t > stall_s:
-                proc.kill()
-                killed = True
-                kill_reason = f"killed on stall ({int(now - last_line_t)}s without output)"
-                break
-            if now - last_status_t >= 10:
-                tag = " (slow-mode VOB scan)" if slow_mode else ""
-                print(
-                    f"  {C.D}probing... {int(now - start)}s elapsed, "
-                    f"{titles_added} title(s) found{tag}{C.R}",
-                    flush=True,
-                )
-                last_status_t = now
-            try:
-                kind, payload = q.get(timeout=2)
-            except queue.Empty:
-                continue
-            if kind == "eof":
-                break
-            if kind == "line":
-                line = payload.rstrip()
-                lines.append(line)
-                last_line_t = now
-                global _LAST_PROBE_ACTIVITY
-                _LAST_PROBE_ACTIVITY = now
-                if "MSG:3028" in line:
-                    titles_added += 1
-                    if stall_s < 180:
-                        stall_s = 180
-                if not slow_mode and "MSG:3042" in line:
-                    slow_mode = True
-                    stall_s = 300
-                    hard_s = max(hard_s, 1800)
-                    print(
-                        f"  {C.YLW}disc has corrupt IFO — falling back to "
-                        f"VOB scan, this is slow but should finish{C.R}",
-                        flush=True,
+            with disc_slot_lock(resolved_device, target=args):
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
                     )
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+                except OSError:
+                    return None, None, None, None, [], resolved_device
+
+                q: queue.Queue = queue.Queue()
+                threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
+
+                lines: list[str] = []
+                last_line_t = time.time()
+                start = time.time()
+                last_status_t = 0.0
+                titles_added = 0
+                killed = False
+                kill_reason = ""
+                stall_s = PROBE_STALL_S
+                hard_s = PROBE_HARD_S
+                slow_mode = False
+                while True:
+                    now = time.time()
+                    if now - start > hard_s:
+                        proc.kill()
+                        killed = True
+                        kill_reason = f"killed after hard timeout ({int(now - start)}s)"
+                        break
+                    if now - last_line_t > stall_s:
+                        proc.kill()
+                        killed = True
+                        kill_reason = f"killed on stall ({int(now - last_line_t)}s without output)"
+                        break
+                    if now - last_status_t >= 10:
+                        tag = " (slow-mode VOB scan)" if slow_mode else ""
+                        print(
+                            f"  {C.D}probing... {int(now - start)}s elapsed, "
+                            f"{titles_added} title(s) found{tag}{C.R}",
+                            flush=True,
+                        )
+                        last_status_t = now
+                    try:
+                        kind, payload = q.get(timeout=2)
+                    except queue.Empty:
+                        continue
+                    if kind == "eof":
+                        break
+                    if kind == "line":
+                        line = payload.rstrip()
+                        lines.append(line)
+                        last_line_t = now
+                        global _LAST_PROBE_ACTIVITY
+                        _LAST_PROBE_ACTIVITY = now
+                        if "MSG:3028" in line:
+                            titles_added += 1
+                            if stall_s < 180:
+                                stall_s = 180
+                        if not slow_mode and "MSG:3042" in line:
+                            slow_mode = True
+                            stall_s = 300
+                            hard_s = max(hard_s, 1800)
+                            print(
+                                f"  {C.YLW}disc has corrupt IFO — falling back to "
+                                f"VOB scan, this is slow but should finish{C.R}",
+                                flush=True,
+                            )
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+        except DriveSlotConflictError as exc:
+            print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
+            append_log(args, f"PROBE_REFUSED  {exc}")
+            raise
 
         if killed and not any(
             line.startswith(("CINFO:", "TINFO:")) for line in lines

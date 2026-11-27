@@ -44,6 +44,7 @@ from burndvd.drive import (
     append_log,
     beep,
     disc_present,
+    disc_slot_lock,
     resolve_makemkv_device,
     respin_drive,
 )
@@ -1380,6 +1381,9 @@ def rip(
         if not ok:
             clear_tv_slot_reservation(os.getpid())
         return ok, payload
+    except DriveSlotConflictError:
+        clear_tv_slot_reservation(os.getpid())
+        raise
     finally:
         pool = preverify_holder.get("pool")
         if pool is not None and not preverify_holder.get("transferred"):
@@ -1636,18 +1640,6 @@ def _rip_impl(
         ]
 
         prefix = f"[{sel_idx}/{len(selectors)}] " if multi_sel else ""
-        print(f"{C.D}{prefix}$ {' '.join(cmd)}{C.R}")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-
-        q: queue.Queue = queue.Queue()
-        threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
-
         cur_v, total_v, mx = 0, 0, 65536
         cur_task = ""
         last_print = 0.0
@@ -1658,94 +1650,115 @@ def _rip_impl(
         stalled = False
 
         try:
-            while True:
+            with disc_slot_lock(resolved_device, target=args):
+                print(f"{C.D}{prefix}$ {' '.join(cmd)}{C.R}")
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+
+                q: queue.Queue = queue.Queue()
+                threading.Thread(
+                    target=_reader, args=(proc.stdout, q), daemon=True
+                ).start()
+                last_progress_time = time.time()
+
                 try:
-                    kind, payload = q.get(timeout=2.0)
-                except queue.Empty:
-                    stall_age = time.time() - last_progress_time
-                    if stall_age > stall_sec:
+                    while True:
                         try:
-                            recent_write = max(
-                                (p.stat().st_mtime for p in staging.rglob("*.mkv")),
-                                default=0.0,
+                            kind, payload = q.get(timeout=2.0)
+                        except queue.Empty:
+                            stall_age = time.time() - last_progress_time
+                            if stall_age > stall_sec:
+                                try:
+                                    recent_write = max(
+                                        (p.stat().st_mtime for p in staging.rglob("*.mkv")),
+                                        default=0.0,
+                                    )
+                                except OSError:
+                                    recent_write = 0.0
+                                if time.time() - recent_write < 60:
+                                    last_progress_time = time.time()
+                                else:
+                                    sys.stdout.write("\n")
+                                    print(
+                                        f"{C.RED}Stalled: no progress for {int(stall_age)}s "
+                                        f"(threshold {stall_sec}s for {item.format}, "
+                                        f"no staging write in {int(time.time() - recent_write)}s); "
+                                        f"killing makemkvcon.{C.R}"
+                                    )
+                                    stalled = True
+                                    proc.terminate()
+                                    try:
+                                        proc.wait(timeout=10)
+                                    except subprocess.TimeoutExpired:
+                                        proc.kill()
+                                        proc.wait()
+                                    break
+                            disp_task = f"{prefix}{cur_task}" if multi_sel else cur_task
+                            _draw_progress(
+                                sel_start,
+                                total_v,
+                                mx,
+                                disp_task,
+                                min(stall_age, _staging_write_age(staging)),
                             )
-                        except OSError:
-                            recent_write = 0.0
-                        if time.time() - recent_write < 60:
-                            last_progress_time = time.time()
-                        else:
-                            sys.stdout.write("\n")
-                            print(
-                                f"{C.RED}Stalled: no progress for {int(stall_age)}s "
-                                f"(threshold {stall_sec}s for {item.format}, "
-                                f"no staging write in {int(time.time() - recent_write)}s); "
-                                f"killing makemkvcon.{C.R}"
-                            )
-                            stalled = True
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=10)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                                proc.wait()
+                            continue
+                        if kind == "eof":
                             break
-                    disp_task = f"{prefix}{cur_task}" if multi_sel else cur_task
-                    _draw_progress(
-                        sel_start,
-                        total_v,
-                        mx,
-                        disp_task,
-                        min(stall_age, _staging_write_age(staging)),
-                    )
-                    continue
-                if kind == "eof":
-                    break
-                line = payload.rstrip()
-                tag, f = parse_line(line)
-                if tag == "PRGV" and f and len(f) >= 3:
+                        line = payload.rstrip()
+                        tag, f = parse_line(line)
+                        if tag == "PRGV" and f and len(f) >= 3:
+                            try:
+                                cur_v, total_v, mx = int(f[0]), int(f[1]), int(f[2])
+                                if total_v > last_progress_total:
+                                    last_progress_total = total_v
+                                    last_progress_time = time.time()
+                            except ValueError:
+                                pass
+                        elif tag == "PRGT" and f and len(f) >= 3:
+                            cur_task = f[2]
+                        elif tag == "MSG" and f and len(f) >= 4:
+                            msgs.append(f[3])
+                            if len(msgs) > 50:
+                                msgs = msgs[-50:]
+                        now = time.time()
+                        if now - last_print > 0.5 and mx > 0:
+                            disp_task = f"{prefix}{cur_task}" if multi_sel else cur_task
+                            _draw_progress(
+                                sel_start,
+                                total_v,
+                                mx,
+                                disp_task,
+                                min(now - last_progress_time, _staging_write_age(staging)),
+                            )
+                            last_print = now
+                except KeyboardInterrupt:
+                    interrupted = True
+                    sys.stdout.write("\n")
+                    print(f"{C.YLW}Interrupted; killing makemkvcon...{C.R}")
+                    proc.terminate()
                     try:
-                        cur_v, total_v, mx = int(f[0]), int(f[1]), int(f[2])
-                        if total_v > last_progress_total:
-                            last_progress_total = total_v
-                            last_progress_time = time.time()
-                    except ValueError:
-                        pass
-                elif tag == "PRGT" and f and len(f) >= 3:
-                    cur_task = f[2]
-                elif tag == "MSG" and f and len(f) >= 4:
-                    msgs.append(f[3])
-                    if len(msgs) > 50:
-                        msgs = msgs[-50:]
-                now = time.time()
-                if now - last_print > 0.5 and mx > 0:
-                    disp_task = f"{prefix}{cur_task}" if multi_sel else cur_task
-                    _draw_progress(
-                        sel_start,
-                        total_v,
-                        mx,
-                        disp_task,
-                        min(now - last_progress_time, _staging_write_age(staging)),
-                    )
-                    last_print = now
-        except KeyboardInterrupt:
-            interrupted = True
-            sys.stdout.write("\n")
-            print(f"{C.YLW}Interrupted; killing makemkvcon...{C.R}")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-            shutil.rmtree(staging, ignore_errors=True)
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                    shutil.rmtree(staging, ignore_errors=True)
+                    raise
+                finally:
+                    if not interrupted and not stalled:
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+        except DriveSlotConflictError as exc:
+            print(f"{C.RED}rip refused: {exc}{C.R}", flush=True)
+            append_log(args, f"RIP_REFUSED  {exc}")
             raise
-        finally:
-            if not interrupted and not stalled:
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
 
         sys.stdout.write("\n")
 

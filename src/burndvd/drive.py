@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fcntl
 import os
 import queue
@@ -51,13 +52,43 @@ def _disc_lock_dir(lock_dir: Path | None = None) -> Path:
     return Path.home() / ".cache" / "burndvd" / "locks"
 
 
-@contextlib.contextmanager
-def disc_slot_lock(device_spec: str, *, lock_dir: Path | None = None):
-    """Acquire an exclusive non-blocking OS flock for a MakeMKV `disc:N` slot.
+_HELD_SLOT_LOCKS_VAR: contextvars.ContextVar[dict[Path, list] | None] = (
+    contextvars.ContextVar("burndvd_held_slot_locks", default=None)
+)
 
-    Prevents two concurrent `ripqueue` / `burndvd` processes from ever targeting
-    the same optical drive slot simultaneously. Non-`disc:N` selectors (such as
-    `iso:` or `file:`) are no-ops.
+
+@contextlib.contextmanager
+def slot_lock_scope():
+    """Isolate re-entrant `disc_slot_lock` ownership to a new logical session scope."""
+    token = _HELD_SLOT_LOCKS_VAR.set({})
+    try:
+        yield
+    finally:
+        _HELD_SLOT_LOCKS_VAR.reset(token)
+
+
+def _sanitize_lock_slug(raw: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", (raw or "").strip()).strip("._-")
+
+
+@contextlib.contextmanager
+def disc_slot_lock(
+    device_spec: str,
+    *,
+    lock_dir: Path | None = None,
+    target=None,
+    drive_device: str | None = None,
+    drive_serial: str | None = None,
+):
+    """Acquire exclusive non-blocking OS flocks for a MakeMKV `disc:N` slot and physical drive.
+
+    Prevents concurrent `ripqueue` / `burndvd` sessions from targeting the same
+    optical drive slot or physical drive simultaneously. Re-entrant within the
+    same logical lock scope for already-held lock paths so nested `probe_disc`
+    and `rip_disc` calls on the already-locked slot succeed without self-deadlock,
+    while any other process, scope, or remapped slot locked by another opener
+    raises `DriveSlotConflictError` immediately via `LOCK_EX | LOCK_NB`.
+    Non-`disc:N` selectors (such as `iso:` or `file:`) are no-ops.
     """
     idx = _disc_selector_index(device_spec)
     if idx is None:
@@ -65,35 +96,94 @@ def disc_slot_lock(device_spec: str, *, lock_dir: Path | None = None):
         return
     base = _disc_lock_dir(lock_dir)
     base.mkdir(parents=True, exist_ok=True)
-    lock_path = base / f"disc-{idx}.lock"
-    fh = open(lock_path, "a+", encoding="utf-8")
+    slot_lock_path = base / f"disc-{idx}.lock"
+
+    _, exp_dev = _explicit_drive_target(target, device_node=drive_device)
+    exp_serial = _explicit_drive_serial(target, drive_serial=drive_serial)
+
+    lock_specs: list[tuple[str, Path]] = [(f"MakeMKV slot {device_spec}", slot_lock_path)]
+    if exp_dev:
+        dev_slug = exp_dev.removeprefix("/dev/")
+        lock_specs.append((f"physical drive {exp_dev}", base / f"dev-{dev_slug}.lock"))
+    if exp_serial:
+        serial_slug = _sanitize_lock_slug(exp_serial)
+        if serial_slug:
+            lock_specs.append(
+                (f"drive serial {exp_serial}", base / f"serial-{serial_slug}.lock")
+            )
+
+    meta = f"pid={os.getpid()} slot={device_spec}"
+    if exp_dev:
+        meta += f" dev={exp_dev}"
+    if exp_serial:
+        meta += f" serial={exp_serial}"
+
+    held = _HELD_SLOT_LOCKS_VAR.get()
+    if held is None:
+        held = {}
+        _HELD_SLOT_LOCKS_VAR.set(held)
+
+    seen_keys: set[Path] = set()
+    ordered_specs: list[tuple[Path, str, Path]] = []
+    for label, path in sorted(lock_specs, key=lambda item: str(item[1].resolve())):
+        key = path.resolve()
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        ordered_specs.append((key, label, path))
+
+    acquired: list[Path] = []
     try:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            fh.seek(0)
-            holder = fh.read().strip() or "another active rip process"
-            raise DriveSlotConflictError(
-                f"MakeMKV slot {device_spec} is already locked ({holder})"
-            ) from exc
-        fh.seek(0)
-        fh.truncate()
-        dev_env = os.environ.get(DRIVE_DEVICE_ENV, "").strip()
-        ser_env = os.environ.get(DRIVE_SERIAL_ENV, "").strip()
-        meta = f"pid={os.getpid()} slot={device_spec}"
-        if dev_env:
-            meta += f" dev={dev_env}"
-        if ser_env:
-            meta += f" serial={ser_env}"
-        fh.write(meta + "\n")
-        fh.flush()
-        yield lock_path
+        for key, label, lock_path in ordered_specs:
+            entry = held.get(key)
+            if entry is not None:
+                entry[1] += 1
+                acquired.append(key)
+                continue
+            fh = open(lock_path, "a+", encoding="utf-8")
+            locked = False
+            try:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                except BlockingIOError as exc:
+                    fh.seek(0)
+                    holder = fh.read().strip() or "another active rip process"
+                    raise DriveSlotConflictError(
+                        f"{label} is already locked ({holder})"
+                    ) from exc
+                fh.seek(0)
+                fh.truncate()
+                fh.write(meta + "\n")
+                fh.flush()
+            except BaseException:
+                if locked:
+                    try:
+                        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                fh.close()
+                raise
+            held[key] = [fh, 1]
+            acquired.append(key)
+        yield slot_lock_path
     finally:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        fh.close()
+        for key in reversed(acquired):
+            entry = held.get(key)
+            if entry is None:
+                continue
+            entry[1] -= 1
+            if entry[1] <= 0:
+                held.pop(key, None)
+                fh = entry[0]
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    fh.close()
+                except OSError:
+                    pass
 
 
 def append_log(args, line: str) -> None:
