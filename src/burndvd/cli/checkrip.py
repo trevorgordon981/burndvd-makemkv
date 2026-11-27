@@ -8,6 +8,7 @@ and content-verified duplicates.
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
 import hashlib
 import json
@@ -19,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 # Allow running directly under minimal PATH (e.g. /usr/bin/python3) without site-packages.
 _REPO_SRC = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", ".."))
@@ -414,8 +416,166 @@ def _staging_for_pid(pid: int) -> str | None:
     return matches[0]
 
 
+def _is_ripqueue_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0]).lower()
+    if exe in ("ripqueue.py", "burndvd-queue"):
+        return True
+    if exe.startswith("python"):
+        for idx, tok in enumerate(argv[1:], 1):
+            if os.path.basename(tok) in ("ripqueue.py", "burndvd-queue"):
+                return True
+            if tok == "-m" and idx + 1 < len(argv) and argv[idx + 1] == "burndvd.cli.ripqueue":
+                return True
+    return False
+
+
+def _is_watch_argv(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    exe = os.path.basename(argv[0]).lower()
+    if exe.startswith("python"):
+        for idx, tok in enumerate(argv[1:], 1):
+            if tok == "-m" and idx + 1 < len(argv) and argv[idx + 1] == "burndvd.cli.watch":
+                return True
+    return False
+
+
+def _read_proc_env_hints(pid: int) -> tuple[str | None, str | None]:
+    """Read BURNDVD_DRIVE_DEVICE / BURNDVD_DRIVE_SERIAL from `ps eww -p <pid>`."""
+    try:
+        r = subprocess.run(
+            ["ps", "eww", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None, None
+    out = r.stdout or ""
+    m_dev = re.search(r"\bBURNDVD_DRIVE_DEVICE=([^\s]+)", out)
+    m_ser = re.search(r"\bBURNDVD_DRIVE_SERIAL=([^\s]+)", out)
+    return (
+        m_dev.group(1).strip() if m_dev else None,
+        m_ser.group(1).strip() if m_ser else None,
+    )
+
+
+def _find_open_burndvd_log(pid: int) -> str | None:
+    """Locate an open ~/logs/burndvd-*.log FD for watch-spawned child rips."""
+    try:
+        r = subprocess.run(
+            ["lsof", "-Fn", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("n") and "/logs/burndvd-" in line and line.endswith(".log"):
+            return line[1:]
+    return None
+
+
+def _claim_hints_for_rip(pid: int, state_path: str | None) -> tuple[str | None, str | None]:
+    """Infer (drive_device, drive_serial) from ~/.cache/burndvd/drive-claims/*."""
+    claim_dir = os.path.expanduser("~/.cache/burndvd/drive-claims")
+    if not os.path.isdir(claim_dir):
+        return None, None
+    dev, ser = None, None
+    try:
+        for entry in os.scandir(claim_dir):
+            if not entry.is_dir() or not entry.name.endswith(".claim"):
+                continue
+            c_state = ""
+            c_pid = ""
+            try:
+                c_state = Path(entry.path, "state").read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            try:
+                c_pid = Path(entry.path, "pid").read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if (state_path and c_state == state_path) or (c_pid.isdigit() and int(c_pid) == pid):
+                if entry.name.startswith("serial-"):
+                    ser = entry.name[len("serial-") : -len(".claim")]
+                elif entry.name.startswith("dev-"):
+                    raw = entry.name[len("dev-") : -len(".claim")]
+                    dev = raw if raw.startswith("/dev/") else f"/dev/{raw}"
+    except OSError:
+        pass
+    return dev, ser
+
+
+def _queue_and_slot_metadata(pid: int, queue_path: str | None) -> dict:
+    """Read title/season/volume/episode_range from queue CSV and active-tv-slots JSON."""
+    meta = {"title": None, "season": None, "volume": None, "episode_range": None}
+    if queue_path and os.path.isfile(queue_path):
+        try:
+            with open(queue_path, encoding="utf-8", newline="") as fh:
+                row = next(csv.DictReader(fh), None)
+            if row:
+                meta["title"] = (row.get("title") or "").strip() or None
+                raw_s = (row.get("season") or "").strip()
+                if raw_s.isdigit():
+                    meta["season"] = int(raw_s)
+                notes = (row.get("notes") or "").strip()
+                m_vol = re.search(r"auto-built from\s+(\S+)", notes)
+                if m_vol:
+                    meta["volume"] = m_vol.group(1)
+                raw_ep = (row.get("episode_start") or "").strip()
+                if raw_ep.isdigit() and meta["season"] is not None:
+                    meta["episode_range"] = f"S{meta['season']:02d}E{int(raw_ep):02d}+"
+        except OSError:
+            pass
+    slot_dir = os.environ.get(
+        "BURNDVD_ACTIVE_TV_SLOTS_DIR",
+        os.path.expanduser("~/.cache/burndvd/active-tv-slots"),
+    )
+    slot_file = os.path.join(slot_dir, f"pid-{pid}.json")
+    if os.path.isfile(slot_file):
+        try:
+            data = json.loads(Path(slot_file).read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                s = int(data.get("season") or 0)
+                ep_s = int(data.get("episode_start") or 0)
+                ep_c = int(data.get("episode_count") or 0)
+                if data.get("title"):
+                    meta["title"] = str(data["title"])
+                if s > 0:
+                    meta["season"] = s
+                if s > 0 and ep_s > 0 and ep_c > 0:
+                    meta["episode_range"] = f"S{s:02d}E{ep_s:02d}-E{ep_s + ep_c - 1:02d}"
+        except (OSError, ValueError, TypeError):
+            pass
+    return meta
+
+
+def active_watchers(procs=None) -> list[dict]:
+    """Detect active `burndvd --watch` daemon processes."""
+    if procs is None:
+        procs = _list_processes()
+    out = []
+    for pid, _ppid, cmd in procs:
+        argv = _split_cmd(cmd)
+        if not _is_watch_argv(argv):
+            continue
+        out.append(
+            {
+                "pid": pid,
+                "show": _extract_flag(argv, "--show"),
+                "season": _extract_flag(argv, "--season"),
+            }
+        )
+    return out
+
+
 def active_rips(procs=None) -> list[dict]:
-    """Detect all active rips via running ripqueue.py / makemkvcon processes."""
+    """Detect all active rips via running ripqueue / burndvd-watch / makemkvcon processes."""
+    live_probe = procs is None
     if procs is None:
         procs = _list_processes()
 
@@ -433,12 +593,22 @@ def active_rips(procs=None) -> list[dict]:
         exe = os.path.basename(argv[0]).lower()
         if exe == "makemkvcon":
             staging = None
+            mk_dev = None
+            for tok in argv[1:]:
+                if tok.startswith("disc:") or tok.startswith("dev:"):
+                    mk_dev = tok
             for tok in reversed(argv[1:]):
                 if "/staging/" in tok:
                     staging = tok
                     break
             makemkvs.append(
-                {"pid": pid, "ppid": ppid, "argv": argv, "staging": staging}
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "argv": argv,
+                    "staging": staging,
+                    "device": mk_dev,
+                }
             )
         elif exe == "script":
             log_path = _script_log_from_argv(argv)
@@ -467,13 +637,7 @@ def active_rips(procs=None) -> list[dict]:
                         "state": _extract_flag(argv, "--state"),
                     }
                 )
-        elif (
-            exe.startswith("python")
-            and any(
-                os.path.basename(a) in ("ripqueue.py", "burndvd-queue")
-                for a in argv[1:]
-            )
-        ) or exe in ("ripqueue.py", "burndvd-queue"):
+        elif _is_ripqueue_argv(argv):
             if "--validate-queue" in argv or "--scan" in argv:
                 continue
             ripqueues.append(
@@ -509,11 +673,15 @@ def active_rips(procs=None) -> list[dict]:
                 ):
                     log_path = wr["log_path"]
                     break
+        if log_path is None and live_probe:
+            log_path = _find_open_burndvd_log(rq_pid)
 
         staging = None
+        mk_device = None
         for mk in makemkvs:
             if _is_ancestor(rq_pid, mk["pid"], ppid_map):
                 staging = mk["staging"]
+                mk_device = mk.get("device")
                 used_mk.add(mk["pid"])
                 break
         if staging is None:
@@ -524,35 +692,54 @@ def active_rips(procs=None) -> list[dict]:
                     and mk["staging"].endswith(f"-{rq_pid}")
                 ):
                     staging = mk["staging"]
+                    mk_device = mk.get("device")
                     used_mk.add(mk["pid"])
                     break
         if staging is None:
             staging = _staging_for_pid(rq_pid)
 
+        drive_dev, drive_ser = _claim_hints_for_rip(rq_pid, rq_state)
+        if live_probe and (not drive_dev or not drive_ser):
+            env_dev, env_ser = _read_proc_env_hints(rq_pid)
+            drive_dev = drive_dev or env_dev
+            drive_ser = drive_ser or env_ser
+
+        meta = _queue_and_slot_metadata(rq_pid, rq["queue"])
         rips.append(
             {
                 "pid": rq_pid,
                 "state": rq_state,
                 "queue": rq["queue"],
-                "device": rq["device"],
+                "device": mk_device or rq["device"],
+                "drive_device": drive_dev,
+                "drive_serial": drive_ser,
+                "title": meta["title"],
+                "season": meta["season"],
+                "volume": meta["volume"],
+                "episode_range": meta["episode_range"],
                 "log_path": log_path,
                 "staging": staging,
             }
         )
 
-    if not rips:
-        for mk in makemkvs:
-            if mk["staging"]:
-                rips.append(
-                    {
-                        "pid": mk["pid"],
-                        "state": None,
-                        "queue": None,
-                        "device": None,
-                        "log_path": None,
-                        "staging": mk["staging"],
-                    }
-                )
+    for mk in makemkvs:
+        if mk["pid"] not in used_mk and mk["staging"]:
+            rips.append(
+                {
+                    "pid": mk["pid"],
+                    "state": None,
+                    "queue": None,
+                    "device": mk.get("device"),
+                    "drive_device": None,
+                    "drive_serial": None,
+                    "title": None,
+                    "season": None,
+                    "volume": None,
+                    "episode_range": None,
+                    "log_path": None,
+                    "staging": mk["staging"],
+                }
+            )
     return rips
 
 
@@ -587,7 +774,7 @@ def measure_rip_speed(staging: str, secs: float = 6.0) -> float | None:
     return max(0, b1 - b0) / secs / 1e6
 
 
-def measure_rip_speeds(stagings: list[str | None], secs: float = 6.0) -> dict[str, float | None]:
+def measure_rip_speeds(stagings: list[str | None], secs: float = 3.0) -> dict[str, float | None]:
     valid = [s for s in stagings if s and os.path.isdir(s)]
     if not valid:
         return {}
@@ -604,7 +791,10 @@ def measure_rip_speeds(stagings: list[str | None], secs: float = 6.0) -> dict[st
     for s, start_b in b0.items():
         try:
             b1 = staged_bytes(s)
-            speeds[s] = max(0, b1 - start_b) / secs / 1e6
+            if start_b == 0 and b1 == 0:
+                speeds[s] = None
+            else:
+                speeds[s] = max(0, b1 - start_b) / secs / 1e6
         except OSError:
             speeds[s] = None
     return speeds
@@ -683,8 +873,10 @@ def main() -> int:
 
     if args.directory is None:
         rips = active_rips()
-        if rips:
-            speeds = measure_rip_speeds([r["staging"] for r in rips])
+        watchers = active_watchers()
+        if rips or watchers:
+            speeds = measure_rip_speeds([r["staging"] for r in rips]) if rips else {}
+            tail_n = 8 if len(rips) > 1 else ACTIVE_TAIL_LINES
             rendered = []
             for r in rips:
                 log_path = r["log_path"]
@@ -695,12 +887,18 @@ def main() -> int:
                         reverse=True,
                     )
                     log_path = logs[0] if logs else None
-                tail = active_rip_tail(log_path) if log_path else []
+                tail = active_rip_tail(log_path, n=tail_n) if log_path else []
                 speed = speeds.get(r["staging"]) if r["staging"] else None
                 rendered.append(
                     {
                         "pid": r["pid"],
                         "device": r["device"],
+                        "drive_device": r.get("drive_device"),
+                        "drive_serial": r.get("drive_serial"),
+                        "title": r.get("title"),
+                        "season": r.get("season"),
+                        "volume": r.get("volume"),
+                        "episode_range": r.get("episode_range"),
                         "staging": r["staging"],
                         "log_path": log_path,
                         "speed": speed,
@@ -708,75 +906,91 @@ def main() -> int:
                     }
                 )
 
-            if args.json:
-                if len(rendered) == 1:
-                    one = rendered[0]
-                    print(
-                        json.dumps(
-                            {
-                                "active": True,
-                                "pid": one["pid"],
-                                "device": one["device"],
-                                "staging": one["staging"],
-                                "log_path": one["log_path"],
-                                "speed_mbps": round(one["speed"], 1)
-                                if one["speed"] is not None
-                                else None,
-                                "log_tail": [
-                                    ANSI_RE.sub("", ln) for ln in one["tail"]
-                                ],
-                            },
-                            indent=2,
-                        )
-                    )
+            def _item_json(item: dict) -> dict:
+                return {
+                    "pid": item["pid"],
+                    "device": item["device"],
+                    "drive_device": item["drive_device"],
+                    "drive_serial": item["drive_serial"],
+                    "title": item["title"],
+                    "season": item["season"],
+                    "volume": item["volume"],
+                    "episode_range": item["episode_range"],
+                    "staging": item["staging"],
+                    "log_path": item["log_path"],
+                    "speed_mbps": round(item["speed"], 1)
+                    if item["speed"] is not None
+                    else None,
+                    "log_tail": [ANSI_RE.sub("", ln) for ln in item["tail"]],
+                }
+
+            def _drive_label(item: dict) -> str:
+                parts = []
+                if item["drive_device"]:
+                    parts.append(item["drive_device"])
+                elif item["device"]:
+                    parts.append(item["device"])
                 else:
-                    print(
-                        json.dumps(
-                            {
-                                "active": True,
-                                "rips": [
-                                    {
-                                        "pid": item["pid"],
-                                        "device": item["device"],
-                                        "staging": item["staging"],
-                                        "log_path": item["log_path"],
-                                        "speed_mbps": round(item["speed"], 1)
-                                        if item["speed"] is not None
-                                        else None,
-                                        "log_tail": [
-                                            ANSI_RE.sub("", ln)
-                                            for ln in item["tail"]
-                                        ],
-                                    }
-                                    for item in rendered
-                                ],
-                            },
-                            indent=2,
-                        )
-                    )
+                    parts.append("unknown-drive")
+                if item["drive_serial"]:
+                    parts.append(f"({item['drive_serial']})")
+                elif item["drive_device"] and item["device"]:
+                    parts.append(f"({item['device']})")
+                return " ".join(parts)
+
+            def _content_label(item: dict) -> str:
+                bits = []
+                if item["title"]:
+                    bits.append(item["title"])
+                if item["episode_range"]:
+                    bits.append(item["episode_range"])
+                if item["volume"]:
+                    bits.append(f"[{item['volume']}]")
+                return " ".join(bits) if bits else "(scanning / unknown disc)"
+
+            if args.json:
+                if len(rendered) == 1 and not watchers:
+                    payload = {"active": True, **_item_json(rendered[0])}
+                else:
+                    payload = {
+                        "active": bool(rendered),
+                        "rips": [_item_json(item) for item in rendered],
+                    }
+                    if watchers:
+                        payload["watchers"] = watchers
+                print(json.dumps(payload, indent=2))
             else:
-                for idx, item in enumerate(rendered, 1):
-                    if len(rendered) > 1:
-                        dev = item["device"] or "unknown-device"
+                if watchers:
+                    for w in watchers:
+                        s_txt = f" S{int(w['season']):02d}" if (w.get("season") or "").isdigit() else ""
+                        print(f"Watch daemon active (pid {w['pid']}): {w.get('show') or 'TV'}{s_txt}")
+                if not rendered:
+                    print("  (watch daemon idle — waiting for disc insertion)")
+                    return 0
+                if len(rendered) > 1:
+                    print(f"=== Active Rips ({len(rendered)} drives) ===")
+                    for idx, item in enumerate(rendered, 1):
+                        spd = f"{item['speed']:.1f} MB/s" if item["speed"] is not None else "probing/idle"
                         print(
-                            f"=== Active rip [{idx}/{len(rendered)}]: {dev} (pid {item['pid']}) ==="
+                            f"  [{idx}/{len(rendered)}] {_drive_label(item)} | "
+                            f"{_content_label(item)} | {spd} | pid {item['pid']}"
                         )
+                    print()
+                for idx, item in enumerate(rendered, 1):
+                    hdr = f"{_drive_label(item)} — {_content_label(item)} (pid {item['pid']})"
+                    if len(rendered) > 1:
+                        print(f"=== [{idx}/{len(rendered)}] {hdr} ===")
+                    else:
+                        print(f"=== Active rip: {hdr} ===")
                     if item["tail"]:
                         print("\n".join(item["tail"]))
                     else:
-                        dev = item["device"] or "active"
-                        print(
-                            f"  rip active ({dev}, pid {item['pid']}) — no log output yet"
-                        )
+                        print(f"  rip active ({_drive_label(item)}, pid {item['pid']}) — no log output yet")
                     if item["speed"] is not None:
                         s = item["speed"]
-                        print(
-                            f"\n  rip speed: {s:.1f} MB/s  ({s * 60 / 1000:.2f} GB/min)"
-                        )
-                    elif item["staging"] is None:
-                        print(
-                            "\n  (between titles / probing / transferring — no active staging write)"
-                        )
+                        print(f"\n  rip speed: {s:.1f} MB/s  ({s * 60 / 1000:.2f} GB/min)")
+                    else:
+                        print("\n  (probing / between titles / verifying / transferring — no active staging write)")
                     if idx < len(rendered):
                         print()
             return 0
@@ -839,12 +1053,12 @@ def main() -> int:
     unreadable_by_path = {u["path"]: u["reason"] for u in result["unreadable"]}
     print(
         f"\n{os.path.basename(args.directory.rstrip('/'))}  "
-        f"({len(entries)} files, median {result["median_min"]} min)\n"
+        f"({len(entries)} files, median {result['median_min']} min)\n"
     )
     for e in entries:
         tag = ""
         if e["path"] in unreadable_by_path:
-            tag = f"  <-- UNREADABLE ({unreadable_by_path[e["path"]]})"
+            tag = f"  <-- UNREADABLE ({unreadable_by_path[e['path']]})"
         elif any(b["path"] == e["path"] for b in result["blobs"]):
             est = next(
                 b["est_episodes"]
@@ -853,7 +1067,7 @@ def main() -> int:
             )
             tag = f"  <-- PLAY-ALL BLOB (~{est} episodes)"
         print(
-            f"  {human_min(e["duration"])}  {human_gb(e["size"])}  {e["name"]}{tag}"
+            f"  {human_min(e['duration'])}  {human_gb(e['size'])}  {e['name']}{tag}"
         )
 
     print()
@@ -861,10 +1075,10 @@ def main() -> int:
     if result["unreadable"]:
         ok = False
         print(
-            f"  UNREADABLE: {len(result["unreadable"])} empty or failed-probe file(s):"
+            f"  UNREADABLE: {len(result['unreadable'])} empty or failed-probe file(s):"
         )
         for u in result["unreadable"]:
-            print(f"    - {u["name"]}: {u["reason"]}")
+            print(f"    - {u['name']}: {u['reason']}")
     if result["blobs"]:
         ok = False
         print(
