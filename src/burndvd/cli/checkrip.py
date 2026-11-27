@@ -1028,6 +1028,108 @@ def _active_claim_devices() -> dict[str, int]:
         pass
     return out
 
+CHECKRIP_JSON_SCHEMA_VERSION = 1
+
+
+def _norm_device_node(dev: str | None) -> str:
+    raw = (dev or "").strip()
+    if raw.startswith("/dev/rdisk"):
+        return "/dev/disk" + raw[len("/dev/rdisk") :]
+    return raw
+
+
+def _match_drives_to_rips(drives: list[dict], rendered: list[dict]) -> list[dict]:
+    """Attribute active rips to physical drives without label-stealing.
+
+    Pass 1: Global exact match on stable hardware identity (serial, then device node).
+    Pass 2: Volume-label fallback ONLY for unmatched drives and unmatched rips
+            with NO known hardware identity, and ONLY when the volume label is
+            unambiguous (1-to-1) across both unmatched sets.
+    Pass 3: Append any remaining unmatched rips as standalone rows.
+    """
+    matched_rip_ids: set[int] = set()
+    matched_by_drive: dict[int, dict] = {}
+
+    # Pass 1: Global hardware-identity pass (serial, then normalized device node).
+    for idx, d in enumerate(drives):
+        d_serial = (d.get("serial") or "").strip()
+        d_dev = _norm_device_node(d.get("device"))
+        for item in rendered:
+            if item["pid"] in matched_rip_ids:
+                continue
+            r_serial = (item.get("drive_serial") or "").strip()
+            r_dev = _norm_device_node(item.get("drive_device"))
+            if d_serial and r_serial and d_serial == r_serial:
+                matched_by_drive[idx] = item
+                matched_rip_ids.add(item["pid"])
+                break
+            if d_dev and r_dev and d_dev == r_dev:
+                matched_by_drive[idx] = item
+                matched_rip_ids.add(item["pid"])
+                break
+
+    # Pass 2: Restricted, unambiguous volume-label fallback only when the rip
+    # has NO known hardware identity (drive_device / drive_serial).
+    unmatched_drive_idxs = [i for i in range(len(drives)) if i not in matched_by_drive]
+    unmatched_identityless_rips = [
+        item
+        for item in rendered
+        if item["pid"] not in matched_rip_ids
+        and not _norm_device_node(item.get("drive_device"))
+        and not (item.get("drive_serial") or "").strip()
+        and (item.get("volume") or "").strip()
+    ]
+    drive_vol_counts: dict[str, int] = {}
+    for idx in unmatched_drive_idxs:
+        vol = (drives[idx].get("volume") or "").strip().lower()
+        if vol:
+            drive_vol_counts[vol] = drive_vol_counts.get(vol, 0) + 1
+    rip_vol_counts: dict[str, int] = {}
+    for item in unmatched_identityless_rips:
+        vol = (item.get("volume") or "").strip().lower()
+        if vol:
+            rip_vol_counts[vol] = rip_vol_counts.get(vol, 0) + 1
+
+    for idx in unmatched_drive_idxs:
+        vol = (drives[idx].get("volume") or "").strip().lower()
+        if not vol:
+            continue
+        if drive_vol_counts.get(vol, 0) != 1 or rip_vol_counts.get(vol, 0) != 1:
+            continue
+        for item in unmatched_identityless_rips:
+            if item["pid"] in matched_rip_ids:
+                continue
+            if (item.get("volume") or "").strip().lower() == vol:
+                matched_by_drive[idx] = item
+                matched_rip_ids.add(item["pid"])
+                break
+
+    drive_rows: list[dict] = [
+        {"drive": d, "rip": matched_by_drive.get(idx)}
+        for idx, d in enumerate(drives)
+    ]
+
+    # Pass 3: Unmatched rips (e.g. discovery unavailable or conflicting hardware identity).
+    next_slot = len(drive_rows) + 1
+    for item in rendered:
+        if item["pid"] not in matched_rip_ids:
+            drive_rows.append(
+                {
+                    "drive": {
+                        "slot": next_slot,
+                        "model": None,
+                        "media_type": "BD-ROM",
+                        "device": item["drive_device"] or item["device"],
+                        "volume": item["volume"],
+                    },
+                    "rip": item,
+                }
+            )
+            next_slot += 1
+
+    return drive_rows
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verify a finished rip directory.")
     ap.add_argument(
@@ -1040,6 +1142,16 @@ def main() -> int:
         "--expected", type=int, default=None, help="expected episode count"
     )
     ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument(
+        "--json-version",
+        choices=("1", "2"),
+        default=str(CHECKRIP_JSON_SCHEMA_VERSION),
+        help=(
+            "JSON schema version for active-rip output: "
+            "1 (default, preserves legacy flat single-rip keys alongside drives/rips) "
+            "or 2 (strict envelope only)"
+        ),
+    )
     ap.add_argument(
         "-v",
         "--verbose",
@@ -1097,47 +1209,7 @@ def main() -> int:
 
             drives = connected_optical_drives()
             claim_devs = _active_claim_devices()
-
-            matched_rip_ids: set[int] = set()
-            drive_rows: list[dict] = []
-            for d in drives:
-                matched = None
-                for item in rendered:
-                    if item["pid"] in matched_rip_ids:
-                        continue
-                    if d["device"] and item["drive_device"] == d["device"]:
-                        matched = item
-                        break
-                if matched is None and d["volume"]:
-                    d_vol = d["volume"].lower()
-                    for item in rendered:
-                        if item["pid"] in matched_rip_ids:
-                            continue
-                        if item["volume"] and item["volume"].lower() == d_vol:
-                            matched = item
-                            break
-                if matched is not None:
-                    matched_rip_ids.add(matched["pid"])
-                    drive_rows.append({"drive": d, "rip": matched})
-                else:
-                    drive_rows.append({"drive": d, "rip": None})
-
-            next_slot = len(drive_rows) + 1
-            for item in rendered:
-                if item["pid"] not in matched_rip_ids:
-                    drive_rows.append(
-                        {
-                            "drive": {
-                                "slot": next_slot,
-                                "model": None,
-                                "media_type": "BD-ROM",
-                                "device": item["drive_device"] or item["device"],
-                                "volume": item["volume"],
-                            },
-                            "rip": item,
-                        }
-                    )
-                    next_slot += 1
+            drive_rows = _match_drives_to_rips(drives, rendered)
 
             def _item_json(item: dict) -> dict:
                 return {
@@ -1205,14 +1277,27 @@ def main() -> int:
                             else claim_devs.get(d.get("device") or ""),
                         }
                     )
-                if len(rendered) == 1 and not watchers and not drives:
-                    payload = {"active": True, **_item_json(rendered[0])}
+                schema_ver = int(getattr(args, "json_version", CHECKRIP_JSON_SCHEMA_VERSION))
+                rips_json = [_item_json(item) for item in rendered]
+                if schema_ver == 2:
+                    payload = {
+                        "schema_version": 2,
+                        "active": bool(rendered),
+                        "rips": rips_json,
+                        "drives": drive_summary,
+                        "watchers": watchers,
+                    }
                 else:
                     payload = {
+                        "schema_version": 1,
                         "active": bool(rendered),
-                        "rips": [_item_json(item) for item in rendered],
-                        "drives": drive_summary,
                     }
+                    # Preserve legacy flat single-rip fields consistently regardless of
+                    # whether hardware discovery returned 0, 1, or N drive rows.
+                    if len(rips_json) == 1 and not watchers:
+                        payload.update(rips_json[0])
+                    payload["rips"] = rips_json
+                    payload["drives"] = drive_summary
                     if watchers:
                         payload["watchers"] = watchers
                 print(json.dumps(payload, indent=2))

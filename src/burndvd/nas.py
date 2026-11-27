@@ -570,6 +570,60 @@ def _emit_claimed_tv_moves(
 # --- Atomic no-clobber & progress movers ---
 
 
+def retire_staged_source(
+    src: Path,
+    source_identity: tuple[int, int] | None = None,
+    *,
+    dst: Path | None = None,
+    allow_missing: bool = True,
+) -> bool:
+    """Safely retire a staged source file after durable publication commit.
+
+    Verifies `(st_dev, st_ino)` matches `source_identity` (when provided) before
+    and after an atomic sibling rename so a foreign file placed at `src` is
+    never deleted. Returns True if a file was retired, False if already absent.
+    """
+    src = Path(src)
+    try:
+        current_src = os.lstat(src)
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise
+    if source_identity is not None and (current_src.st_dev, current_src.st_ino) != source_identity:
+        raise OSError(
+            f"source path was replaced during move; completed "
+            f"destination retained at {dst}; replacement source "
+            f"left untouched at {src}"
+        )
+    retired = src.with_name(
+        f".{src.name}.burndvd-consumed-{os.getpid()}-"
+        f"{time.time_ns()}-{os.urandom(8).hex()}"
+    )
+    try:
+        os.rename(src, retired)
+    except FileNotFoundError:
+        if allow_missing:
+            return False
+        raise
+    retired_stat = os.lstat(retired)
+    if source_identity is not None and (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
+        retained_at = retired
+        if not src.exists():
+            try:
+                os.rename(retired, src)
+                retained_at = src
+            except OSError:
+                pass
+        raise OSError(
+            f"source path was replaced during move; completed "
+            f"destination retained at {dst}; foreign source "
+            f"retained at {retained_at}"
+        )
+    retired.unlink()
+    return True
+
+
 def move_with_progress(
     src: Path,
     dst: Path,
@@ -577,6 +631,7 @@ def move_with_progress(
     interval: float = 5.0,
     *,
     allow_overwrite: bool = False,
+    retire_source: bool = True,
 ) -> None:
     """Atomically move a file across filesystems with progress and no-replace by default.
 
@@ -729,41 +784,8 @@ def move_with_progress(
             _atomic_rename_noreplace(partial, dst)
         published = True
 
-        try:
-            current_src = os.lstat(src)
-        except FileNotFoundError:
-            current_src = None
-        if current_src is not None:
-            if (current_src.st_dev, current_src.st_ino) != source_identity:
-                raise OSError(
-                    f"source path was replaced during move; completed "
-                    f"destination retained at {dst}; replacement source "
-                    f"left untouched at {src}"
-                )
-            retired = src.with_name(
-                f".{src.name}.burndvd-consumed-{os.getpid()}-"
-                f"{time.time_ns()}-{os.urandom(8).hex()}"
-            )
-            try:
-                os.rename(src, retired)
-            except FileNotFoundError:
-                pass
-            else:
-                retired_stat = os.lstat(retired)
-                if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
-                    retained_at = retired
-                    if not src.exists():
-                        try:
-                            os.rename(retired, src)
-                            retained_at = src
-                        except OSError:
-                            pass
-                    raise OSError(
-                        f"source path was replaced during move; completed "
-                        f"destination retained at {dst}; foreign source "
-                        f"retained at {retained_at}"
-                    )
-                retired.unlink()
+        if retire_source:
+            retire_staged_source(src, source_identity, dst=dst, allow_missing=True)
     except BaseException:
         if monitor_fd is not None:
             try:
@@ -871,6 +893,7 @@ def move_with_progress_noclobber(
     partial_root: Path | None = None,
     lock_dir: Path | None = None,
     publish_lock_held: bool = False,
+    retire_source: bool = True,
 ) -> None:
     """Copy to out-of-library `.partial`, fsync, atomically publish no-clobber, retire source."""
     src, dst = Path(src), Path(dst)
@@ -1017,32 +1040,14 @@ def move_with_progress_noclobber(
             if claim_path is not None:
                 _remove_zero_placeholder(claim_path, placeholder_identity)
 
-        retired = src.with_name(
-            f".{src.name}.burndvd-consumed-{os.getpid()}-"
-            f"{time.time_ns()}-{os.urandom(8).hex()}"
-        )
-        try:
-            os.rename(src, retired)
-        except OSError as exc:
-            raise OSError(
-                f"source path changed after publication; destination retained "
-                f"at {dst}: {exc}"
-            ) from exc
-        retired_stat = os.lstat(retired)
-        if (retired_stat.st_dev, retired_stat.st_ino) != source_identity:
-            retained_at = retired
-            if not src.exists():
-                try:
-                    os.rename(retired, src)
-                    retained_at = src
-                except OSError:
-                    pass
-            raise OSError(
-                f"source path was replaced during protected copy; completed "
-                f"destination retained at {dst}; foreign source retained at "
-                f"{retained_at}"
-            )
-        retired.unlink()
+        if retire_source:
+            try:
+                retire_staged_source(src, source_identity, dst=dst, allow_missing=False)
+            except FileNotFoundError as exc:
+                raise OSError(
+                    f"source path changed after publication; destination retained "
+                    f"at {dst}: {exc}"
+                ) from exc
     except BaseException:
         if monitor_fd is not None:
             try:

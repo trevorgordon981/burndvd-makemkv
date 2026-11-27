@@ -32,6 +32,7 @@ from burndvd.drive import (
     check_key_expiry,
     eject,
 )
+from burndvd.metadata import _compact, volume_matches_show_intent
 from burndvd.models import (
     QueueItem,
     load_or_init,
@@ -182,6 +183,30 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["skip", "retry", "abort"],
         default="skip",
         help="non-interactive disposition for FAIL",
+    )
+    ap.add_argument(
+        "--expected-volume",
+        default=None,
+        help="require probed physical disc volume label to match before staging",
+    )
+    ap.add_argument(
+        "--allow-volume",
+        dest="allow_volumes",
+        action="append",
+        default=[],
+        help="repeatable volume label/glob allowlist for strict physical-disc binding",
+    )
+    ap.add_argument(
+        "--allow-fingerprint",
+        dest="allow_fingerprints",
+        action="append",
+        default=[],
+        help="repeatable physical-disc SHA-256 fingerprint allowlist for pre-staging verification",
+    )
+    ap.add_argument(
+        "--strict-disc-match",
+        action="store_true",
+        help="fail closed (exit 4) before staging if probed disc does not match configured show/volume intent",
     )
     return ap
 
@@ -537,6 +562,72 @@ def main() -> None:
         fingerprint = disc_content_fingerprint(info)
         disc_args = argparse.Namespace(**vars(args))
         disc_args.current_disc_fingerprint = fingerprint
+
+        # Pre-staging physical disc intent revalidation (strict watch / allowlist guard).
+        is_watch_row = (item.notes or "").startswith("watch:")
+        expected_vol = (getattr(args, "expected_volume", None) or "").strip()
+        if not expected_vol and is_watch_row:
+            note_parts = (item.notes or "").split(":", 2)
+            if len(note_parts) == 3:
+                expected_vol = note_parts[2].strip()
+        allow_volumes = tuple(
+            str(v).strip()
+            for v in (getattr(args, "allow_volumes", None) or ())
+            if str(v).strip()
+        )
+        allow_fingerprints = {
+            str(fp).strip().lower()
+            for fp in (getattr(args, "allow_fingerprints", None) or ())
+            if str(fp).strip()
+        }
+        strict_disc_match = bool(
+            getattr(args, "strict_disc_match", False)
+            or expected_vol
+            or is_watch_row
+            or allow_volumes
+            or allow_fingerprints
+        )
+        if strict_disc_match:
+            if allow_fingerprints and (fingerprint or "").lower() not in allow_fingerprints:
+                err_msg = (
+                    f"probed physical disc fingerprint {(fingerprint or '')[:16]!r} "
+                    f"is not in --allow-fingerprint allowlist"
+                )
+                print(
+                    f"{C.RED}{err_msg}; refusing optical read before staging.{C.R}",
+                    file=sys.stderr,
+                )
+                append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
+                sys.exit(4)
+            if expected_vol and (
+                not label or _compact(label) != _compact(expected_vol)
+            ):
+                err_msg = (
+                    f"probed disc volume {label!r} does not match expected "
+                    f"volume {expected_vol!r} (disc changed or misrouted)"
+                )
+                print(
+                    f"{C.RED}{err_msg}; refusing optical read before staging.{C.R}",
+                    file=sys.stderr,
+                )
+                append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
+                sys.exit(4)
+            if item.type == "tv-season" and not allow_fingerprints:
+                ok_intent, intent_reason = volume_matches_show_intent(
+                    label,
+                    item.title,
+                    item.season,
+                    allowed_volumes=allow_volumes,
+                )
+                if not ok_intent:
+                    err_msg = f"probed disc rejected for {item.title} S{item.season:02d}: {intent_reason}"
+                    print(
+                        f"{C.RED}{err_msg}; refusing optical read before staging.{C.R}",
+                        file=sys.stderr,
+                    )
+                    append_log(args, f"DISC_INTENT_MISMATCH {item.title} :: {err_msg}")
+                    sys.exit(4)
+
         target = resolve_nas_path(
             compute_target_dir(item), prefer_nfs=(item.type == "tv-season")
         )
@@ -580,7 +671,7 @@ def main() -> None:
             append_log(args, f"DUP_DISC {item.title} disc{disc_n} {fingerprint}")
             sys.exit(4)
 
-        if not loose_match(label, item.title):
+        if not strict_disc_match and not loose_match(label, item.title):
             print(f"{C.YLW}Disc label doesn't match expected '{item.title}'.{C.R}")
             ans = auto_answer(args, "Proceed anyway? [y/N/skip] ", "y")
             if ans == "skip":

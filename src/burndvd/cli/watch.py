@@ -103,6 +103,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to ripqueue.py / burndvd-queue (default: ~/scripts/ripqueue.py or python -m burndvd.cli.ripqueue)",
     )
+    parser.add_argument(
+        "--allow-volume",
+        dest="allow_volumes",
+        action="append",
+        default=[],
+        metavar="PATTERN",
+        help=(
+            "Explicit volume label or glob allowlist for this watch session "
+            "(repeatable; when set, only matching discs are admitted)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-fingerprint",
+        dest="allow_fingerprints",
+        action="append",
+        default=[],
+        metavar="SHA256",
+        help=(
+            "Explicit physical-disc SHA-256 fingerprint allowlist forwarded to "
+            "burndvd-queue for pre-staging revalidation (repeatable)"
+        ),
+    )
     return parser
 
 
@@ -147,6 +169,8 @@ def config_from_args(
         max_discs=int(args.max_discs),
         makemkvcon=args.makemkvcon,
         ripqueue_py=args.ripqueue_py,
+        allowed_volumes=tuple(getattr(args, "allow_volumes", ()) or ()),
+        allowed_fingerprints=tuple(getattr(args, "allow_fingerprints", ()) or ()),
     )
 
 

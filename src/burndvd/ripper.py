@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import errno
+import hashlib
 import json
 import os
 import queue
@@ -73,6 +74,7 @@ from burndvd.nas import (
     require_free_extra_destination,
     reserve_tv_review_attempt_dir,
     resolve_nas_path,
+    retire_staged_source,
     season_dir_lock,
     starting_ep,
     tv_partial_capture_root,
@@ -401,10 +403,128 @@ def _unpack_move_job(job):
 
 
 _COMMITTED_MANIFEST_NAME = ".burndvd-committed.json"
+_PUBLISH_INTENT_NAME = ".burndvd-publish-intent.json"
 
 
 def _norm_job_key(src: Path | str, orig_dst: Path | str) -> tuple[str, str]:
     return (os.path.normpath(os.fspath(src)), os.path.normpath(os.fspath(orig_dst)))
+
+
+def _sha256_file(path: Path) -> tuple[str, int]:
+    """Compute `(hex_sha256, byte_size)` by streaming `path`."""
+    h = hashlib.sha256()
+    total = 0
+    with Path(path).open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+    return h.hexdigest(), total
+
+
+def _fsync_dir(dir_path: Path) -> None:
+    """Best-effort fsync of a directory entry on POSIX filesystems."""
+    try:
+        dfd = os.open(str(dir_path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dfd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(dfd)
+        except OSError:
+            pass
+
+
+def _atomic_write_json_durable(path: Path, payload: dict) -> None:
+    """Atomically write JSON with fsync on file + parent directory."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        raw = json.dumps(payload, indent=2)
+        with tmp.open("w", encoding="utf-8") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _load_publish_intents(staging) -> list[dict]:
+    """Load any durable in-flight per-file publish intent records from staging."""
+    if not staging:
+        return []
+    intent_path = Path(staging) / _PUBLISH_INTENT_NAME
+    if not intent_path.is_file():
+        return []
+    try:
+        data = json.loads(intent_path.read_text(encoding="utf-8"))
+        entries = data.get("intents") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return []
+        return [dict(e) for e in entries if isinstance(e, dict) and e.get("src") and (e.get("orig_dst") or e.get("dst"))]
+    except Exception:
+        return []
+
+
+def _save_publish_intents(staging, intents: list[dict]) -> None:
+    """Durably persist or clear the staging publish-intent journal."""
+    if not staging:
+        return
+    stage_dir = Path(staging)
+    if not stage_dir.is_dir():
+        return
+    intent_path = stage_dir / _PUBLISH_INTENT_NAME
+    if not intents:
+        try:
+            intent_path.unlink(missing_ok=True)
+            _fsync_dir(stage_dir)
+        except OSError:
+            pass
+        return
+    _atomic_write_json_durable(intent_path, {"intents": intents})
+
+
+def _upsert_intent(intents: list[dict], record: dict) -> list[dict]:
+    key = _norm_job_key(record["src"], record.get("orig_dst", record["dst"]))
+    updated = [
+        e
+        for e in intents
+        if _norm_job_key(e.get("src", ""), e.get("orig_dst", e.get("dst", ""))) != key
+    ]
+    updated.append(dict(record))
+    return updated
+
+
+def _remove_intent(intents: list[dict], src: Path, orig_dst: Path) -> list[dict]:
+    key = _norm_job_key(src, orig_dst)
+    return [
+        e
+        for e in intents
+        if _norm_job_key(e.get("src", ""), e.get("orig_dst", e.get("dst", ""))) != key
+    ]
+
+
+def _find_intent_record(
+    intents: list[dict], src: Path, orig_dst: Path
+) -> dict | None:
+    key = _norm_job_key(src, orig_dst)
+    for rec in intents:
+        if not isinstance(rec, dict):
+            continue
+        if _norm_job_key(rec.get("src", ""), rec.get("orig_dst", rec.get("dst", ""))) == key:
+            return rec
+    return None
 
 
 def _load_committed_jobs(result: dict, staging) -> list[dict]:
@@ -435,25 +555,14 @@ def _load_committed_jobs(result: dict, staging) -> list[dict]:
 
 
 def _save_committed_manifest(staging, committed_jobs: list[dict]) -> None:
-    """Atomically persist per-file commit records inside the staging directory."""
+    """Atomically and durably persist per-file commit records inside the staging directory."""
     if not staging:
         return
     stage_dir = Path(staging)
     if not stage_dir.is_dir():
         return
     manifest = stage_dir / _COMMITTED_MANIFEST_NAME
-    tmp = stage_dir / f"{_COMMITTED_MANIFEST_NAME}.{os.getpid()}.{time.time_ns()}.tmp"
-    try:
-        tmp.write_text(
-            json.dumps({"committed_jobs": committed_jobs}, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, manifest)
-    except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+    _atomic_write_json_durable(manifest, {"committed_jobs": committed_jobs})
 
 
 def _find_committed_record(
@@ -469,7 +578,12 @@ def _find_committed_record(
 
 
 def _verify_committed_destination(rec: dict, src: Path) -> Path:
-    """Verify a previously committed destination still exists with recorded size/identity."""
+    """Verify a previously committed destination still exists with recorded size/identity.
+
+    If a crash happened after durably writing the commit manifest but before
+    retiring `src`, verifies `src` content identity matches the committed record
+    and completes safe retirement instead of failing recovery.
+    """
     dst_raw = rec.get("dst") or rec.get("orig_dst")
     if not dst_raw:
         raise OSError("committed job record is missing destination path")
@@ -501,11 +615,97 @@ def _verify_committed_destination(rec: dict, src: Path) -> Path:
         raise OSError(
             f"previously committed destination inode mismatch at {actual_dst}"
         )
+    expected_sha = rec.get("sha256")
+    if expected_sha:
+        actual_sha, actual_bytes = _sha256_file(actual_dst)
+        if actual_sha != str(expected_sha) or (
+            expected_size is not None and actual_bytes != int(expected_size)
+        ):
+            raise OSError(
+                f"previously committed destination checksum mismatch at {actual_dst}"
+            )
     if src.exists():
+        if expected_sha:
+            src_stat = os.lstat(src)
+            src_sha, src_bytes = _sha256_file(src)
+            src_dev = rec.get("src_dev")
+            src_ino = rec.get("src_ino")
+            identity_ok = (
+                src_dev is None
+                or src_ino is None
+                or (src_stat.st_dev == int(src_dev) and src_stat.st_ino == int(src_ino))
+            )
+            if (
+                stat.S_ISREG(src_stat.st_mode)
+                and identity_ok
+                and src_sha == str(expected_sha)
+                and (expected_size is None or src_bytes == int(expected_size))
+            ):
+                retire_staged_source(
+                    src,
+                    (src_stat.st_dev, src_stat.st_ino),
+                    dst=actual_dst,
+                    allow_missing=True,
+                )
+                return actual_dst
         raise OSError(
             f"staged source still present for committed destination {actual_dst}: {src}"
         )
     return actual_dst
+
+
+def _reconcile_intent_destination(intent: dict, src: Path) -> dict | None:
+    """Reconcile an in-flight publish intent after a crash between rename and commit journal.
+
+    Returns a verified `commit_rec` if the destination already exists with matching
+    content identity (and retires `src` if still present after verifying its
+    content identity); returns `None` if destination does not yet exist (crash
+    happened before rename). Raises `OSError` fail-closed if destination exists
+    with foreign or corrupted content.
+    """
+    dst_raw = intent.get("dst") or intent.get("orig_dst")
+    if not dst_raw:
+        return None
+    actual_dst = Path(dst_raw)
+    try:
+        dst_stat = os.lstat(actual_dst)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(dst_stat.st_mode):
+        raise OSError(
+            f"publish-intent reconciliation failed: destination is not a regular file: {actual_dst}"
+        )
+    expected_size = intent.get("size")
+    expected_sha = intent.get("sha256")
+    if expected_size is None or not expected_sha:
+        raise OSError(
+            f"publish-intent record for {actual_dst} lacks content identity; refusing blind adoption"
+        )
+    if dst_stat.st_size != int(expected_size):
+        raise OSError(
+            f"publish-intent reconciliation size mismatch at {actual_dst}: "
+            f"expected {expected_size}, found {dst_stat.st_size}"
+        )
+    actual_sha, actual_bytes = _sha256_file(actual_dst)
+    if actual_sha != str(expected_sha) or actual_bytes != int(expected_size):
+        raise OSError(
+            f"publish-intent reconciliation checksum mismatch at {actual_dst}: "
+            f"destination content does not match staged source"
+        )
+    return {
+        "src": str(src),
+        "orig_dst": str(intent.get("orig_dst") or actual_dst),
+        "dst": str(actual_dst),
+        "size": int(dst_stat.st_size),
+        "sha256": str(expected_sha),
+        "src_dev": intent.get("src_dev"),
+        "src_ino": intent.get("src_ino"),
+        "dst_dev": int(dst_stat.st_dev),
+        "dst_ino": int(dst_stat.st_ino),
+        "label": str(intent.get("label") or "moving"),
+        "committed_at": time.time(),
+        "reconciled_from_intent": True,
+    }
 
 
 def _cleanup_owned_claims(unpacked_jobs: list[tuple]) -> int:
@@ -569,25 +769,79 @@ def _run_finalize(
         with _FINALIZE_LOCK:
             unpacked_jobs = [_unpack_move_job(job) for job in jobs]
             committed_jobs = _load_committed_jobs(result, staging)
+            publish_intents = _load_publish_intents(staging)
             result["committed_jobs"] = list(committed_jobs)
 
-            # Classify jobs into already-committed (from an earlier partial batch) vs pending.
+            # Classify jobs into already-committed (from manifest or crash-reconciled
+            # publish intent) vs pending.
             pending_indices: list[int] = []
             try:
+                intents_dirty = False
                 for i, unpacked in enumerate(unpacked_jobs):
-                    src, orig_dst_raw = unpacked[0], unpacked[1]
+                    (
+                        src,
+                        orig_dst_raw,
+                        _lbl,
+                        protected,
+                        placeholder_identity,
+                        claim_path,
+                        _partial_root,
+                        _lock_dir,
+                    ) = unpacked
                     src_path = Path(src)
                     orig_dst = Path(orig_dst_raw)
                     rec = _find_committed_record(committed_jobs, src_path, orig_dst)
                     if rec is not None:
                         actual_dst = _verify_committed_destination(rec, src_path)
+                        if (
+                            protected
+                            and placeholder_identity is not None
+                            and claim_path is not None
+                        ):
+                            _remove_zero_placeholder(claim_path, placeholder_identity)
+                        if _find_intent_record(publish_intents, src_path, orig_dst) is not None:
+                            publish_intents = _remove_intent(publish_intents, src_path, orig_dst)
+                            intents_dirty = True
                         if str(actual_dst) != str(orig_dst):
                             files = [
                                 str(actual_dst) if fp == str(orig_dst) else fp
                                 for fp in files
                             ]
-                    else:
-                        pending_indices.append(i)
+                        continue
+
+                    intent = _find_intent_record(publish_intents, src_path, orig_dst)
+                    if intent is not None:
+                        reconciled = _reconcile_intent_destination(intent, src_path)
+                        if reconciled is not None:
+                            committed_jobs.append(reconciled)
+                            result["committed_jobs"] = list(committed_jobs)
+                            _save_committed_manifest(staging, committed_jobs)
+                            if on_file_committed is not None:
+                                try:
+                                    on_file_committed(dict(reconciled))
+                                except Exception:
+                                    pass
+                            if src_path.exists():
+                                _verify_committed_destination(reconciled, src_path)
+                            if (
+                                protected
+                                and placeholder_identity is not None
+                                and claim_path is not None
+                            ):
+                                _remove_zero_placeholder(claim_path, placeholder_identity)
+                            publish_intents = _remove_intent(publish_intents, src_path, orig_dst)
+                            _save_publish_intents(staging, publish_intents)
+                            actual_dst = Path(reconciled["dst"])
+                            if str(actual_dst) != str(orig_dst):
+                                files = [
+                                    str(actual_dst) if fp == str(orig_dst) else fp
+                                    for fp in files
+                                ]
+                            continue
+
+                    pending_indices.append(i)
+                if intents_dirty:
+                    _save_publish_intents(staging, publish_intents)
             except BaseException as e:
                 cleaned_claims = _cleanup_owned_claims(unpacked_jobs)
                 err_msg = f"MOVE_FAIL {item.title} disc{disc_n}: {e}"
@@ -716,10 +970,37 @@ def _run_finalize(
                             str(dst) if fp == str(orig_dst) else fp for fp in files
                         ]
                     expected_size: int | None = None
+                    src_sha256: str | None = None
+                    src_identity: tuple[int, int] | None = None
                     try:
-                        expected_size = os.lstat(src_path).st_size
+                        src_stat = os.lstat(src_path)
+                        src_identity = (int(src_stat.st_dev), int(src_stat.st_ino))
+                        src_sha256, expected_size = _sha256_file(src_path)
                     except OSError:
                         expected_size = None
+                        src_sha256 = None
+                        src_identity = None
+
+                    # Phase 1: durably fsync per-file publish intent BEFORE publishing
+                    # so a crash between atomic rename and commit manifest can reconcile
+                    # via verified content identity without clobbering or self-colliding.
+                    if src_sha256 is not None and expected_size is not None:
+                        intent_rec = {
+                            "src": str(src_path),
+                            "orig_dst": str(orig_dst),
+                            "dst": str(dst),
+                            "size": int(expected_size),
+                            "sha256": src_sha256,
+                            "src_dev": src_identity[0] if src_identity else None,
+                            "src_ino": src_identity[1] if src_identity else None,
+                            "label": str(label),
+                            "created_at": time.time(),
+                        }
+                        publish_intents = _upsert_intent(publish_intents, intent_rec)
+                        _save_publish_intents(staging, publish_intents)
+
+                    # Phase 2: atomic no-replace publish, deferring staged-source retirement
+                    # until AFTER the commit journal is durably persisted.
                     if protected:
                         move_with_progress_noclobber(
                             src_path,
@@ -729,13 +1010,20 @@ def _run_finalize(
                             claim_path=claim_path,
                             partial_root=partial_root,
                             lock_dir=lock_dir,
+                            retire_source=False,
                         )
                     elif allow_movie_overwrite:
                         move_with_progress(
-                            src_path, dst, label=label, allow_overwrite=True
+                            src_path,
+                            dst,
+                            label=label,
+                            allow_overwrite=True,
+                            retire_source=False,
                         )
                     else:
-                        move_with_progress(src_path, dst, label=label)
+                        move_with_progress(
+                            src_path, dst, label=label, retire_source=False
+                        )
 
                     dst_stat = os.lstat(dst)
                     if not stat.S_ISREG(dst_stat.st_mode):
@@ -755,6 +1043,13 @@ def _run_finalize(
                         "label": str(label),
                         "committed_at": time.time(),
                     }
+                    if src_sha256 is not None:
+                        commit_rec["sha256"] = src_sha256
+                    if src_identity is not None:
+                        commit_rec["src_dev"] = src_identity[0]
+                        commit_rec["src_ino"] = src_identity[1]
+
+                    # Phase 3: durably fsync commit manifest BEFORE retiring staged source.
                     committed_jobs.append(commit_rec)
                     result["committed_jobs"] = list(committed_jobs)
                     _save_committed_manifest(staging, committed_jobs)
@@ -763,6 +1058,16 @@ def _run_finalize(
                             on_file_committed(dict(commit_rec))
                         except Exception:
                             pass
+
+                    # Phase 4: retire staged source & clear in-flight intent.
+                    retire_staged_source(
+                        src_path, src_identity, dst=dst, allow_missing=True
+                    )
+                    if _find_intent_record(publish_intents, src_path, orig_dst) is not None:
+                        publish_intents = _remove_intent(
+                            publish_intents, src_path, orig_dst
+                        )
+                        _save_publish_intents(staging, publish_intents)
                     done_pending_pos = pos + 1
             except BaseException as e:
                 # Only clean owned zero-byte TV claim placeholders (verified by

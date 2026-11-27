@@ -9,6 +9,10 @@ and monitors child `ripqueue` processes until completion or shutdown.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
+import inspect
 import json
 import os
 import re
@@ -19,10 +23,12 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, TextIO
 
 from burndvd import config as burndvd_config
 from burndvd import metadata as burndvd_metadata
@@ -39,8 +45,11 @@ from burndvd.drive import (
 )
 from burndvd.metadata import (
     ACTIVE_TV_SLOTS_ENV,
+    _compact,
+    _norm_media_root,
     compute_next_tv_episode,
     episode_contract,
+    volume_matches_show_intent,
     write_queue,
 )
 
@@ -48,6 +57,72 @@ DEFAULT_WATCH_MAKEMKVCON = "/opt/homebrew/bin/makemkvcon"
 DEFAULT_POLL_INTERVAL_S = 5.0
 DEFAULT_SCAN_WAIT_S = 120.0
 USER_CONFIG_DEFAULT_PATH = Path.home() / ".config" / "burndvd" / "config"
+
+_WATCHER_REGISTRY_LOCK = threading.Lock()
+_SEASON_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_LIVE_WATCHER_RIPS: dict[str, list[ActiveRip]] = {}
+
+
+def _season_coord_key(
+    show: str,
+    season: int,
+    target_root: str,
+    media_smb_root: str = SMB_MEDIA_PREFIX,
+    media_nfs_root: str = NFS_MEDIA_PREFIX,
+) -> str:
+    norm_root = _norm_media_root(target_root, media_smb_root, media_nfs_root)
+    return f"{_compact(show)}|S{int(season)}|{norm_root}"
+
+
+def _get_season_thread_lock(season_key: str) -> threading.Lock:
+    with _WATCHER_REGISTRY_LOCK:
+        lock = _SEASON_THREAD_LOCKS.get(season_key)
+        if lock is None:
+            lock = threading.Lock()
+            _SEASON_THREAD_LOCKS[season_key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _watch_season_lock(work_dir: Path, season_key: str) -> Iterator[None]:
+    """Serialize Watch episode planning + launch across threads and independent processes."""
+    tlock = _get_season_thread_lock(season_key)
+    locks_dir = Path(work_dir) / ".locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(season_key.encode("utf-8")).hexdigest()[:16]
+    lock_file = locks_dir / f"watch-season-{digest}.lock"
+    with tlock:
+        fh = lock_file.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+
+def _spawn_accepts_start_new_session(spawn_fn: Callable[..., Any]) -> bool:
+    """Return True if `spawn_fn` accepts `start_new_session=True` (always True for Popen)."""
+    if spawn_fn is subprocess.Popen:
+        return True
+    try:
+        sig = inspect.signature(spawn_fn)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "start_new_session":
+            return True
+    return False
 
 
 def _parse_bool(value: Any) -> bool | None:
@@ -231,6 +306,10 @@ def build_ripqueue_command(
     no_extras: bool = False,
     ripqueue_py: str | None = None,
     env: Mapping[str, str] | None = None,
+    expected_volume: str | None = None,
+    strict_disc_match: bool = False,
+    allowed_volumes: Iterable[str] = (),
+    allowed_fingerprints: Iterable[str] = (),
 ) -> list[str]:
     """Build the non-interactive `ripqueue` subprocess command for one disc."""
     cmd = resolve_ripqueue_base_cmd(ripqueue_py, env=env)
@@ -251,6 +330,18 @@ def build_ripqueue_command(
     )
     if no_extras:
         cmd.append("--no-extras")
+    if expected_volume:
+        cmd.extend(["--expected-volume", str(expected_volume)])
+    if strict_disc_match:
+        cmd.append("--strict-disc-match")
+    for pattern in allowed_volumes or ():
+        cleaned = str(pattern).strip()
+        if cleaned:
+            cmd.extend(["--allow-volume", cleaned])
+    for fp in allowed_fingerprints or ():
+        cleaned = str(fp).strip()
+        if cleaned:
+            cmd.extend(["--allow-fingerprint", cleaned])
     return cmd
 
 
@@ -343,9 +434,19 @@ class WatchConfig:
     slots_dir: Path | None = None
     media_smb_root: str = SMB_MEDIA_PREFIX
     media_nfs_root: str = NFS_MEDIA_PREFIX
+    allowed_volumes: tuple[str, ...] = ()
+    allowed_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.media_format = str(self.media_format or "BD").strip().upper()
+        self.allowed_volumes = tuple(
+            str(v).strip() for v in (self.allowed_volumes or ()) if str(v).strip()
+        )
+        self.allowed_fingerprints = tuple(
+            str(fp).strip().lower()
+            for fp in (self.allowed_fingerprints or ())
+            if str(fp).strip()
+        )
         if not self.target_root:
             self.target_root = resolve_default_target_root(
                 self.show,
@@ -387,6 +488,7 @@ class ActiveRip:
     queue_path: Path
     state_path: Path
     started_at: float
+    pending_launch_path: Path | None = None
 
 
 @dataclass
@@ -451,11 +553,86 @@ class BoxSetWatcher:
 
         self.active_procs: dict[str, ActiveRip] = {}
         self.handled_discs: dict[str, str] = {}
+        self.rejected_discs: dict[str, str] = {}
         self.results: list[CompletedRip] = []
         self._launched_count: int = 0
         self._first_episode_override: int | None = config.episode_start
         self._stop_requested: bool = False
         self._launch_counter: int = 0
+        self.watcher_id: str = uuid.uuid4().hex[:8]
+
+    def _season_key(self) -> str:
+        return _season_coord_key(
+            self.config.show,
+            self.config.season,
+            self.config.target_root,
+            self.config.media_smb_root,
+            self.config.media_nfs_root,
+        )
+
+    def _pending_dir(self) -> Path:
+        return Path(self.config.work_dir) / ".pending"
+
+    def _register_live_rip(self, rip: ActiveRip) -> None:
+        skey = self._season_key()
+        with _WATCHER_REGISTRY_LOCK:
+            bucket = [
+                r
+                for r in _LIVE_WATCHER_RIPS.get(skey, [])
+                if r.proc.poll() is None
+            ]
+            bucket.append(rip)
+            _LIVE_WATCHER_RIPS[skey] = bucket
+
+    def _unregister_live_rip(self, rip: ActiveRip) -> None:
+        skey = self._season_key()
+        with _WATCHER_REGISTRY_LOCK:
+            bucket = [
+                r
+                for r in _LIVE_WATCHER_RIPS.get(skey, [])
+                if r is not rip and r.proc.poll() is None
+            ]
+            if bucket:
+                _LIVE_WATCHER_RIPS[skey] = bucket
+            else:
+                _LIVE_WATCHER_RIPS.pop(skey, None)
+        if rip.pending_launch_path is not None:
+            try:
+                rip.pending_launch_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_pending_launch_record(
+        self,
+        *,
+        pid: int,
+        drive_key: str,
+        queue_path: Path,
+        state_path: Path,
+        log_path: Path,
+        attempt_token: str,
+    ) -> Path | None:
+        pdir = self._pending_dir()
+        try:
+            pdir.mkdir(parents=True, exist_ok=True)
+            dest = pdir / f"launch-{os.getpid()}-{int(pid)}-{attempt_token}.json"
+            tmp = pdir / f".launch-{os.getpid()}-{int(pid)}-{attempt_token}.tmp"
+            payload = {
+                "pid": int(pid),
+                "owner_pid": os.getpid(),
+                "watcher_id": self.watcher_id,
+                "season_key": self._season_key(),
+                "drive_key": drive_key,
+                "state_file": str(state_path),
+                "queue_file": str(queue_path),
+                "log_file": str(log_path),
+                "created_at": time.time(),
+            }
+            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, dest)
+            return dest
+        except OSError:
+            return None
 
     def _emit(self, message: str) -> None:
         ts = self._now_fn().strftime("%H:%M:%S")
@@ -482,6 +659,7 @@ class BoxSetWatcher:
 
         for drive_key, rc in finished_keys:
             rip = self.active_procs.pop(drive_key)
+            self._unregister_live_rip(rip)
             elapsed = max(0.0, self._clock_fn() - rip.started_at)
             # Keep handled_discs pinned to this volume so an un-ejected disc is not re-ripped.
             self.handled_discs[drive_key] = rip.volume
@@ -520,7 +698,7 @@ class BoxSetWatcher:
         return reaped
 
     def _update_handled_guard(self, drives: list[dict[str, Any]]) -> None:
-        """Clear `handled_discs` entries once a drive reports empty/open tray or a new volume."""
+        """Clear `handled_discs` and `rejected_discs` once a drive reports empty/open tray or a new volume."""
         for d in drives:
             drive_key = drive_identity_key(d)
             if drive_key in self.active_procs:
@@ -529,6 +707,7 @@ class BoxSetWatcher:
             node = str(d.get("device_node") or "").strip()
             if state != 2 or not node:
                 self.handled_discs.pop(drive_key, None)
+                self.rejected_discs.pop(drive_key, None)
                 continue
             raw_vol = str(d.get("volume") or "").strip()
             if (
@@ -537,6 +716,11 @@ class BoxSetWatcher:
                 and self.handled_discs[drive_key] != raw_vol
             ):
                 self.handled_discs.pop(drive_key, None)
+            if (
+                drive_key in self.rejected_discs
+                and self.rejected_discs[drive_key] != raw_vol
+            ):
+                self.rejected_discs.pop(drive_key, None)
 
     def _eligible_drives(self, drives: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Return idle drives holding a new, unhandled disc sorted deterministically."""
@@ -553,15 +737,17 @@ class BoxSetWatcher:
             drive_key = drive_identity_key(d)
             if drive_key in seen_keys or drive_key in self.active_procs:
                 continue
-            volume = str(d.get("volume") or "").strip() or f"disc{int(d.get('index', 0))}"
-            if self.handled_discs.get(drive_key) == volume:
+            raw_vol = str(d.get("volume") or "").strip()
+            if raw_vol and self.handled_discs.get(drive_key) == raw_vol:
+                continue
+            if drive_key in self.rejected_discs and self.rejected_discs[drive_key] == raw_vol:
                 continue
             seen_keys.add(drive_key)
             candidates.append(d)
         return candidates
 
     def _known_active_processes(self) -> list[dict[str, Any]]:
-        """Build active-process list combining our live children and external ripqueue procs."""
+        """Build active-process list combining our live children, sibling watchers, and external ripqueue procs."""
         procs: list[dict[str, Any]] = []
         seen_pids: set[int] = set()
         for rip in self.active_procs.values():
@@ -574,6 +760,65 @@ class BoxSetWatcher:
                         "state_file": str(rip.state_path),
                         "queue_file": str(rip.queue_path),
                         "log_file": str(rip.log_path),
+                    }
+                )
+        skey = self._season_key()
+        with _WATCHER_REGISTRY_LOCK:
+            sibling_rips = [
+                r
+                for r in _LIVE_WATCHER_RIPS.get(skey, [])
+                if r.proc.poll() is None
+            ]
+            if sibling_rips:
+                _LIVE_WATCHER_RIPS[skey] = sibling_rips
+            else:
+                _LIVE_WATCHER_RIPS.pop(skey, None)
+        for rip in sibling_rips:
+            pid = getattr(rip.proc, "pid", None)
+            if isinstance(pid, int) and pid > 0 and pid not in seen_pids:
+                seen_pids.add(pid)
+                procs.append(
+                    {
+                        "pid": pid,
+                        "state_file": str(rip.state_path),
+                        "queue_file": str(rip.queue_path),
+                        "log_file": str(rip.log_path),
+                    }
+                )
+        pdir = self._pending_dir()
+        if pdir.is_dir():
+            for path in sorted(pdir.glob("launch-*.json")):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if not isinstance(data, dict) or data.get("season_key") != skey:
+                    continue
+                try:
+                    pid = int(data.get("pid", 0))
+                    owner_pid = int(data.get("owner_pid", 0))
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0 or pid in seen_pids:
+                    continue
+                if owner_pid != os.getpid() and not burndvd_metadata._pid_alive(pid):
+                    if not burndvd_metadata._pid_alive(owner_pid):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    continue
+                if owner_pid == os.getpid():
+                    # Same-process watcher launches are already tracked accurately
+                    # via `_LIVE_WATCHER_RIPS` (including fake PIDs in unit tests).
+                    continue
+                seen_pids.add(pid)
+                procs.append(
+                    {
+                        "pid": pid,
+                        "state_file": str(data.get("state_file") or ""),
+                        "queue_file": str(data.get("queue_file") or ""),
+                        "log_file": str(data.get("log_file") or ""),
                     }
                 )
         try:
@@ -590,8 +835,44 @@ class BoxSetWatcher:
                 procs.append(dict(entry))
         return procs
 
+    def _create_unique_attempt_paths(
+        self, *, slug: str, drive_slug: str, ts: str
+    ) -> tuple[Path, Path, Path, Path, int, str]:
+        """Allocate collision-proof attempt directory and exclusive log file descriptor."""
+        self.config.log_dir.mkdir(parents=True, exist_ok=True)
+        self.config.work_dir.mkdir(parents=True, exist_ok=True)
+        pid = os.getpid()
+        for _ in range(32):
+            attempt_token = uuid.uuid4().hex[:8]
+            unique_tag = (
+                f"{slug}-{drive_slug}-{ts}-{pid}-"
+                f"{self.watcher_id}-{self._launch_counter}-{attempt_token}"
+            )
+            attempt_dir = self.config.work_dir / f"attempt-{unique_tag}"
+            try:
+                attempt_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            log_path = self.config.log_dir / f"burndvd-watch-{unique_tag}.log"
+            try:
+                log_fd = os.open(
+                    str(log_path),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o644,
+                )
+            except FileExistsError:
+                try:
+                    attempt_dir.rmdir()
+                except OSError:
+                    pass
+                continue
+            queue_path = attempt_dir / "queue.csv"
+            state_path = attempt_dir / "state.json"
+            return attempt_dir, queue_path, state_path, log_path, log_fd, attempt_token
+        raise RuntimeError("failed to allocate unique watch attempt directory/log")
+
     def _launch_single_drive(self, drive_row: Mapping[str, Any]) -> ActiveRip | None:
-        """Serialized launch gate for a single drive (zero episode-slot race)."""
+        """Serialized, intent-bound launch gate for a single drive (zero slot or artifact race)."""
         # Reap any child that may have exited just before we compute the next episode.
         self.reap_finished()
 
@@ -600,129 +881,180 @@ class BoxSetWatcher:
         device_node = str(drive_row.get("device_node") or "").strip()
         disc_index = int(drive_row.get("index", 0))
         drutil_drive = disc_index + 1
-        volume = str(drive_row.get("volume") or "").strip() or f"disc{disc_index}"
+        raw_vol = str(drive_row.get("volume") or "").strip()
 
-        contract = episode_contract(self.config.show, self.config.season, volume)
-        expected_episodes = ""
-        expected_disc_episodes = ""
-        expected_title_ids = ""
-        expected_physical_disc = ""
-
-        if self._first_episode_override is not None:
-            ep_start = int(self._first_episode_override)
-            pending_scan_pids: list[int] = []
-        elif contract is not None:
-            ep_start = int(contract["episode_start"])
-            expected_episodes = str(contract["expected_episodes"])
-            expected_disc_episodes = str(contract["expected_disc_episodes"])
-            expected_title_ids = ",".join(str(x) for x in contract["expected_title_ids"])
-            expected_physical_disc = str(contract["disc"])
-            pending_scan_pids = []
-        else:
-            known_procs = self._known_active_processes()
-            ep_info = self._compute_next_ep_fn(
-                title=self.config.show,
-                season=int(self.config.season),
-                target_root=self.config.target_root,
-                season_dir=self.config.season_dir,
-                slots_dir=self.config.slots_dir,
-                media_smb_root=self.config.media_smb_root,
-                media_nfs_root=self.config.media_nfs_root,
-                active_processes=known_procs,
-                wait_scan_s=float(self.config.scan_wait),
-                poll_interval_s=min(2.0, max(0.05, float(self.config.poll_interval))),
+        matched_intent, intent_reason = volume_matches_show_intent(
+            raw_vol,
+            self.config.show,
+            self.config.season,
+            allowed_volumes=self.config.allowed_volumes,
+        )
+        if not matched_intent:
+            self.rejected_discs[drive_key] = raw_vol
+            vol_disp = raw_vol or "(unlabeled)"
+            self._emit(
+                f"Drive {drive_key} ({device_node}) REJECTED {vol_disp} — "
+                f"{intent_reason}; refusing unattended launch"
             )
-            pending_scan_pids = list(ep_info.get("pending_scan_pids") or [])
-            if pending_scan_pids:
-                pids_s = ", ".join(str(p) for p in pending_scan_pids)
-                self._emit(
-                    f"Drive {drive_key} ({device_node}) WAITING — concurrent scan "
-                    f"pid(s) {pids_s} did not publish slot within {int(self.config.scan_wait)}s; "
-                    f"deferring {volume}"
+            return None
+
+        volume = raw_vol
+        skey = self._season_key()
+        with _watch_season_lock(self.config.work_dir, skey):
+            # Guard against two independent watchers launching the same physical drive.
+            with _WATCHER_REGISTRY_LOCK:
+                already_active_drive = any(
+                    r.drive_key == drive_key and r.proc.poll() is None
+                    for r in _LIVE_WATCHER_RIPS.get(skey, [])
                 )
+            if already_active_drive:
                 return None
-            ep_start = int(ep_info.get("next_episode") or 1)
 
-        self._launch_counter += 1
-        ts = self._now_fn().strftime("%Y%m%dT%H%M%S")
-        slug = slugify_volume(volume)
-        unique_tag = f"{slug}-{ts}-{self._launch_counter}"
+            contract = episode_contract(self.config.show, self.config.season, volume)
+            expected_episodes = ""
+            expected_disc_episodes = ""
+            expected_title_ids = ""
+            expected_physical_disc = ""
 
-        self.config.log_dir.mkdir(parents=True, exist_ok=True)
-        self.config.work_dir.mkdir(parents=True, exist_ok=True)
-        log_path = self.config.log_dir / f"burndvd-watch-{slug}-{ts}.log"
-        if log_path.exists():
-            log_path = self.config.log_dir / f"burndvd-watch-{unique_tag}.log"
-        queue_path = self.config.work_dir / f"queue-{unique_tag}.csv"
-        state_path = self.config.work_dir / f"state-{unique_tag}.json"
+            if self._first_episode_override is not None:
+                ep_start = int(self._first_episode_override)
+                pending_scan_pids: list[int] = []
+            elif contract is not None:
+                ep_start = int(contract["episode_start"])
+                expected_episodes = str(contract["expected_episodes"])
+                expected_disc_episodes = str(contract["expected_disc_episodes"])
+                expected_title_ids = ",".join(str(x) for x in contract["expected_title_ids"])
+                expected_physical_disc = str(contract["disc"])
+                pending_scan_pids = []
+            else:
+                known_procs = self._known_active_processes()
+                ep_info = self._compute_next_ep_fn(
+                    title=self.config.show,
+                    season=int(self.config.season),
+                    target_root=self.config.target_root,
+                    season_dir=self.config.season_dir,
+                    slots_dir=self.config.slots_dir,
+                    media_smb_root=self.config.media_smb_root,
+                    media_nfs_root=self.config.media_nfs_root,
+                    active_processes=known_procs,
+                    wait_scan_s=float(self.config.scan_wait),
+                    poll_interval_s=min(2.0, max(0.05, float(self.config.poll_interval))),
+                )
+                pending_scan_pids = list(ep_info.get("pending_scan_pids") or [])
+                if pending_scan_pids:
+                    pids_s = ", ".join(str(p) for p in pending_scan_pids)
+                    self._emit(
+                        f"Drive {drive_key} ({device_node}) WAITING — concurrent scan "
+                        f"pid(s) {pids_s} did not publish slot within {int(self.config.scan_wait)}s; "
+                        f"deferring {volume}"
+                    )
+                    return None
+                ep_start = int(ep_info.get("next_episode") or 1)
 
-        write_queue(
-            queue_path,
-            title=self.config.show,
-            item_type="tv-season",
-            season=str(self.config.season),
-            episode_start=str(ep_start),
-            expected_episodes=expected_episodes,
-            expected_disc_episodes=expected_disc_episodes,
-            expected_title_ids=expected_title_ids,
-            expected_physical_disc=expected_physical_disc,
-            target_root=self.config.target_root,
-            media_format=self.config.media_format,
-            notes=f"watch:{drive_key}:{volume}",
-        )
-
-        cmd = build_ripqueue_command(
-            queue_path=queue_path,
-            state_path=state_path,
-            disc_index=disc_index,
-            makemkvcon=self.config.makemkvcon,
-            no_extras=self.config.no_extras,
-            ripqueue_py=self.config.ripqueue_py,
-        )
-        child_env = build_ripqueue_env(
-            device_node=device_node,
-            drive_serial=drive_serial,
-            drutil_drive=drutil_drive,
-            no_extras=self.config.no_extras,
-            slots_dir=self.config.slots_dir,
-        )
-
-        log_fh = log_path.open("a", encoding="utf-8")
-        try:
-            proc = self._spawn_fn(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=child_env,
+            self._launch_counter += 1
+            ts = self._now_fn().strftime("%Y%m%dT%H%M%S")
+            slug = slugify_volume(volume)
+            drive_slug = slugify_volume(drive_key)
+            (
+                _attempt_dir,
+                queue_path,
+                state_path,
+                log_path,
+                log_fd,
+                attempt_token,
+            ) = self._create_unique_attempt_paths(
+                slug=slug, drive_slug=drive_slug, ts=ts
             )
-        except Exception:
+
+            write_queue(
+                queue_path,
+                title=self.config.show,
+                item_type="tv-season",
+                season=str(self.config.season),
+                episode_start=str(ep_start),
+                expected_episodes=expected_episodes,
+                expected_disc_episodes=expected_disc_episodes,
+                expected_title_ids=expected_title_ids,
+                expected_physical_disc=expected_physical_disc,
+                target_root=self.config.target_root,
+                media_format=self.config.media_format,
+                notes=f"watch:{drive_key}:{volume}",
+            )
+
+            cmd = build_ripqueue_command(
+                queue_path=queue_path,
+                state_path=state_path,
+                disc_index=disc_index,
+                makemkvcon=self.config.makemkvcon,
+                no_extras=self.config.no_extras,
+                ripqueue_py=self.config.ripqueue_py,
+                expected_volume=volume,
+                strict_disc_match=True,
+                allowed_volumes=self.config.allowed_volumes,
+                allowed_fingerprints=self.config.allowed_fingerprints,
+            )
+            child_env = build_ripqueue_env(
+                device_node=device_node,
+                drive_serial=drive_serial,
+                drutil_drive=drutil_drive,
+                no_extras=self.config.no_extras,
+                slots_dir=self.config.slots_dir,
+            )
+
+            log_fh = os.fdopen(log_fd, "w", encoding="utf-8")
+            spawn_kwargs: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": log_fh,
+                "stderr": subprocess.STDOUT,
+                "env": child_env,
+            }
+            if _spawn_accepts_start_new_session(self._spawn_fn):
+                spawn_kwargs["start_new_session"] = True
+            try:
+                proc = self._spawn_fn(cmd, **spawn_kwargs)
+            except Exception:
+                log_fh.close()
+                raise
+            # Child inherited the fd; close parent copy so watcher shutdown never leaks FDs.
             log_fh.close()
-            raise
-        # Child inherited the fd; close parent copy so watcher shutdown never leaks FDs.
-        log_fh.close()
 
-        # Consume one-shot --episode-start override only after spawn succeeded.
-        if self._first_episode_override is not None:
-            self._first_episode_override = None
+            # Consume one-shot --episode-start override only after spawn succeeded.
+            if self._first_episode_override is not None:
+                self._first_episode_override = None
 
-        rip = ActiveRip(
-            drive_key=drive_key,
-            drive_serial=drive_serial,
-            device_node=device_node,
-            disc_index=disc_index,
-            drutil_drive=drutil_drive,
-            volume=volume,
-            episode_start=ep_start,
-            proc=proc,
-            log_path=log_path,
-            queue_path=queue_path,
-            state_path=state_path,
-            started_at=self._clock_fn(),
-        )
-        self.active_procs[drive_key] = rip
-        self.handled_discs[drive_key] = volume
-        self._launched_count += 1
+            pid_val = getattr(proc, "pid", None)
+            pending_launch_path = (
+                self._write_pending_launch_record(
+                    pid=int(pid_val),
+                    drive_key=drive_key,
+                    queue_path=queue_path,
+                    state_path=state_path,
+                    log_path=log_path,
+                    attempt_token=attempt_token,
+                )
+                if isinstance(pid_val, int) and pid_val > 0
+                else None
+            )
+
+            rip = ActiveRip(
+                drive_key=drive_key,
+                drive_serial=drive_serial,
+                device_node=device_node,
+                disc_index=disc_index,
+                drutil_drive=drutil_drive,
+                volume=volume,
+                episode_start=ep_start,
+                proc=proc,
+                log_path=log_path,
+                queue_path=queue_path,
+                state_path=state_path,
+                started_at=self._clock_fn(),
+                pending_launch_path=pending_launch_path,
+            )
+            self.active_procs[drive_key] = rip
+            self.handled_discs[drive_key] = volume
+            self._launched_count += 1
+            self._register_live_rip(rip)
 
         pid_s = getattr(proc, "pid", "?")
         self._emit(

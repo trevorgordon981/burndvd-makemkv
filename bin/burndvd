@@ -249,8 +249,14 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
 fi
 if [ "${1:-}" = "doctor" ]; then
     shift
+    if [ -x "$SCRIPT_DIR/burndvd-doctor" ]; then
+        exec "$SCRIPT_DIR/burndvd-doctor" "$@"
+    fi
     if command -v burndvd-doctor >/dev/null 2>&1; then
         exec burndvd-doctor "$@"
+    fi
+    if [ -x "$SCRIPT_DIR/python3" ]; then
+        exec "$SCRIPT_DIR/python3" -m burndvd.cli.doctor "$@"
     fi
     if [ -x "$HOME/.pyenv/shims/python3" ]; then
         PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
@@ -261,6 +267,9 @@ if [ "${1:-}" = "doctor" ]; then
 fi
 if [ "${1:-}" = "--watch" ] || [ "${1:-}" = "watch" ]; then
     shift
+    if [ -x "$SCRIPT_DIR/python3" ]; then
+        exec "$SCRIPT_DIR/python3" -m burndvd.cli.watch "$@"
+    fi
     if [ -x "$HOME/.pyenv/shims/python3" ]; then
         PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" \
             exec "$HOME/.pyenv/shims/python3" -m burndvd.cli.watch "$@"

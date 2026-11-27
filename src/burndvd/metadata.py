@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import atexit
 import csv
+import fnmatch
 import os
 import subprocess
 import time
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 QUEUE_FIELDS = (
@@ -218,6 +220,90 @@ def episode_contract(title: str, season: int, volume: str) -> dict | None:
         "expected_episodes": int(total),
         "expected_title_ids": title_ids,
     }
+
+
+def _words(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", (value or "").casefold())
+
+
+def volume_matches_show_intent(
+    volume: str,
+    show: str,
+    season: int,
+    *,
+    allowed_volumes: Iterable[str] = (),
+) -> tuple[bool, str]:
+    """Verify an optical disc volume label matches a configured TV show/season intent.
+
+    Returns `(True, reason)` only when the disc volume is explicitly bound to
+    `show`/`season` (or matches an explicit per-season `allowed_volumes` entry).
+    Rejects empty/unlabeled discs, mismatched explicit seasons, and unrelated
+    media so unattended Watch mode cannot queue arbitrary discs under a show.
+    """
+    raw_vol = (volume or "").strip()
+    if not raw_vol:
+        return False, "disc has no volume label"
+
+    allowlist = [str(p).strip() for p in (allowed_volumes or ()) if str(p).strip()]
+    if allowlist:
+        vol_cf = raw_vol.casefold()
+        vol_compact = _compact(raw_vol)
+        for pattern in allowlist:
+            pat_cf = pattern.casefold()
+            if (
+                vol_cf == pat_cf
+                or fnmatch.fnmatchcase(vol_cf, pat_cf)
+                or (
+                    not any(ch in pattern for ch in "*?[]")
+                    and vol_compact
+                    and vol_compact == _compact(pattern)
+                )
+            ):
+                return True, f"matched allowed volume pattern {pattern!r}"
+        return (
+            False,
+            f"volume {raw_vol!r} is not in allowed_volumes allowlist ({allowlist})",
+        )
+
+    season_match = _EXPLICIT_SEASON_RE.search(raw_vol)
+    if season_match:
+        vol_season = int(season_match.group(1) or season_match.group(2))
+        if vol_season != int(season):
+            return (
+                False,
+                f"volume reports season S{vol_season:02d}, expected S{int(season):02d}",
+            )
+
+    vol_stem = _strip_tv_disc_suffix(raw_vol)
+    has_tv_suffix = vol_stem.strip() != raw_vol
+    compact_show = _compact(show)
+    compact_stem = _compact(vol_stem)
+    compact_vol = _compact(raw_vol)
+    if not compact_show or not compact_stem:
+        return False, f"cannot bind volume {raw_vol!r} to show {show!r}"
+
+    if compact_stem == compact_show or compact_vol == compact_show:
+        return True, "exact normalized show match"
+
+    show_words = _words(show)
+    vol_words = _words(vol_stem)
+    if (
+        vol_words
+        and len(vol_words) <= len(show_words)
+        and show_words[: len(vol_words)] == vol_words
+        and len("".join(vol_words)) >= 6
+    ):
+        return True, "leading show-title word prefix match"
+
+    if has_tv_suffix and len(show_words) >= 3:
+        acronym = "".join(w[0] for w in show_words if w)
+        if len(acronym) >= 3 and compact_stem == acronym:
+            return True, "TV acronym match with disc/part suffix"
+
+    return (
+        False,
+        f"volume {raw_vol!r} does not match configured show {show!r} S{int(season):02d}",
+    )
 
 
 def parse_features(raw: str) -> list[dict[str, object]]:
