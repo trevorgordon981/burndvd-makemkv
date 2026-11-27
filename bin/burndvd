@@ -536,10 +536,176 @@ claim_is_active() {
 
 BUSY_DEVS=$( { for p in $(pgrep -f makemkvcon 2>/dev/null || true); do lsof -p "$p" 2>/dev/null | grep -oE '/dev/r?disk[0-9]+' || true; done | grep -oE 'disk[0-9]+' | sort -u; } || true )
 
-ENUM_ROWS=$(python3 - "${MAKEMKVCON_BIN:-}" <<'PY'
-import re, subprocess, sys
+ENUM_ROWS=$(python3 - "${MAKEMKVCON_BIN:-}" "$DRIVE_CLAIM_DIR" "${BUSY_DEVS:-}" <<'PY'
+import csv, json, os, re, subprocess, sys
+from pathlib import Path
 
 mkv_bin = (sys.argv[1] or "").strip()
+claim_dir_arg = (sys.argv[2] or "").strip()
+busy_devs_arg = sys.argv[3] if len(sys.argv) > 3 else ""
+
+RIPQUEUE_RE = re.compile(r"(?:ripqueue\.py|burndvd-queue)\b")
+DEVICE_ARG_RE = re.compile(r"--device(?:=|\s+)disc:(\d+)\b")
+QUEUE_ARG_RE = re.compile(r"--queue(?:=|\s+)(\S+)")
+MAKEMKV_PROC_RE = re.compile(r"\bmakemkvcon\b")
+MAKEMKV_DISC_RE = re.compile(r"\b(?:info|mkv)\s+disc:(\d+)\b")
+DUMMY_DISC_IDX = 9999
+
+def norm_dev_short(raw):
+    m = re.match(r"^(?:/dev/)?r?(disk\d+)$", (raw or "").strip())
+    return m.group(1) if m else ""
+
+def parse_disc_idx(raw):
+    s = (raw or "").strip()
+    if s.startswith("disc:"):
+        s = s[5:]
+    return int(s) if re.fullmatch(r"\d+", s) else None
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+def read_txt(p):
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+def active_procs():
+    try:
+        r = subprocess.run(["ps", "-Ao", "pid=,args="], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    rows = []
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.+)$", line)
+        if m:
+            rows.append((int(m.group(1)), m.group(2).strip()))
+    return rows
+
+def vol_for_dev(dev):
+    try:
+        r = subprocess.run(["diskutil", "info", f"/dev/{dev}"], capture_output=True, text=True, timeout=5)
+        for line in (r.stdout or "").splitlines():
+            if "Volume Name" in line and ":" in line:
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+def queue_volume_from_state_or_cmd(state_path, cmd):
+    qp = ""
+    if cmd:
+        qm = QUEUE_ARG_RE.search(cmd)
+        if qm:
+            qp = qm.group(1).strip("'\"")
+    notes_list = []
+    if state_path and os.path.isfile(state_path):
+        try:
+            d = json.load(open(state_path, encoding="utf-8"))
+            for q in (d.get("queue") or []):
+                if isinstance(q, dict) and q.get("notes"):
+                    notes_list.append(str(q["notes"]))
+        except Exception:
+            pass
+    if not notes_list and qp and os.path.isfile(qp):
+        try:
+            with open(qp, encoding="utf-8", newline="") as fh:
+                for q in csv.DictReader(fh):
+                    if q.get("notes"):
+                        notes_list.append(str(q["notes"]))
+        except Exception:
+            pass
+    for notes in notes_list:
+        vm = re.search(r"auto-built from\s+(\S+)", notes)
+        if vm:
+            return vm.group(1).strip()
+    return ""
+
+procs = active_procs()
+busy_devs = {norm_dev_short(d) for d in busy_devs_arg.splitlines() if norm_dev_short(d)}
+busy_serials_cf = set()
+busy_discs = set()
+busy_volumes_cf = set()
+
+if claim_dir_arg and os.path.isdir(claim_dir_arg):
+    try:
+        claim_entries = sorted(Path(claim_dir_arg).iterdir(), key=lambda p: p.name)
+    except OSError:
+        claim_entries = []
+    for entry in claim_entries:
+        if not entry.is_dir() or not entry.name.endswith(".claim"):
+            continue
+        pid_txt = read_txt(entry / "pid")
+        c_pid = int(pid_txt) if pid_txt.isdigit() else None
+        c_state = read_txt(entry / "state")
+        c_dev = norm_dev_short(read_txt(entry / "dev"))
+        c_serial = read_txt(entry / "serial")
+        c_disc = parse_disc_idx(read_txt(entry / "disc"))
+
+        stem = entry.name[:-len(".claim")]
+        if stem.startswith("dev-") and not c_dev:
+            c_dev = norm_dev_short(stem[len("dev-"):])
+        elif stem.startswith("serial-") and not c_serial:
+            c_serial = stem[len("serial-"):].strip()
+        elif stem.startswith("disc-") and c_disc is None:
+            c_disc = parse_disc_idx(stem[len("disc-"):])
+
+        matching_cmd = None
+        if c_state:
+            for _ppid, cmd in procs:
+                if RIPQUEUE_RE.search(cmd) and c_state in cmd:
+                    matching_cmd = cmd
+                    break
+
+        is_active = (c_pid is not None and pid_alive(c_pid)) or (matching_cmd is not None)
+        if not is_active:
+            continue
+
+        if c_disc is None and matching_cmd is not None:
+            dm = DEVICE_ARG_RE.search(matching_cmd)
+            if dm:
+                c_disc = int(dm.group(1))
+        if c_dev:
+            busy_devs.add(c_dev)
+        if c_serial:
+            busy_serials_cf.add(c_serial.casefold())
+        if c_disc is not None and c_disc != DUMMY_DISC_IDX:
+            busy_discs.add(c_disc)
+        qvol = queue_volume_from_state_or_cmd(c_state, matching_cmd or "")
+        if qvol:
+            busy_volumes_cf.add(qvol.casefold())
+
+my_pid = os.getpid()
+for ppid, cmd in procs:
+    if ppid == my_pid:
+        continue
+    if RIPQUEUE_RE.search(cmd):
+        dm = DEVICE_ARG_RE.search(cmd)
+        if dm:
+            k = int(dm.group(1))
+            if k != DUMMY_DISC_IDX:
+                busy_discs.add(k)
+        qvol = queue_volume_from_state_or_cmd("", cmd)
+        if qvol:
+            busy_volumes_cf.add(qvol.casefold())
+    elif MAKEMKV_PROC_RE.search(cmd) and not re.search(r"\binfo\s+list\b", cmd):
+        dm = MAKEMKV_DISC_RE.search(cmd)
+        if dm:
+            k = int(dm.group(1))
+            if k != DUMMY_DISC_IDX:
+                busy_discs.add(k)
 
 def parse_drv_line(line):
     if ":" not in line:
@@ -573,13 +739,13 @@ def parse_drv_line(line):
     desc = out[4].strip()
     vol = out[5].strip()
     raw_dev = out[6].strip()
-    m = re.match(r"^(?:/dev/)?r?(disk\d+)$", raw_dev)
-    dev = m.group(1) if m else ""
+    dev = norm_dev_short(raw_dev)
     toks = desc.split()
     last_tok = toks[-1] if toks else ""
     serial = last_tok if (len(last_tok) >= 6 and last_tok.isalnum()) else ""
     return (idx, state, desc, serial, vol, dev)
 
+all_drutil_indices = []
 drutil_by_dev = {}
 drutil_loaded = []
 try:
@@ -589,6 +755,8 @@ try:
         if not m:
             continue
         ix = m.group(1)
+        if ix not in all_drutil_indices:
+            all_drutil_indices.append(ix)
         try:
             st = subprocess.run(["drutil", "status", "-drive", ix], capture_output=True, text=True, timeout=10)
         except Exception:
@@ -609,6 +777,8 @@ except Exception:
     pass
 
 mkv_rows = []
+unmatched_mkv = []
+matched_devs = set()
 if mkv_bin:
     try:
         r = subprocess.run([mkv_bin, "-r", "info", "list"], capture_output=True, text=True, timeout=15)
@@ -617,11 +787,53 @@ if mkv_bin:
             if not parsed:
                 continue
             idx, state, desc, serial, vol, dev = parsed
-            if state == 2 and dev:
+            if state != 2:
+                continue
+            if dev:
                 ix, dtype = drutil_by_dev.get(dev, (str(idx + 1), ""))
-                mkv_rows.append((dev, str(idx), ix, serial, dtype, vol))
+                is_busy = (
+                    (dev in busy_devs)
+                    or (bool(serial) and serial.casefold() in busy_serials_cf)
+                    or (idx in busy_discs)
+                )
+                mkv_rows.append((dev, str(idx), ix, serial, dtype, vol, "1" if is_busy else "0"))
+                matched_devs.add(dev)
+            else:
+                unmatched_mkv.append((idx, serial, vol))
     except Exception:
         pass
+
+if unmatched_mkv:
+    rem_drutil = [item for item in drutil_loaded if item[2] not in matched_devs]
+    rem_vols = {item[2]: vol_for_dev(item[2]) for item in rem_drutil}
+    still_mkv = []
+    for idx, serial, vol in unmatched_mkv:
+        matched_item = None
+        if vol:
+            hits = [it for it in rem_drutil if rem_vols.get(it[2], "").casefold() == vol.casefold()]
+            if len(hits) == 1:
+                matched_item = hits[0]
+        if matched_item is not None:
+            _, _, dev, ix, dtype = matched_item
+            is_busy = (
+                (dev in busy_devs)
+                or (bool(serial) and serial.casefold() in busy_serials_cf)
+                or (idx in busy_discs)
+            )
+            mkv_rows.append((dev, str(idx), ix, serial, dtype, vol, "1" if is_busy else "0"))
+            matched_devs.add(dev)
+            rem_drutil = [it for it in rem_drutil if it[2] != dev]
+        else:
+            still_mkv.append((idx, serial, vol))
+    if len(still_mkv) == 1 and len(rem_drutil) == 1:
+        idx, serial, vol = still_mkv[0]
+        _, _, dev, ix, dtype = rem_drutil[0]
+        is_busy = (
+            (dev in busy_devs)
+            or (bool(serial) and serial.casefold() in busy_serials_cf)
+            or (idx in busy_discs)
+        )
+        mkv_rows.append((dev, str(idx), ix, serial, dtype, vol, "1" if is_busy else "0"))
 
 SEP = "\x1f"
 if mkv_rows:
@@ -629,8 +841,39 @@ if mkv_rows:
         print(SEP.join(field.replace(SEP, " ") for field in row))
 else:
     drutil_loaded.sort(key=lambda item: (item[0], item[1]))
-    for rank, (_, _, dev, ix, dtype) in enumerate(drutil_loaded):
-        print(SEP.join((dev, str(rank), ix, "", dtype, "")))
+    if busy_discs and busy_volumes_cf:
+        for _, _, dev, _, _ in drutil_loaded:
+            if dev not in busy_devs:
+                v = vol_for_dev(dev)
+                if v and v.casefold() in busy_volumes_cf:
+                    busy_devs.add(dev)
+    avail_drutil = []
+    for item in drutil_loaded:
+        _, _, dev, ix, dtype = item
+        if dev in busy_devs:
+            print(SEP.join((dev, "", ix, "", dtype, "", "1")))
+        else:
+            avail_drutil.append(item)
+    if busy_discs:
+        total_slots = max(len(all_drutil_indices), len(drutil_loaded), max(busy_discs) + 1)
+        free_slots = [k for k in range(total_slots) if k not in busy_discs]
+        if not free_slots:
+            sys.stderr.write(
+                "burndvd: MakeMKV drive enumeration unavailable and all detected disc slots "
+                f"({sorted(busy_discs)}) are busy/claimed; refusing unsafe fallback.\n"
+            )
+        elif len(avail_drutil) <= len(free_slots):
+            for slot_idx, (_, _, dev, ix, dtype) in zip(free_slots, avail_drutil):
+                print(SEP.join((dev, str(slot_idx), ix, "", dtype, "", "0")))
+        else:
+            sys.stderr.write(
+                "burndvd: MakeMKV drive enumeration unavailable while disc slot(s) "
+                f"{sorted(busy_discs)} are busy and {len(avail_drutil)} loaded drive(s) remain "
+                "unattributed; refusing to guess and risk clobbering the active rip.\n"
+            )
+    else:
+        for rank, (_, _, dev, ix, dtype) in enumerate(avail_drutil):
+            print(SEP.join((dev, str(rank), ix, "", dtype, "", "0")))
 PY
 )
 
@@ -646,7 +889,7 @@ TARGET_NORM_DEV="${TARGET_DRIVE#/dev/}"
 TARGET_NORM_DEV="${TARGET_NORM_DEV#r}"
 TARGET_UPPER=$(printf '%s' "$TARGET_DRIVE" | tr '[:lower:]' '[:upper:]')
 
-while IFS=$'\x1f' read -r _dev _discN _drutilIx _serial _dtype _vol; do
+while IFS=$'\x1f' read -r _dev _discN _drutilIx _serial _dtype _vol _row_busy; do
     [ -z "$_dev" ] && continue
     _serial_upper=$(printf '%s' "$_serial" | tr '[:lower:]' '[:upper:]')
     if [ -n "$TARGET_DRIVE" ]; then
@@ -656,13 +899,19 @@ while IFS=$'\x1f' read -r _dev _discN _drutilIx _serial _dtype _vol; do
         TARGET_FOUND=1
     fi
     _is_busy=0
-    if printf '%s\n' "$BUSY_DEVS" | grep -qx "$_dev"; then
+    if [ "${_row_busy:-0}" = "1" ] || [ -z "$_discN" ]; then
+        _is_busy=1
+    fi
+    if [ "$_is_busy" = "0" ] && printf '%s\n' "$BUSY_DEVS" | grep -qx "$_dev"; then
         _is_busy=1
     fi
     if [ "$_is_busy" = "0" ] && [ -n "$_serial" ] && claim_is_active "$DRIVE_CLAIM_DIR/serial-${_serial}.claim"; then
         _is_busy=1
     fi
     if [ "$_is_busy" = "0" ] && claim_is_active "$DRIVE_CLAIM_DIR/dev-${_dev}.claim"; then
+        _is_busy=1
+    fi
+    if [ "$_is_busy" = "0" ] && [ -n "$_discN" ] && claim_is_active "$DRIVE_CLAIM_DIR/disc-${_discN}.claim"; then
         _is_busy=1
     fi
     if [ "$_is_busy" = "1" ]; then
@@ -746,6 +995,11 @@ fi
 DRIVE_CLAIM_HELD="$drive_claim"
 echo "$$" > "$DRIVE_CLAIM_HELD/pid" 2>/dev/null || true
 echo "$STATE" > "$DRIVE_CLAIM_HELD/state" 2>/dev/null || true
+echo "/dev/$dev" > "$DRIVE_CLAIM_HELD/dev" 2>/dev/null || true
+echo "$discN" > "$DRIVE_CLAIM_HELD/disc" 2>/dev/null || true
+if [ -n "$serial" ]; then
+    echo "$serial" > "$DRIVE_CLAIM_HELD/serial" 2>/dev/null || true
+fi
 DEVICE="$dev"
 DISC_INDEX="$discN"
 DRUTIL_INDEX="$idx"

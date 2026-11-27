@@ -40,6 +40,7 @@ from burndvd.config import (
     sanitize,
 )
 from burndvd.drive import (
+    DriveSlotConflictError,
     append_log,
     beep,
     disc_present,
@@ -1602,7 +1603,12 @@ def _rip_impl(
     for sel_idx, selector in enumerate(selectors, 1):
         sel_start = time.time()
         before_mkvs = set(staging.glob("*.mkv"))
-        resolved_device = resolve_makemkv_device(args)
+        try:
+            resolved_device = resolve_makemkv_device(args)
+        except DriveSlotConflictError as exc:
+            print(f"{C.RED}rip refused: {exc}{C.R}", flush=True)
+            append_log(args, f"RIP_REFUSED  {exc}")
+            return False, str(exc)
         cmd = [
             args.makemkvcon,
             "-r",

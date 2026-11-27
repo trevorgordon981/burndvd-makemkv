@@ -29,6 +29,15 @@ _SLIM_TRAY_DRIVE_RE = re.compile(
 )
 _DEVICE_NODE_RE = re.compile(r"^(?:/dev/)?r?(disk\d+)$")
 _DRUTIL_LIST_LINE_RE = re.compile(r"^\s*(\d+)\s+\S")
+_RIPQUEUE_PROC_RE = re.compile(r"(?:ripqueue\.py|burndvd-queue)\b")
+_DEVICE_ARG_RE = re.compile(r"--device(?:=|\s+)disc:(\d+)\b")
+_MAKEMKV_PROC_RE = re.compile(r"\bmakemkvcon\b")
+_MAKEMKV_DISC_RE = re.compile(r"\b(?:info|mkv)\s+disc:(\d+)\b")
+_DUMMY_KEYCHECK_DISC_IDX = 9999
+
+
+class DriveSlotConflictError(RuntimeError):
+    """Raised when a MakeMKV `disc:N` slot belongs to another busy/foreign drive."""
 
 
 def append_log(args, line: str) -> None:
@@ -165,17 +174,214 @@ def parse_makemkv_drives(output: str) -> list[dict]:
     return drives
 
 
+def _pid_is_alive(pid: int) -> bool:
+    """Return True if process `pid` currently exists."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _active_process_lines() -> list[tuple[int, str]]:
+    """Return `[(pid, cmdline), ...]` from `ps -Ao pid=,args=` (best-effort)."""
+    try:
+        r = subprocess.run(
+            ["ps", "-Ao", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if r.returncode != 0:
+        return []
+    out: list[tuple[int, str]] = []
+    for line in (r.stdout or "").splitlines():
+        m = re.match(r"^\s*(\d+)\s+(.+)$", line)
+        if m:
+            out.append((int(m.group(1)), m.group(2).strip()))
+    return out
+
+
+def _read_claim_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _parse_disc_idx_text(raw: str) -> int | None:
+    s = (raw or "").strip()
+    if s.startswith("disc:"):
+        s = s[5:]
+    return int(s) if re.fullmatch(r"\d+", s) else None
+
+
+def active_busy_disc_claims(
+    *,
+    exclude_device_node: str | None = None,
+    exclude_serial: str | None = None,
+    exclude_state: str | None = None,
+    exclude_pid: int | None = None,
+    claim_dir: Path | None = None,
+) -> dict[int, dict[str, str]]:
+    """Return `{disc_index: metadata}` for MakeMKV slots claimed by OTHER active rips.
+
+    Inspects active `~/.cache/burndvd/drive-claims/*.claim` entries plus live
+    `ripqueue`/`burndvd-queue`/`makemkvcon` processes from `ps`. Any claim or
+    process matching the caller's own `exclude_*` identity is excluded.
+    """
+    norm_excl_node = _normalize_device_node(exclude_device_node)
+    excl_serial_cf = (exclude_serial or "").strip().casefold() or None
+    norm_excl_state = os.path.normpath(exclude_state) if exclude_state else None
+    cdir = claim_dir or (Path.home() / ".cache" / "burndvd" / "drive-claims")
+
+    procs = _active_process_lines()
+    busy: dict[int, dict[str, str]] = {}
+    self_states: set[str] = set()
+    self_pids: set[int] = set()
+    self_discs: set[int] = set()
+    if exclude_state:
+        self_states.add(exclude_state)
+    if exclude_pid is not None:
+        self_pids.add(exclude_pid)
+
+    if cdir.is_dir():
+        try:
+            entries = sorted(cdir.iterdir(), key=lambda p: p.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            if not entry.is_dir() or not entry.name.endswith(".claim"):
+                continue
+            pid_txt = _read_claim_text(entry / "pid")
+            c_pid = int(pid_txt) if pid_txt.isdigit() else None
+            c_state = _read_claim_text(entry / "state")
+            c_dev = _normalize_device_node(_read_claim_text(entry / "dev"))
+            c_serial = _read_claim_text(entry / "serial")
+            c_disc = _parse_disc_idx_text(_read_claim_text(entry / "disc"))
+
+            stem = entry.name[: -len(".claim")]
+            if stem.startswith("dev-") and c_dev is None:
+                c_dev = _normalize_device_node(stem[len("dev-") :])
+            elif stem.startswith("serial-") and not c_serial:
+                c_serial = stem[len("serial-") :].strip()
+            elif stem.startswith("disc-") and c_disc is None:
+                c_disc = _parse_disc_idx_text(stem[len("disc-") :])
+
+            matching_proc_cmd: str | None = None
+            if c_state:
+                for _ppid, cmd in procs:
+                    if _RIPQUEUE_PROC_RE.search(cmd) and c_state in cmd:
+                        matching_proc_cmd = cmd
+                        break
+
+            is_active = (c_pid is not None and _pid_is_alive(c_pid)) or (
+                matching_proc_cmd is not None
+            )
+            if not is_active:
+                continue
+
+            if c_disc is None and matching_proc_cmd is not None:
+                dm = _DEVICE_ARG_RE.search(matching_proc_cmd)
+                if dm:
+                    c_disc = int(dm.group(1))
+
+            is_self = False
+            if (
+                norm_excl_state
+                and c_state
+                and os.path.normpath(c_state) == norm_excl_state
+            ):
+                is_self = True
+            if exclude_pid is not None and c_pid == exclude_pid:
+                is_self = True
+            if norm_excl_node and c_dev and c_dev == norm_excl_node:
+                is_self = True
+            if excl_serial_cf and c_serial and c_serial.casefold() == excl_serial_cf:
+                is_self = True
+
+            if is_self:
+                if c_state:
+                    self_states.add(c_state)
+                if c_pid is not None:
+                    self_pids.add(c_pid)
+                if c_disc is not None:
+                    self_discs.add(c_disc)
+                continue
+
+            if c_disc is not None and c_disc != _DUMMY_KEYCHECK_DISC_IDX:
+                busy[c_disc] = {
+                    "dev": c_dev or "",
+                    "serial": c_serial or "",
+                    "state": c_state,
+                    "source": "claim",
+                }
+
+    my_pid = os.getpid()
+    for ppid, cmd in procs:
+        if ppid == my_pid or ppid in self_pids:
+            continue
+        if any(s and s in cmd for s in self_states):
+            continue
+        if _RIPQUEUE_PROC_RE.search(cmd):
+            dm = _DEVICE_ARG_RE.search(cmd)
+            if dm:
+                k = int(dm.group(1))
+                if k != _DUMMY_KEYCHECK_DISC_IDX and k not in self_discs:
+                    busy.setdefault(
+                        k,
+                        {
+                            "dev": "",
+                            "serial": "",
+                            "state": "",
+                            "source": "ripqueue",
+                            "pid": str(ppid),
+                        },
+                    )
+        elif _MAKEMKV_PROC_RE.search(cmd) and not re.search(r"\binfo\s+list\b", cmd):
+            dm = _MAKEMKV_DISC_RE.search(cmd)
+            if dm:
+                k = int(dm.group(1))
+                if k != _DUMMY_KEYCHECK_DISC_IDX and k not in self_discs:
+                    busy.setdefault(
+                        k,
+                        {
+                            "dev": "",
+                            "serial": "",
+                            "state": "",
+                            "source": "makemkvcon",
+                            "pid": str(ppid),
+                        },
+                    )
+
+    return busy
+
+
 def resolve_makemkv_device(args) -> str:
     """Resolve a `disc:N` selector to the current MakeMKV index for a pinned physical drive.
 
     When `BURNDVD_DRIVE_DEVICE` / `args.drive_device` or `BURNDVD_DRIVE_SERIAL` /
     `args.drive_serial` is explicitly set and `args.device` is a `disc:N` selector,
     queries `[makemkvcon, "-r", "info", "list"]` and matches by normalized `/dev/diskN`
-    (preferred) or by hardware serial with media loaded. Falls back gracefully to
-    `args.device` if no explicit pin is set or if enumeration fails.
+    (preferred) or by hardware serial with media loaded.
+
+    Handles reverse BSD-to-MakeMKV slot ordering (e.g. `/dev/rdisk6` -> `disc:0`,
+    `/dev/rdisk5` -> `disc:1`) directly from MakeMKV `DRV:` rows. When falling back
+    because enumeration failed or lacked a direct match, excludes any `disc:K` slot
+    claimed by another active rip/drive and raises `DriveSlotConflictError` rather
+    than ever handing an already-busy/foreign `disc:K` to a different `/dev/diskM`.
     """
     device = _extract_device_spec(args)
-    if _disc_selector_index(device) is None:
+    orig_idx = _disc_selector_index(device)
+    if orig_idx is None:
         return device
 
     _, exp_node = _explicit_drive_target(args)
@@ -184,6 +390,7 @@ def resolve_makemkv_device(args) -> str:
         return device
 
     makemkvcon = getattr(args, "makemkvcon", None) or DEFAULT_MAKEMKVCON
+    drives: list[dict] = []
     try:
         r = subprocess.run(
             [makemkvcon, "-r", "info", "list"],
@@ -191,16 +398,12 @@ def resolve_makemkv_device(args) -> str:
             text=True,
             timeout=15,
         )
+        if r.returncode == 0 or (r.stdout or "").strip():
+            drives = parse_makemkv_drives(r.stdout or "")
     except (subprocess.TimeoutExpired, OSError):
-        return device
+        drives = []
 
-    if r.returncode != 0 and not (r.stdout or "").strip():
-        return device
-    drives = parse_makemkv_drives(r.stdout or "")
-    if not drives:
-        return device
-
-    if exp_node is not None:
+    if drives and exp_node is not None:
         node_matches = [d for d in drives if d["device_node"] == exp_node]
         if node_matches:
             if exp_serial is not None:
@@ -216,7 +419,7 @@ def resolve_makemkv_device(args) -> str:
             chosen = loaded[0] if loaded else node_matches[0]
             return f"disc:{chosen['index']}"
 
-    if exp_serial is not None:
+    if drives and exp_serial is not None:
         serial_matches = [
             d
             for d in drives
@@ -227,7 +430,64 @@ def resolve_makemkv_device(args) -> str:
         if serial_matches:
             return f"disc:{serial_matches[0]['index']}"
 
-    return device
+    # Fallback safety: check active drive-claims and running ripqueue/makemkvcon
+    # processes so we NEVER hand a busy/foreign disc:K to a different physical drive.
+    busy = active_busy_disc_claims(
+        exclude_device_node=exp_node,
+        exclude_serial=exp_serial,
+        exclude_state=getattr(args, "state", None) if not isinstance(args, str) else None,
+        exclude_pid=os.getpid(),
+    )
+    present_drives = [
+        d
+        for d in drives
+        if d["state"] != 256
+        and (d["drive_desc"] or d["device_node"] or d["has_media"])
+    ]
+    foreign_indices: set[int] = set(busy.keys())
+    for d in present_drives:
+        if exp_node is not None and d["device_node"] and d["device_node"] != exp_node:
+            foreign_indices.add(d["index"])
+        if (
+            exp_serial is not None
+            and d["serial"]
+            and d["serial"].casefold() != exp_serial.casefold()
+        ):
+            foreign_indices.add(d["index"])
+
+    if orig_idx not in foreign_indices:
+        return device
+
+    if present_drives:
+        candidates = [d for d in present_drives if d["index"] not in foreign_indices]
+        loaded_candidates = [d for d in candidates if d["has_media"]]
+        if len(loaded_candidates) == 1:
+            return f"disc:{loaded_candidates[0]['index']}"
+        if len(candidates) == 1 and exp_node is not None:
+            return f"disc:{candidates[0]['index']}"
+    else:
+        drutil_drives = _drutil_list_drives()
+        total_slots = max(
+            len(drutil_drives),
+            (max(busy) + 1) if busy else 0,
+        )
+        if total_slots >= 2:
+            free_slots = [k for k in range(total_slots) if k not in foreign_indices]
+            if len(free_slots) == 1:
+                return f"disc:{free_slots[0]}"
+
+    holder = busy.get(orig_idx, {})
+    holder_desc = (
+        holder.get("dev")
+        or holder.get("serial")
+        or holder.get("source")
+        or "another drive"
+    )
+    target_desc = exp_node or exp_serial or "pinned drive"
+    raise DriveSlotConflictError(
+        f"refusing to assign busy/foreign MakeMKV slot {device} "
+        f"(owned by {holder_desc}) to {target_desc}"
+    )
 
 
 def _drutil_status_output(drutil_drive: int | None = None) -> str | None:

@@ -23,6 +23,7 @@ from burndvd.config import (
     fmt_dur,
 )
 from burndvd.drive import (
+    DriveSlotConflictError,
     _disc_selector_index,
     _drive_idx_from_args,
     _optical_mounts,
@@ -35,6 +36,46 @@ from burndvd.models import QueueItem, TitleInfo
 
 # Module-level last-line timestamp updated while MakeMKV streams probe lines.
 _LAST_PROBE_ACTIVITY = 0.0
+
+_PROBE_DIAG_CODES = frozenset({2003, 3042, 5010})
+_PROBE_DIAG_TEXT_RE = re.compile(
+    r"(tray\s+open|medium\s+not\s+present|failed\s+to\s+open\s+disc)",
+    re.IGNORECASE,
+)
+
+
+def _format_probe_diagnostics(lines: list[str], *, limit: int = 3) -> str:
+    """Extract a concise diagnostic summary from MakeMKV `MSG:` lines."""
+    priority: list[str] = []
+    fallback: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        tag, f = parse_line(line)
+        if tag != "MSG" or not f or len(f) < 4:
+            continue
+        code_raw = f[0].strip()
+        msg_text = " ".join(f[3].split()).strip()
+        if not msg_text:
+            continue
+        try:
+            code_int = int(code_raw)
+        except ValueError:
+            code_int = None
+        entry = f"MSG:{code_int} {msg_text}" if code_int is not None else msg_text
+        if entry in seen:
+            continue
+        seen.add(entry)
+        if (code_int in _PROBE_DIAG_CODES) or _PROBE_DIAG_TEXT_RE.search(msg_text):
+            priority.append(entry)
+        else:
+            fallback.append(entry)
+    chosen = priority[-limit:] if priority else fallback[-1:]
+    if not chosen:
+        return ""
+    summary = "; ".join(chosen)
+    if len(summary) > 320:
+        summary = summary[:317] + "..."
+    return summary
 
 
 def _reader(stream, q: queue.Queue) -> None:
@@ -176,7 +217,12 @@ def probe_disc(args) -> dict | None:
     def _run_once():
         if _optical_mounts():
             unmount_blocking_volume(None, drive_idx=target_drive_idx)
-        resolved_device = resolve_makemkv_device(args)
+        try:
+            resolved_device = resolve_makemkv_device(args)
+        except DriveSlotConflictError as exc:
+            print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
+            append_log(args, f"PROBE_REFUSED  {exc}")
+            return None, None, None, None, [], getattr(args, "device", "")
         resolved_disc_idx = _disc_selector_index(resolved_device)
         eff_drv_idx = (
             resolved_disc_idx if resolved_disc_idx is not None else want_drv_idx
@@ -197,7 +243,7 @@ def probe_disc(args) -> dict | None:
                 bufsize=1,
             )
         except OSError:
-            return None, None, None, None
+            return None, None, None, None, [], resolved_device
 
         q: queue.Queue = queue.Queue()
         threading.Thread(target=_reader, args=(proc.stdout, q), daemon=True).start()
@@ -208,6 +254,7 @@ def probe_disc(args) -> dict | None:
         last_status_t = 0.0
         titles_added = 0
         killed = False
+        kill_reason = ""
         stall_s = PROBE_STALL_S
         hard_s = PROBE_HARD_S
         slow_mode = False
@@ -216,10 +263,12 @@ def probe_disc(args) -> dict | None:
             if now - start > hard_s:
                 proc.kill()
                 killed = True
+                kill_reason = f"killed after hard timeout ({int(now - start)}s)"
                 break
             if now - last_line_t > stall_s:
                 proc.kill()
                 killed = True
+                kill_reason = f"killed on stall ({int(now - last_line_t)}s without output)"
                 break
             if now - last_status_t >= 10:
                 tag = " (slow-mode VOB scan)" if slow_mode else ""
@@ -266,9 +315,19 @@ def probe_disc(args) -> dict | None:
         if killed and not any(
             line.startswith(("CINFO:", "TINFO:")) for line in lines
         ):
-            return None, None, None, None
+            diag = _format_probe_diagnostics(lines)
+            detail = f": {diag}" if diag else " (no MakeMKV messages)"
+            print(
+                f"  {C.YLW}probe {kill_reason} on {resolved_device}{detail}{C.R}",
+                flush=True,
+            )
+            append_log(
+                args,
+                f"PROBE_DIAG  {resolved_device}  {kill_reason}{detail}",
+            )
+            return None, None, None, None, lines, resolved_device
         if proc.returncode not in (0, None) and not lines:
-            return None, None, None, None
+            return None, None, None, None, lines, resolved_device
 
         cinfo, titles, msgs, rdisk = {}, {}, [], None
         msg_codes: set[int] = set()
@@ -297,12 +356,12 @@ def probe_disc(args) -> dict | None:
                     titles.setdefault(tid, {})[code] = f[3]
                 except ValueError:
                     pass
-        return (cinfo, titles, msgs), msg_codes, rdisk, proc
+        return (cinfo, titles, msgs), msg_codes, rdisk, proc, lines, resolved_device
 
-    result, codes, rdisk, _ = _run_once()
+    result, codes, rdisk, _, raw_lines, resolved_device = _run_once()
     if (result is None or not result[1]) and _optical_mounts():
         if unmount_blocking_volume(rdisk, drive_idx=target_drive_idx):
-            result, codes, rdisk, _ = _run_once()
+            result, codes, rdisk, _, raw_lines, resolved_device = _run_once()
     if result is None:
         return None
     cinfo, titles, msgs = result
@@ -311,6 +370,15 @@ def probe_disc(args) -> dict | None:
     if msgs_indicate_aacs_lock(msgs):
         return {"error": "AACS_LOCKED", "msgs": msgs}
     diag_codes = (codes or set()) & {3042, 2003, 5010}
+    has_diag_text = any(_PROBE_DIAG_TEXT_RE.search(m) for m in msgs)
+    if diag_codes or has_diag_text:
+        diag = _format_probe_diagnostics(raw_lines)
+        if diag:
+            print(
+                f"  {C.YLW}probe diagnostic ({resolved_device}): {diag}{C.R}",
+                flush=True,
+            )
+            append_log(args, f"PROBE_DIAG  {resolved_device}  {diag}")
     if diag_codes:
         if target_drive_idx is not None and not disc_present(args):
             return None
