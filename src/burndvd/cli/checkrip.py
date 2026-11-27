@@ -857,6 +857,177 @@ def latest_rip_dir() -> str | None:
     return best
 
 
+_PROGRESS_RE = re.compile(
+    r"(\[[#=\-]+\])\s+(\d+(?:\.\d+)?)%"
+    r"(?:\s+el\s+(\S+))?"
+    r"(?:\s+ETA\s+(\S+))?"
+    r"(?:\s+\d{2}:\d{2}:\d{2})?"
+    r"(?:\s+(\[\d+/\d+\]))?"
+)
+
+
+def _diskutil_external_volumes() -> dict[str, str]:
+    """Return {/dev/diskN: VOLUME_NAME} for external physical disks (read-only)."""
+    try:
+        res = subprocess.run(
+            ["diskutil", "list", "external"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode != 0:
+            return {}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    vols: dict[str, str] = {}
+    cur_dev: str | None = None
+    for raw in res.stdout.splitlines():
+        m_dev = re.match(r"^(/dev/disk\d+)\b", raw.strip())
+        if m_dev:
+            cur_dev = m_dev.group(1)
+            continue
+        if cur_dev and raw.strip().startswith("0:"):
+            m_row = re.match(
+                r"^0:\s+(.+?)\s+\*?[\d.]+\s+[KMGT]?B\s+disk\d+\s*$",
+                raw.strip(),
+            )
+            if m_row:
+                name = m_row.group(1).strip()
+                if name and not name.startswith("Apple_"):
+                    vols[cur_dev] = name
+    return vols
+
+
+def connected_optical_drives() -> list[dict]:
+    """Discover connected optical drives via read-only drutil status + diskutil.
+
+    Never touches MakeMKV or disturbs active rips. Returns [] if unavailable.
+    """
+    try:
+        res = subprocess.run(
+            ["drutil", "status"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode != 0:
+            return []
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    vols = _diskutil_external_volumes()
+    drives: list[dict] = []
+    cur: dict | None = None
+    for line in res.stdout.splitlines():
+        if re.match(r"^\s*Vendor\s+Product\s+Rev\b", line):
+            if cur is not None:
+                drives.append(cur)
+            cur = {
+                "slot": len(drives) + 1,
+                "model": None,
+                "media_type": None,
+                "device": None,
+                "volume": None,
+            }
+            continue
+        if cur is None:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if cur["model"] is None and not stripped.startswith(
+            ("Type:", "Sessions:", "Overwritable:", "Space ", "Writability:")
+        ):
+            cur["model"] = re.sub(r"\s+", " ", stripped)
+            continue
+        m_type = re.search(r"Type:\s*(.+?)(?:\s{2,}Name:\s*(\S+))?\s*$", line)
+        if m_type:
+            mtype = m_type.group(1).strip()
+            dev = (m_type.group(2) or "").strip() or None
+            cur["media_type"] = None if mtype.lower().startswith("no media") else mtype
+            cur["device"] = dev
+            if dev and dev in vols:
+                cur["volume"] = vols[dev]
+    if cur is not None:
+        drives.append(cur)
+    return drives
+
+
+def _parse_rip_status(tail: list[str], speed: float | None) -> dict:
+    """Summarize current rip stage, progress bar, title counter, elapsed, and ETA."""
+    clean = [ANSI_RE.sub("", ln).strip() for ln in tail if ANSI_RE.sub("", ln).strip()]
+    prog = None
+    prog_idx = -1
+    for i, ln in enumerate(clean):
+        m = _PROGRESS_RE.search(ln)
+        if m:
+            prog = {
+                "bar": m.group(1),
+                "percent": m.group(2),
+                "elapsed": m.group(3),
+                "eta": m.group(4),
+                "titles": m.group(5),
+            }
+            prog_idx = i
+
+    post_lines = clean[prog_idx + 1 :] if prog_idx >= 0 else clean
+    stage = "RIPPING" if (prog is not None or (speed is not None and speed > 0.1)) else "STARTING"
+    detail = None
+    for ln in reversed(post_lines):
+        low = ln.lower()
+        if any(k in low for k in ("copying", "rsync", "transferring", "publishing", "installing")):
+            stage = "COPYING"
+            detail = ln
+            break
+        if any(k in low for k in ("verifying", "ffprobe", "verify ", "integrity")):
+            stage = "VERIFYING"
+            detail = ln
+            break
+        if any(k in low for k in ("probing", "scanning", "opening disc")):
+            stage = "PROBING"
+            detail = ln
+            break
+        if ln.startswith("Selected ") or ln.startswith("Disc label:"):
+            if stage != "RIPPING":
+                detail = ln
+                break
+
+    if stage == "STARTING" and detail is None and clean:
+        for ln in reversed(clean):
+            if not ln.startswith("[") and not ln.startswith("staging:"):
+                detail = ln
+                break
+
+    return {
+        "stage": stage,
+        "progress": prog,
+        "detail": detail,
+    }
+
+
+def _active_claim_devices() -> dict[str, int]:
+    """Return {/dev/diskN: pid} for live burndvd drive claims."""
+    claim_dir = os.path.expanduser("~/.cache/burndvd/drive-claims")
+    out: dict[str, int] = {}
+    if not os.path.isdir(claim_dir):
+        return out
+    try:
+        for entry in os.scandir(claim_dir):
+            if not entry.is_dir() or not entry.name.endswith(".claim"):
+                continue
+            try:
+                pid_txt = Path(entry.path, "pid").read_text(encoding="utf-8").strip()
+                pid_val = int(pid_txt)
+                os.kill(pid_val, 0)
+            except (OSError, ValueError):
+                continue
+            if entry.name.startswith("dev-"):
+                dev = "/dev/" + entry.name[4:-6]
+                out[dev] = pid_val
+    except OSError:
+        pass
+    return out
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Verify a finished rip directory.")
     ap.add_argument(
@@ -869,6 +1040,12 @@ def main() -> int:
         "--expected", type=int, default=None, help="expected episode count"
     )
     ap.add_argument("--json", action="store_true", help="emit JSON")
+    ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="show raw MakeMKV log tail under each active drive",
+    )
     args = ap.parse_args()
 
     if args.directory is None:
@@ -876,7 +1053,7 @@ def main() -> int:
         watchers = active_watchers()
         if rips or watchers:
             speeds = measure_rip_speeds([r["staging"] for r in rips]) if rips else {}
-            tail_n = 8 if len(rips) > 1 else ACTIVE_TAIL_LINES
+            tail_n = ACTIVE_TAIL_LINES if args.verbose else 12
             rendered = []
             for r in rips:
                 log_path = r["log_path"]
@@ -889,6 +1066,7 @@ def main() -> int:
                     log_path = logs[0] if logs else None
                 tail = active_rip_tail(log_path, n=tail_n) if log_path else []
                 speed = speeds.get(r["staging"]) if r["staging"] else None
+                status = _parse_rip_status(tail, speed)
                 rendered.append(
                     {
                         "pid": r["pid"],
@@ -902,9 +1080,64 @@ def main() -> int:
                         "staging": r["staging"],
                         "log_path": log_path,
                         "speed": speed,
+                        "stage": status["stage"],
+                        "progress": status["progress"],
+                        "detail": status["detail"],
                         "tail": tail,
                     }
                 )
+
+            rendered.sort(
+                key=lambda x: (
+                    x.get("drive_device") or "~",
+                    x.get("device") or "~",
+                    x.get("pid") or 0,
+                )
+            )
+
+            drives = connected_optical_drives()
+            claim_devs = _active_claim_devices()
+
+            matched_rip_ids: set[int] = set()
+            drive_rows: list[dict] = []
+            for d in drives:
+                matched = None
+                for item in rendered:
+                    if item["pid"] in matched_rip_ids:
+                        continue
+                    if d["device"] and item["drive_device"] == d["device"]:
+                        matched = item
+                        break
+                if matched is None and d["volume"]:
+                    d_vol = d["volume"].lower()
+                    for item in rendered:
+                        if item["pid"] in matched_rip_ids:
+                            continue
+                        if item["volume"] and item["volume"].lower() == d_vol:
+                            matched = item
+                            break
+                if matched is not None:
+                    matched_rip_ids.add(matched["pid"])
+                    drive_rows.append({"drive": d, "rip": matched})
+                else:
+                    drive_rows.append({"drive": d, "rip": None})
+
+            next_slot = len(drive_rows) + 1
+            for item in rendered:
+                if item["pid"] not in matched_rip_ids:
+                    drive_rows.append(
+                        {
+                            "drive": {
+                                "slot": next_slot,
+                                "model": None,
+                                "media_type": "BD-ROM",
+                                "device": item["drive_device"] or item["device"],
+                                "volume": item["volume"],
+                            },
+                            "rip": item,
+                        }
+                    )
+                    next_slot += 1
 
             def _item_json(item: dict) -> dict:
                 return {
@@ -916,6 +1149,8 @@ def main() -> int:
                     "season": item["season"],
                     "volume": item["volume"],
                     "episode_range": item["episode_range"],
+                    "stage": item["stage"],
+                    "progress": item["progress"],
                     "staging": item["staging"],
                     "log_path": item["log_path"],
                     "speed_mbps": round(item["speed"], 1)
@@ -924,37 +1159,59 @@ def main() -> int:
                     "log_tail": [ANSI_RE.sub("", ln) for ln in item["tail"]],
                 }
 
-            def _drive_label(item: dict) -> str:
-                parts = []
-                if item["drive_device"]:
-                    parts.append(item["drive_device"])
-                elif item["device"]:
-                    parts.append(item["device"])
-                else:
-                    parts.append("unknown-drive")
-                if item["drive_serial"]:
-                    parts.append(f"({item['drive_serial']})")
-                elif item["drive_device"] and item["device"]:
-                    parts.append(f"({item['device']})")
-                return " ".join(parts)
+            def _drive_tag(item: dict, drv: dict | None = None) -> str:
+                dev = (
+                    item.get("drive_device")
+                    or (drv.get("device") if drv else None)
+                    or item.get("device")
+                    or "unknown"
+                )
+                ser = item.get("drive_serial")
+                return f"{dev} ({ser})" if ser else dev
 
-            def _content_label(item: dict) -> str:
+            def _content_label(item: dict, drv: dict | None = None) -> str:
                 bits = []
-                if item["title"]:
+                if item.get("title"):
                     bits.append(item["title"])
-                if item["episode_range"]:
+                if item.get("episode_range"):
                     bits.append(item["episode_range"])
-                if item["volume"]:
-                    bits.append(f"[{item['volume']}]")
+                vol = item.get("volume") or (drv.get("volume") if drv else None)
+                if vol:
+                    bits.append(f"[{vol}]")
                 return " ".join(bits) if bits else "(scanning / unknown disc)"
 
             if args.json:
-                if len(rendered) == 1 and not watchers:
+                drive_summary = []
+                for row in drive_rows:
+                    d = row["drive"]
+                    r_item = row["rip"]
+                    if r_item is not None:
+                        st = r_item["stage"]
+                    elif d.get("device") and d["device"] in claim_devs:
+                        st = "STARTING"
+                    elif d.get("media_type"):
+                        st = "READY"
+                    else:
+                        st = "IDLE"
+                    drive_summary.append(
+                        {
+                            "slot": d["slot"],
+                            "device": d.get("device"),
+                            "media_type": d.get("media_type"),
+                            "volume": d.get("volume") or (r_item.get("volume") if r_item else None),
+                            "status": st,
+                            "pid": r_item["pid"]
+                            if r_item
+                            else claim_devs.get(d.get("device") or ""),
+                        }
+                    )
+                if len(rendered) == 1 and not watchers and not drives:
                     payload = {"active": True, **_item_json(rendered[0])}
                 else:
                     payload = {
                         "active": bool(rendered),
                         "rips": [_item_json(item) for item in rendered],
+                        "drives": drive_summary,
                     }
                     if watchers:
                         payload["watchers"] = watchers
@@ -962,36 +1219,64 @@ def main() -> int:
             else:
                 if watchers:
                     for w in watchers:
-                        s_txt = f" S{int(w['season']):02d}" if (w.get("season") or "").isdigit() else ""
-                        print(f"Watch daemon active (pid {w['pid']}): {w.get('show') or 'TV'}{s_txt}")
-                if not rendered:
+                        season_val = w.get("season") or ""
+                        s_txt = f" S{int(season_val):02d}" if season_val.isdigit() else ""
+                        show_name = w.get("show") or "TV"
+                        print(f"Watch daemon active (pid {w['pid']}): {show_name}{s_txt}")
+                if not rendered and not drive_rows:
                     print("  (watch daemon idle — waiting for disc insertion)")
                     return 0
-                if len(rendered) > 1:
-                    print(f"=== Active Rips ({len(rendered)} drives) ===")
-                    for idx, item in enumerate(rendered, 1):
-                        spd = f"{item['speed']:.1f} MB/s" if item["speed"] is not None else "probing/idle"
-                        print(
-                            f"  [{idx}/{len(rendered)}] {_drive_label(item)} | "
-                            f"{_content_label(item)} | {spd} | pid {item['pid']}"
-                        )
-                    print()
-                for idx, item in enumerate(rendered, 1):
-                    hdr = f"{_drive_label(item)} — {_content_label(item)} (pid {item['pid']})"
-                    if len(rendered) > 1:
-                        print(f"=== [{idx}/{len(rendered)}] {hdr} ===")
+
+                total_drives = len(drive_rows)
+                active_count = len(rendered)
+                print(f"=== Optical Drives ({active_count}/{total_drives} ripping) ===")
+                for idx, row in enumerate(drive_rows):
+                    d = row["drive"]
+                    item = row["rip"]
+                    slot = d["slot"]
+                    if item is not None:
+                        dtag = _drive_tag(item, d)
+                        content = _content_label(item, d)
+                        stage_txt = item["stage"]
+                        print(f"  Drive {slot}  {dtag}  {stage_txt:<9}  {content}")
+                        prog = item["progress"]
+                        stats = []
+                        if prog:
+                            if prog["titles"]:
+                                stats.append(prog["titles"])
+                            stats.append(f"{prog['percent']}%")
+                            if prog["elapsed"]:
+                                stats.append(f"el {prog['elapsed']}")
+                            if prog["eta"]:
+                                stats.append(f"ETA {prog['eta']}")
+                        if item["speed"] is not None:
+                            s = item["speed"]
+                            stats.append(f"{s:.1f} MB/s ({s * 60 / 1000:.2f} GB/min)")
+                        elif item["detail"]:
+                            stats.append(item["detail"])
+                        else:
+                            stats.append("no active staging write yet")
+                        stats.append(f"pid {item['pid']}")
+                        joined_stats = "  |  ".join(stats)
+                        print(f"           {joined_stats}")
+                        if prog and prog["bar"]:
+                            print(f"           {prog['bar']}")
+                        if args.verbose and item["tail"]:
+                            print("           --- log ---")
+                            for ln in item["tail"]:
+                                print(f"           {ln}")
                     else:
-                        print(f"=== Active rip: {hdr} ===")
-                    if item["tail"]:
-                        print("\n".join(item["tail"]))
-                    else:
-                        print(f"  rip active ({_drive_label(item)}, pid {item['pid']}) — no log output yet")
-                    if item["speed"] is not None:
-                        s = item["speed"]
-                        print(f"\n  rip speed: {s:.1f} MB/s  ({s * 60 / 1000:.2f} GB/min)")
-                    else:
-                        print("\n  (probing / between titles / verifying / transferring — no active staging write)")
-                    if idx < len(rendered):
+                        dev = d.get("device") or "(empty)"
+                        vol = d.get("volume")
+                        vol_txt = f"[{vol}] " if vol else ""
+                        if d.get("device") and d["device"] in claim_devs:
+                            cpid = claim_devs[d["device"]]
+                            print(f"  Drive {slot}  {dev}  STARTING   {vol_txt}(probing / waiting, pid {cpid})")
+                        elif d.get("media_type"):
+                            print(f"  Drive {slot}  {dev}  READY      {vol_txt}(disc inserted, not ripping)")
+                        else:
+                            print(f"  Drive {slot}  (empty)     IDLE       No disc inserted")
+                    if idx < len(drive_rows) - 1:
                         print()
             return 0
         args.directory = latest_rip_dir()

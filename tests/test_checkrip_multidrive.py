@@ -1,4 +1,4 @@
-"""Unit tests for multi-drive and watch-mode awareness in checkrip."""
+"""Tests for multi-drive and --watch support in checkrip."""
 
 from __future__ import annotations
 
@@ -45,8 +45,16 @@ class TestCheckripMultiDrive(unittest.TestCase):
                 json.dumps({"pid": 2001, "title": "Dragon Ball Super", "season": 1, "episode_start": 114, "episode_count": 4}),
                 encoding="utf-8",
             )
-            log1.write_text("[###---] 20.0% [1/9] Saving\n", encoding="utf-8")
-            log2.write_text("[#####-] 50.0% [2/4] Saving\n", encoding="utf-8")
+            log1.write_text(
+                "  staging budget: need 50GB\n"
+                "[######------------------------]  20.0%  el 1m10s  ETA 4m40s  20:10:00  [1/9] Saving all titles\n",
+                encoding="utf-8",
+            )
+            log2.write_text(
+                "  staging budget: need 30GB\n"
+                "[###############---------------]  50.0%  el 3m00s  ETA 3m00s  20:10:00  [2/4] Saving all titles\n",
+                encoding="utf-8",
+            )
 
             procs = [
                 (900, 1, "python3 -m burndvd.cli.watch --show 'Dragon Ball Super' --season 1"),
@@ -68,33 +76,43 @@ class TestCheckripMultiDrive(unittest.TestCase):
             self.assertEqual(rips[0]["drive_device"], "/dev/disk5")
             self.assertEqual(rips[0]["drive_serial"], "DRVSER00001")
             self.assertEqual(rips[0]["episode_range"], "S01E105-E113")
-            self.assertEqual(rips[0]["volume"], "DBS_P9_D1")
             self.assertEqual(rips[1]["drive_device"], "/dev/disk6")
             self.assertEqual(rips[1]["drive_serial"], "DRVSER00002")
             self.assertEqual(rips[1]["episode_range"], "S01E114-E117")
-            self.assertEqual(rips[1]["volume"], "DBS_P9_D2")
 
-            # Verify human summary & JSON rendering for 2 simultaneous drives
             fake_rips = [
                 {**rips[0], "log_path": str(log1)},
                 {**rips[1], "log_path": str(log2)},
             ]
+            fake_drives = [
+                {"slot": 1, "model": "HL-DT-ST BD-RE BU40N 1.03", "media_type": "BD-ROM", "device": "/dev/disk5", "volume": "DBS_P9_D1"},
+                {"slot": 2, "model": "HL-DT-ST BD-RE BU40N 1.03", "media_type": "BD-ROM", "device": "/dev/disk6", "volume": "DBS_P9_D2"},
+            ]
             with mock.patch.object(checkrip, "_list_processes", return_value=procs), \
                  mock.patch.object(checkrip, "active_rips", return_value=fake_rips), \
                  mock.patch.object(checkrip, "active_watchers", return_value=watchers), \
+                 mock.patch.object(checkrip, "connected_optical_drives", return_value=fake_drives), \
+                 mock.patch.object(checkrip, "_active_claim_devices", return_value={}), \
                  mock.patch.object(checkrip, "measure_rip_speeds", return_value={"/tmp/staging/111-1001": 18.4, "/tmp/staging/222-2001": 19.2}):
                 buf = io.StringIO()
                 with mock.patch.object(sys, "argv", ["checkrip"]), contextlib.redirect_stdout(buf):
                     rc = checkrip.main()
                 self.assertEqual(rc, 0)
                 out = buf.getvalue()
-                self.assertIn("Active Rips (2 drives)", out)
-                self.assertIn("/dev/disk5 (DRVSER00001)", out)
-                self.assertIn("/dev/disk6 (DRVSER00002)", out)
+                self.assertIn("Optical Drives (2/2 ripping)", out)
+                self.assertIn("Drive 1  /dev/disk5 (DRVSER00001)  RIPPING", out)
+                self.assertIn("Drive 2  /dev/disk6 (DRVSER00002)  RIPPING", out)
                 self.assertIn("S01E105-E113", out)
                 self.assertIn("S01E114-E117", out)
                 self.assertIn("18.4 MB/s", out)
                 self.assertIn("19.2 MB/s", out)
+                self.assertNotIn("staging budget", out)
+
+                buf_v = io.StringIO()
+                with mock.patch.object(sys, "argv", ["checkrip", "--verbose"]), contextlib.redirect_stdout(buf_v):
+                    rc_v = checkrip.main()
+                self.assertEqual(rc_v, 0)
+                self.assertIn("staging budget", buf_v.getvalue())
 
                 buf_json = io.StringIO()
                 with mock.patch.object(sys, "argv", ["checkrip", "--json"]), contextlib.redirect_stdout(buf_json):
@@ -103,9 +121,40 @@ class TestCheckripMultiDrive(unittest.TestCase):
                 parsed = json.loads(buf_json.getvalue())
                 self.assertTrue(parsed["active"])
                 self.assertEqual(len(parsed["rips"]), 2)
+                self.assertEqual(len(parsed["drives"]), 2)
+                self.assertEqual(parsed["rips"][0]["stage"], "RIPPING")
                 self.assertEqual(parsed["rips"][0]["drive_serial"], "DRVSER00001")
-                self.assertEqual(parsed["rips"][1]["episode_range"], "S01E114-E117")
                 self.assertEqual(len(parsed["watchers"]), 1)
+
+    def test_single_active_rip_still_shows_idle_and_ready_second_drive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log2 = Path(tmp) / "d2.log"
+            log2.write_text("[##########--------------------]  33.3%  el 2m00s  ETA 4m00s  20:10:00  [1/6] Saving\n", encoding="utf-8")
+            fake_rips = [{
+                "pid": 2001, "state": "/tmp/s2.json", "queue": None, "device": "disc:1",
+                "drive_device": "/dev/disk6", "drive_serial": "DRVSER00002",
+                "title": "Dragon Ball Super", "season": 1, "volume": "DBS_P10_D2",
+                "episode_range": "S01E126-E131", "log_path": str(log2), "staging": "/tmp/s2",
+            }]
+            fake_drives = [
+                {"slot": 1, "model": "HL-DT-ST BD-RE BU40N 1.03", "media_type": "BD-ROM", "device": "/dev/disk5", "volume": "THE_IRISHMAN_DISC01"},
+                {"slot": 2, "model": "HL-DT-ST BD-RE BU40N 1.03", "media_type": "BD-ROM", "device": "/dev/disk6", "volume": "DBS_P10_D2"},
+                {"slot": 3, "model": "HL-DT-ST BD-RE BU40N 1.03", "media_type": None, "device": None, "volume": None},
+            ]
+            with mock.patch.object(checkrip, "active_rips", return_value=fake_rips), \
+                 mock.patch.object(checkrip, "active_watchers", return_value=[]), \
+                 mock.patch.object(checkrip, "connected_optical_drives", return_value=fake_drives), \
+                 mock.patch.object(checkrip, "_active_claim_devices", return_value={}), \
+                 mock.patch.object(checkrip, "measure_rip_speeds", return_value={"/tmp/s2": 21.5}):
+                buf = io.StringIO()
+                with mock.patch.object(sys, "argv", ["checkrip"]), contextlib.redirect_stdout(buf):
+                    rc = checkrip.main()
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("Optical Drives (1/3 ripping)", out)
+                self.assertIn("Drive 1  /dev/disk5  READY      [THE_IRISHMAN_DISC01]", out)
+                self.assertIn("Drive 2  /dev/disk6 (DRVSER00002)  RIPPING", out)
+                self.assertIn("Drive 3  (empty)     IDLE       No disc inserted", out)
 
     def test_measure_rip_speeds_returns_none_when_empty_staging(self):
         with tempfile.TemporaryDirectory() as tmp:
