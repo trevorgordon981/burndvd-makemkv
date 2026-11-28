@@ -586,11 +586,15 @@ def active_rips(procs=None) -> list[dict]:
     scripts = []
     wrappers = []
     makemkvs = []
+    ffmpegs = []
 
     for pid, ppid, cmd, argv in parsed:
         if not argv:
             continue
         exe = os.path.basename(argv[0]).lower()
+        if exe == "ffmpeg":
+            ffmpegs.append({"pid": pid, "ppid": ppid})
+            continue
         if exe == "makemkvcon":
             staging = None
             mk_dev = None
@@ -705,6 +709,10 @@ def active_rips(procs=None) -> list[dict]:
             drive_ser = drive_ser or env_ser
 
         meta = _queue_and_slot_metadata(rq_pid, rq["queue"])
+        drive_released = bool(rq_state and os.path.isfile(f"{rq_state}.drive_released"))
+        verifying_child = any(
+            _is_ancestor(rq_pid, ff["pid"], ppid_map) for ff in ffmpegs
+        )
         rips.append(
             {
                 "pid": rq_pid,
@@ -719,6 +727,8 @@ def active_rips(procs=None) -> list[dict]:
                 "episode_range": meta["episode_range"],
                 "log_path": log_path,
                 "staging": staging,
+                "drive_released": drive_released,
+                "verifying_child": verifying_child,
             }
         )
 
@@ -953,7 +963,13 @@ def connected_optical_drives() -> list[dict]:
     return drives
 
 
-def _parse_rip_status(tail: list[str], speed: float | None) -> dict:
+def _parse_rip_status(
+    tail: list[str],
+    speed: float | None,
+    *,
+    verifying_child: bool = False,
+    drive_released: bool = False,
+) -> dict:
     """Summarize current rip stage, progress bar, title counter, elapsed, and ETA."""
     clean = [ANSI_RE.sub("", ln).strip() for ln in tail if ANSI_RE.sub("", ln).strip()]
     prog = None
@@ -983,6 +999,18 @@ def _parse_rip_status(tail: list[str], speed: float | None) -> dict:
             stage = "VERIFYING"
             detail = ln
             break
+        if any(
+            k in low
+            for k in (
+                "optical drive ejected",
+                "optical drive unlocked",
+                "finalizing to nas",
+                "background nas transfer",
+            )
+        ):
+            stage = "FINALIZING"
+            detail = ln
+            break
         if any(k in low for k in ("probing", "scanning", "opening disc")):
             stage = "PROBING"
             detail = ln
@@ -991,6 +1019,15 @@ def _parse_rip_status(tail: list[str], speed: float | None) -> dict:
             if stage != "RIPPING":
                 detail = ln
                 break
+
+    if verifying_child and stage != "COPYING":
+        stage = "VERIFYING"
+        if detail is None or "waiting for" in detail.lower() or "optical drive" in detail.lower():
+            detail = "ffmpeg verify running"
+    elif drive_released and stage in ("RIPPING", "STARTING"):
+        stage = "FINALIZING"
+        if detail is None:
+            detail = "verifying / transferring to NAS"
 
     if stage == "STARTING" and detail is None and clean:
         for ln in reversed(clean):
@@ -1015,6 +1052,12 @@ def _active_claim_devices() -> dict[str, int]:
         for entry in os.scandir(claim_dir):
             if not entry.is_dir() or not entry.name.endswith(".claim"):
                 continue
+            try:
+                c_state = Path(entry.path, "state").read_text(encoding="utf-8").strip()
+                if c_state and os.path.isfile(f"{c_state}.drive_released"):
+                    continue
+            except OSError:
+                pass
             try:
                 pid_txt = Path(entry.path, "pid").read_text(encoding="utf-8").strip()
                 pid_val = int(pid_txt)
@@ -1259,13 +1302,19 @@ def main() -> int:
                     log_path = logs[0] if logs else None
                 tail = active_rip_tail(log_path, n=tail_n) if log_path else []
                 speed = speeds.get(r["staging"]) if r["staging"] else None
-                status = _parse_rip_status(tail, speed)
+                status = _parse_rip_status(
+                    tail,
+                    speed,
+                    verifying_child=bool(r.get("verifying_child", False)),
+                    drive_released=bool(r.get("drive_released", False)),
+                )
                 rendered.append(
                     {
                         "pid": r["pid"],
                         "device": r["device"],
                         "drive_device": r.get("drive_device"),
                         "drive_serial": r.get("drive_serial"),
+                        "drive_released": bool(r.get("drive_released", False)),
                         "title": r.get("title"),
                         "season": r.get("season"),
                         "volume": r.get("volume"),
@@ -1288,9 +1337,12 @@ def main() -> int:
                 )
             )
 
+            drive_rips = [item for item in rendered if not item.get("drive_released")]
+            finalizing_rips = [item for item in rendered if item.get("drive_released")]
+
             drives = connected_optical_drives()
             claim_devs = _active_claim_devices()
-            drive_rows = _match_drives_to_rips(drives, rendered)
+            drive_rows = _match_drives_to_rips(drives, drive_rips)
 
             def _item_json(item: dict) -> dict:
                 return {
@@ -1298,6 +1350,7 @@ def main() -> int:
                     "device": item["device"],
                     "drive_device": item["drive_device"],
                     "drive_serial": item["drive_serial"],
+                    "drive_released": bool(item.get("drive_released", False)),
                     "title": item["title"],
                     "season": item["season"],
                     "volume": item["volume"],
@@ -1399,7 +1452,7 @@ def main() -> int:
                     return 0
 
                 total_drives = len(drive_rows)
-                active_count = len(rendered)
+                active_count = len(drive_rips)
                 print(f"=== Optical Drives ({active_count}/{total_drives} ripping) ===")
                 for idx, row in enumerate(drive_rows):
                     d = row["drive"]
@@ -1449,6 +1502,18 @@ def main() -> int:
                             print(f"  Drive {slot}  (empty)     IDLE       No disc inserted")
                     if idx < len(drive_rows) - 1:
                         print()
+                if finalizing_rips:
+                    print()
+                    print(
+                        f"=== Background Finalizing ({len(finalizing_rips)} — drive free) ==="
+                    )
+                    for f_item in finalizing_rips:
+                        content = _content_label(f_item)
+                        stage_txt = f_item["stage"]
+                        extra = f_item["detail"] or "verifying / transferring to NAS"
+                        print(
+                            f"  {stage_txt:<10}  {content}  |  {extra}  |  pid {f_item['pid']}"
+                        )
             return 0
         args.directory = latest_rip_dir()
         if args.directory is None:

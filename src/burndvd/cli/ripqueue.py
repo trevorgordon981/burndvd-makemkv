@@ -33,7 +33,9 @@ from burndvd.drive import (
     beep,
     check_key_expiry,
     disc_slot_lock,
+    drive_released_marker_path,
     eject,
+    mark_drive_released,
     resolve_makemkv_device,
     slot_lock_scope,
 )
@@ -299,15 +301,27 @@ def main() -> None:
         with slot_lock_scope():
             resolved_device = resolve_makemkv_device(args)
             args.device = resolved_device
-            with disc_slot_lock(args.device, target=args):
-                _run_queue_session(args, _initial_drive_idx, _initial_drive_id)
+            with contextlib.ExitStack() as lock_stack:
+                lock_stack.enter_context(disc_slot_lock(args.device, target=args))
+                _run_queue_session(
+                    args,
+                    _initial_drive_idx,
+                    _initial_drive_id,
+                    release_drive_lock=lock_stack.close,
+                )
     except DriveSlotConflictError as exc:
         print(f"{C.RED}{exc}; refusing to touch busy optical drive.{C.R}", file=sys.stderr)
         append_log(args, f"DRIVE_SLOT_BUSY {args.device} :: {exc}")
         sys.exit(4)
 
 
-def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
+def _run_queue_session(
+    args,
+    _initial_drive_idx,
+    _initial_drive_id,
+    *,
+    release_drive_lock=None,
+) -> None:
     check_key_expiry(args)
 
     items = load_queue(Path(args.queue))
@@ -384,11 +398,45 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
             _save_snapshot_locked()
 
     _persist_committed_state()
+    _stale_released = drive_released_marker_path(args.state)
+    if _stale_released is not None:
+        try:
+            _stale_released.unlink(missing_ok=True)
+        except OSError:
+            pass
     clear_finalize_errors()
     _FINALIZE_THREADS.clear()
     pending_final_summary: list[tuple[str, int, float, list[str]]] = []
     needs_final_eject = False
     early_ejected = threading.Event()
+    drive_released = False
+
+    def _release_optical_drive(*, should_eject: bool) -> None:
+        nonlocal drive_released, needs_final_eject
+        if drive_released:
+            return
+        drive_released = True
+        did_eject = False
+        if should_eject and not args.no_eject and not early_ejected.is_set():
+            early_ejected.set()
+            needs_final_eject = False
+            eject(args)
+            did_eject = True
+        else:
+            needs_final_eject = False
+        mark_drive_released(
+            args.state,
+            device=str(args.device),
+            ejected=did_eject,
+        )
+        if release_drive_lock is not None:
+            release_drive_lock()
+        action = "ejected & unlocked" if did_eject else "unlocked"
+        print(
+            f"{C.D}  Optical drive {action} — ready for the next disc while "
+            f"verify/NAS finishes in background.{C.R}",
+            flush=True,
+        )
 
     while state["current_index"] < len(state["queue"]):
         if _initial_drive_idx is not None:
@@ -1020,14 +1068,6 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 f"{C.D}Staged in {fmt_dur(result['elapsed_s'])}; "
                 f"finalizing to NAS...{C.R}"
             )
-            on_verified_cb = None
-            if not has_more_items and not args.sync_move and not args.no_eject:
-                def _on_verified_eject() -> None:
-                    if not early_ejected.is_set():
-                        early_ejected.set()
-                        eject(args)
-
-                on_verified_cb = _on_verified_eject
             start_background_finalize(
                 disc_args,
                 result,
@@ -1036,7 +1076,7 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 on_complete=on_complete_cb,
                 on_failure=on_failure_cb,
                 on_file_committed=on_file_committed_cb,
-                on_verified=on_verified_cb,
+                on_verified=None,
             )
             pending_final_summary.append(
                 (item.title, disc_n, result["elapsed_s"], list(result["files"]))
@@ -1045,7 +1085,7 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 if not get_finalize_errors():
                     eject(args)
             else:
-                needs_final_eject = True
+                _release_optical_drive(should_eject=True)
         else:
             try:
                 log_final_durations(disc_args, item, disc_n, result["files"])
@@ -1131,6 +1171,8 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
                 )
                 beep(args, ok=False)
                 on_failure_cb(err_msg)
+    if any(t.is_alive() for t in _FINALIZE_THREADS) and not drive_released:
+        _release_optical_drive(should_eject=needs_final_eject)
     join_finalizers()
     finalize_errors = get_finalize_errors()
     if finalize_errors:
@@ -1154,7 +1196,7 @@ def _run_queue_session(args, _initial_drive_idx, _initial_drive_id) -> None:
             print(f"  {fp}")
     if pending_final_summary:
         beep(args, ok=True)
-    if needs_final_eject and not early_ejected.is_set():
+    if needs_final_eject and not early_ejected.is_set() and not drive_released:
         eject(args)
     print(f"\n{C.B}{C.GRN}Queue complete.{C.R}")
 

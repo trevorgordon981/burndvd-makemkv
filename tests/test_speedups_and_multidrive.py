@@ -497,11 +497,13 @@ class TestEarlyEjectAfterPrePublishVerify(unittest.TestCase):
                 ripqueue.main()
 
             self.assertEqual(events.count("eject"), 1, f"must eject exactly once: {events}")
-            self.assertLess(events.index("verify"), events.index("eject"))
+            # Optical drive is ejected & released immediately after staging so the next
+            # disc can start without waiting for ffmpeg --verify or NAS transfer.
             self.assertLess(events.index("eject"), events.index("move"))
+            self.assertTrue(Path(f"{state_path}.drive_released").is_file())
             self.assertTrue(dst.is_file())
 
-    def test_verify_failure_never_triggers_early_eject(self):
+    def test_verify_failure_after_staging_release_blocks_publish_and_never_double_ejects(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             nas = root / "nas"
@@ -555,7 +557,8 @@ class TestEarlyEjectAfterPrePublishVerify(unittest.TestCase):
                     ripqueue.main()
 
             self.assertEqual(ctx.exception.code, 2)
-            self.assertEqual(ejects, [])
+            # Ejected once right after staging (while drive lock was held); never touched again after verify fail.
+            self.assertEqual(len(ejects), 1)
             self.assertFalse(dst.exists())
             self.assertTrue(src.is_file())
 

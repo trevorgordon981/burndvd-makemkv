@@ -334,12 +334,13 @@ class TestQueueFinalizerGatingForDoneBeepEject(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
             self.assertNotIn(True, beeps)
             self.assertIn(False, beeps)
-            self.assertEqual(ejects, [])
+            # Optical drive ejected once right after staging; never double-ejected on finalize failure.
+            self.assertEqual(len(ejects), 1)
             self.assertNotIn("Queue complete.", out_buf.getvalue())
             self.assertNotIn("Done in", out_buf.getvalue())
             self.assertIn("finalize/verify error(s)", err_buf.getvalue())
 
-    def test_background_finalize_success_emits_done_success_beep_and_eject_after_join(self):
+    def test_background_finalize_success_releases_drive_before_join_and_beeps_after_join(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             nas = root / "nas"
@@ -382,7 +383,7 @@ class TestQueueFinalizerGatingForDoneBeepEject(unittest.TestCase):
                  contextlib.redirect_stdout(out_buf):
                 ripqueue.main()
 
-            self.assertEqual(events, ["joined", "beep:True", "eject"])
+            self.assertEqual(events, ["eject", "joined", "beep:True"])
             self.assertIn("Done in", out_buf.getvalue())
             self.assertIn("Queue complete.", out_buf.getvalue())
 

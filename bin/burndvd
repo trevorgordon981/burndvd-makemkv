@@ -360,7 +360,7 @@ sweep_burndvd_orphans() {
         for pid in $(pgrep -f "$state" 2>/dev/null || true); do
             kill "$pid" 2>/dev/null || true
         done
-        rm -f "${state}.exit" 2>/dev/null || true
+        rm -f "${state}.exit" "${state}.drive_released" 2>/dev/null || true
     done
     find "$LOG_DIR" -maxdepth 1 -name "burndvd-*.log" -mtime +30 \
         -delete 2>/dev/null || true
@@ -371,11 +371,15 @@ sweep_burndvd_orphans() {
         local claim_pid
         for claim in "$claim_dir"/serial-*.claim "$claim_dir"/dev-*.claim "$claim_dir"/disc-*.claim; do
             [ -d "$claim" ] || continue
+            claim_state=$(cat "$claim/state" 2>/dev/null || true)
+            if [ -n "$claim_state" ] && [ -f "${claim_state}.drive_released" ]; then
+                rm -rf "$claim" 2>/dev/null || true
+                continue
+            fi
             claim_pid=$(cat "$claim/pid" 2>/dev/null || true)
             if [ -n "$claim_pid" ] && [[ "$claim_pid" =~ ^[0-9]+$ ]] && kill -0 "$claim_pid" 2>/dev/null; then
                 continue
             fi
-            claim_state=$(cat "$claim/state" 2>/dev/null || true)
             if [ -n "$claim_state" ]; then
                 pgrep -if "python.*(ripqueue\.py|burndvd-queue).*$claim_state" >/dev/null 2>&1 \
                     && continue
@@ -523,11 +527,14 @@ fi
 claim_is_active() {
     local cdir="$1" claim_pid claim_state
     [ -d "$cdir" ] || return 1
+    claim_state=$(cat "$cdir/state" 2>/dev/null || true)
+    if [ -n "$claim_state" ] && [ -f "${claim_state}.drive_released" ]; then
+        return 1
+    fi
     claim_pid=$(cat "$cdir/pid" 2>/dev/null || true)
     if [ -n "$claim_pid" ] && [[ "$claim_pid" =~ ^[0-9]+$ ]] && kill -0 "$claim_pid" 2>/dev/null; then
         return 0
     fi
-    claim_state=$(cat "$cdir/state" 2>/dev/null || true)
     if [ -n "$claim_state" ] && pgrep -if "python.*(ripqueue\.py|burndvd-queue).*$claim_state" >/dev/null 2>&1; then
         return 0
     fi
@@ -547,9 +554,17 @@ busy_devs_arg = sys.argv[3] if len(sys.argv) > 3 else ""
 RIPQUEUE_RE = re.compile(r"(?:ripqueue\.py|burndvd-queue)\b")
 DEVICE_ARG_RE = re.compile(r"--device(?:=|\s+)disc:(\d+)\b")
 QUEUE_ARG_RE = re.compile(r"--queue(?:=|\s+)(\S+)")
+STATE_ARG_RE = re.compile(r"--state(?:=|\s+)(\S+)")
 MAKEMKV_PROC_RE = re.compile(r"\bmakemkvcon\b")
 MAKEMKV_DISC_RE = re.compile(r"\b(?:info|mkv)\s+disc:(\d+)\b")
 DUMMY_DISC_IDX = 9999
+
+def state_drive_released(state_path):
+    return bool(state_path and os.path.isfile(state_path + ".drive_released"))
+
+def state_from_cmd(cmd):
+    m = STATE_ARG_RE.search(cmd or "")
+    return m.group(1).strip("'\"") if m else ""
 
 def norm_dev_short(raw):
     m = re.match(r"^(?:/dev/)?r?(disk\d+)$", (raw or "").strip())
@@ -672,6 +687,8 @@ if claim_dir_arg and os.path.isdir(claim_dir_arg):
         is_active = (c_pid is not None and pid_alive(c_pid)) or (matching_cmd is not None)
         if not is_active:
             continue
+        if state_drive_released(c_state):
+            continue
 
         if c_disc is None and matching_cmd is not None:
             dm = DEVICE_ARG_RE.search(matching_cmd)
@@ -692,6 +709,8 @@ for ppid, cmd in procs:
     if ppid == my_pid:
         continue
     if RIPQUEUE_RE.search(cmd):
+        if state_drive_released(state_from_cmd(cmd)):
+            continue
         dm = DEVICE_ARG_RE.search(cmd)
         if dm:
             k = int(dm.group(1))
@@ -1280,7 +1299,7 @@ if [ -n "$VOLUME" ]; then
 fi
 
 BURNDVD_DRUTIL_DRIVE="$DRUTIL_INDEX" BURNDVD_DRIVE_DEVICE="/dev/$DEVICE" \
-    BURNDVD_DRIVE_SERIAL="$DRIVE_SERIAL" \
+    BURNDVD_DRIVE_SERIAL="$DRIVE_SERIAL" BURNDVD_DRIVE_CLAIM="$DRIVE_CLAIM_HELD" \
     nohup "$WRAPPER_PATH" --internal-pty-run "$LOG" \
     caffeinate -dimsu "$RIPQUEUE_PY" --queue "$QUEUE" --state "$STATE" \
     --device "disc:$DISC_INDEX" --non-interactive --on-fail=retry --verify \
@@ -1383,7 +1402,7 @@ case "$RIP_EXIT_CODE" in
         ;;
 esac
 
-if [ "$RIP_EXIT_CODE" = "0" ]; then
+if [ "$RIP_EXIT_CODE" = "0" ] && [ ! -f "${STATE}.drive_released" ]; then
     if [ -x "$HOME/.local/bin/ejectdisc" ]; then
         echo "Ejecting disc."
         "$HOME/.local/bin/ejectdisc" "$DRUTIL_INDEX" || echo "WARN: eject failed (drutil returned non-zero)" >&2

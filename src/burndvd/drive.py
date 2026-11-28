@@ -5,9 +5,11 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import fcntl
+import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -26,6 +28,7 @@ from burndvd.config import (
 DRUTIL_DRIVE_ENV = "BURNDVD_DRUTIL_DRIVE"
 DRIVE_DEVICE_ENV = "BURNDVD_DRIVE_DEVICE"
 DRIVE_SERIAL_ENV = "BURNDVD_DRIVE_SERIAL"
+DRIVE_CLAIM_ENV = "BURNDVD_DRIVE_CLAIM"
 
 _SLIM_TRAY_DRIVE_RE = re.compile(
     r"\b(?:BU\d+N|BP\d+NB\d+|WP\d+NB\d+|SLIM)\b", re.IGNORECASE
@@ -34,6 +37,7 @@ _DEVICE_NODE_RE = re.compile(r"^(?:/dev/)?r?(disk\d+)$")
 _DRUTIL_LIST_LINE_RE = re.compile(r"^\s*(\d+)\s+\S")
 _RIPQUEUE_PROC_RE = re.compile(r"(?:ripqueue\.py|burndvd-queue)\b")
 _DEVICE_ARG_RE = re.compile(r"--device(?:=|\s+)disc:(\d+)\b")
+_STATE_ARG_RE = re.compile(r"--state(?:=|\s+)(\S+)")
 _MAKEMKV_PROC_RE = re.compile(r"\bmakemkvcon\b")
 _MAKEMKV_DISC_RE = re.compile(r"\b(?:info|mkv)\s+disc:(\d+)\b")
 _DUMMY_KEYCHECK_DISC_IDX = 9999
@@ -454,6 +458,81 @@ def _parse_disc_idx_text(raw: str) -> int | None:
     return int(s) if re.fullmatch(r"\d+", s) else None
 
 
+def drive_released_marker_path(state_path: str | Path | None) -> Path | None:
+    """Return `<state>.drive_released` path for a ripqueue state file, or None."""
+    if not state_path:
+        return None
+    raw = str(state_path).strip()
+    return Path(f"{raw}.drive_released") if raw else None
+
+
+def is_state_drive_released(state_path: str | Path | None) -> bool:
+    """Return True if the ripqueue run for `state_path` already released its optical drive."""
+    marker = drive_released_marker_path(state_path)
+    if marker is None:
+        return False
+    try:
+        return marker.is_file()
+    except OSError:
+        return False
+
+
+def mark_drive_released(
+    state_path: str | Path | None,
+    *,
+    device: str = "",
+    ejected: bool = False,
+    claim_path: str | Path | None = None,
+) -> Path | None:
+    """Record that optical reads are done and clear our own wrapper drive claim.
+
+    Called right before releasing `disc_slot_lock` so new `burndvd` runs can
+    immediately use the physical drive while `ffmpeg --verify` and NAS transfer
+    finish in the background. Only removes `claim_path` (or `BURNDVD_DRIVE_CLAIM`)
+    when its `state` file matches `state_path` (or `state_path` is unset).
+    """
+    marker = drive_released_marker_path(state_path)
+    if marker is not None:
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "device": str(device or ""),
+                "ejected": bool(ejected),
+                "ts": time.time(),
+            }
+        )
+        tmp = marker.with_name(f".{marker.name}.{os.getpid()}.tmp")
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(payload + "\n", encoding="utf-8")
+            os.replace(tmp, marker)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    raw_claim = str(claim_path or os.environ.get(DRIVE_CLAIM_ENV, "")).strip()
+    if raw_claim:
+        cpath = Path(raw_claim)
+        if cpath.is_dir() and cpath.name.endswith(".claim"):
+            should_remove = True
+            if state_path:
+                claim_state = _read_claim_text(cpath / "state")
+                if claim_state and os.path.normpath(claim_state) != os.path.normpath(
+                    str(state_path)
+                ):
+                    should_remove = False
+            if should_remove:
+                shutil.rmtree(cpath, ignore_errors=True)
+    return marker
+
+
+def _state_from_cmd(cmd: str) -> str:
+    m = _STATE_ARG_RE.search(cmd or "")
+    return m.group(1).strip("'\"") if m else ""
+
+
 def active_busy_disc_claims(
     *,
     exclude_device_node: str | None = None,
@@ -518,6 +597,8 @@ def active_busy_disc_claims(
             )
             if not is_active:
                 continue
+            if c_state and is_state_drive_released(c_state):
+                continue
 
             if c_disc is None and matching_proc_cmd is not None:
                 dm = _DEVICE_ARG_RE.search(matching_proc_cmd)
@@ -562,6 +643,9 @@ def active_busy_disc_claims(
         if any(s and s in cmd for s in self_states):
             continue
         if _RIPQUEUE_PROC_RE.search(cmd):
+            proc_state = _state_from_cmd(cmd)
+            if proc_state and is_state_drive_released(proc_state):
+                continue
             dm = _DEVICE_ARG_RE.search(cmd)
             if dm:
                 k = int(dm.group(1))
