@@ -160,3 +160,46 @@ class TestCheckripMultiDrive(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             speeds = checkrip.measure_rip_speeds([tmp], secs=0.01)
             self.assertEqual(speeds, {tmp: None})
+
+    def test_effective_rip_speed_uses_cumulative_avg_between_cache_flushes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stg = Path(tmp) / "stage"
+            stg.mkdir()
+            (stg / "B1_t00.mkv").write_bytes(b"\0" * 3_000_000)  # 3 MB
+            log = Path(tmp) / "rip.log"
+            log.write_text("active\n", encoding="utf-8")
+
+            speed, is_avg = checkrip._effective_rip_speed(
+                0.0, str(stg), {"elapsed": "1m00s"}, str(log)
+            )
+            self.assertTrue(is_avg)
+            self.assertIsNotNone(speed)
+            self.assertAlmostEqual(speed, 0.05, places=3)
+
+    def test_effective_rip_speed_preserves_zero_when_log_is_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stg = Path(tmp) / "stage"
+            stg.mkdir()
+            (stg / "B1_t00.mkv").write_bytes(b"\0" * 3_000_000)
+            log = Path(tmp) / "rip.log"
+            log.write_text("stalled\n", encoding="utf-8")
+            stale_now = log.stat().st_mtime + 120.0
+
+            speed, is_avg = checkrip._effective_rip_speed(
+                0.0, str(stg), {"elapsed": "1m00s"}, str(log), now=stale_now
+            )
+            self.assertFalse(is_avg)
+            self.assertEqual(speed, 0.0)
+
+    def test_effective_rip_speed_keeps_instant_speed_when_nonzero(self):
+        speed, is_avg = checkrip._effective_rip_speed(
+            18.4, None, {"elapsed": "2m00s"}, None
+        )
+        self.assertFalse(is_avg)
+        self.assertEqual(speed, 18.4)
+
+    def test_parse_elapsed_s_handles_hms(self):
+        self.assertEqual(checkrip._parse_elapsed_s("13m55s"), 835.0)
+        self.assertEqual(checkrip._parse_elapsed_s("1h02m05s"), 3725.0)
+        self.assertEqual(checkrip._parse_elapsed_s("45s"), 45.0)
+        self.assertIsNone(checkrip._parse_elapsed_s(""))

@@ -784,6 +784,67 @@ def measure_rip_speed(staging: str, secs: float = 6.0) -> float | None:
     return max(0, b1 - b0) / secs / 1e6
 
 
+_ELAPSED_PART_RE = re.compile(r"(\d+)\s*([hms])", re.IGNORECASE)
+_ACTIVE_LOG_FRESH_S = 60.0
+
+
+def _parse_elapsed_s(text: str | None) -> float | None:
+    if not text:
+        return None
+    total = 0.0
+    matched = False
+    for num_s, unit in _ELAPSED_PART_RE.findall(str(text)):
+        matched = True
+        val = float(num_s)
+        u = unit.lower()
+        if u == "h":
+            total += val * 3600.0
+        elif u == "m":
+            total += val * 60.0
+        else:
+            total += val
+    return total if matched and total > 0.0 else None
+
+
+def _effective_rip_speed(
+    instant_speed: float | None,
+    staging: str | None,
+    prog: dict | None,
+    log_path: str | None = None,
+    *,
+    now: float | None = None,
+) -> tuple[float | None, bool]:
+    """Return `(speed_mbps, is_avg)` avoiding false 0.0 MB/s between MakeMKV cache flushes.
+
+    `makemkvcon --cache=1024` flushes to disk in bursts, so a 3s staging-size sample
+    frequently sees 0 delta during healthy slow DVD rips. When the instant sample is
+    ~0 MB/s, staged bytes exist, and the rip log is actively updating (mtime <= 60s),
+    fall back to cumulative `staged_bytes / elapsed_s`. If the log has gone stale
+    (> 60s), preserve `0.0` so genuinely stalled rips stay visible.
+    """
+    if instant_speed is None or instant_speed >= 0.05:
+        return instant_speed, False
+    if not staging or not os.path.isdir(staging):
+        return instant_speed, False
+    elapsed_s = _parse_elapsed_s((prog or {}).get("elapsed"))
+    if elapsed_s is None or elapsed_s <= 0.0:
+        return instant_speed, False
+    try:
+        total_b = staged_bytes(staging)
+    except OSError:
+        return instant_speed, False
+    if total_b <= 0:
+        return instant_speed, False
+    if log_path:
+        try:
+            cur_now = time.time() if now is None else float(now)
+            if cur_now - os.path.getmtime(log_path) > _ACTIVE_LOG_FRESH_S:
+                return instant_speed, False
+        except OSError:
+            return instant_speed, False
+    return total_b / elapsed_s / 1e6, True
+
+
 def measure_rip_speeds(stagings: list[str | None], secs: float = 3.0) -> dict[str, float | None]:
     valid = [s for s in stagings if s and os.path.isdir(s)]
     if not valid:
@@ -1301,12 +1362,18 @@ def main() -> int:
                     )
                     log_path = logs[0] if logs else None
                 tail = active_rip_tail(log_path, n=tail_n) if log_path else []
-                speed = speeds.get(r["staging"]) if r["staging"] else None
+                raw_speed = speeds.get(r["staging"]) if r["staging"] else None
                 status = _parse_rip_status(
                     tail,
-                    speed,
+                    raw_speed,
                     verifying_child=bool(r.get("verifying_child", False)),
                     drive_released=bool(r.get("drive_released", False)),
+                )
+                speed, speed_is_avg = _effective_rip_speed(
+                    raw_speed,
+                    r["staging"],
+                    status["progress"],
+                    log_path,
                 )
                 rendered.append(
                     {
@@ -1322,6 +1389,7 @@ def main() -> int:
                         "staging": r["staging"],
                         "log_path": log_path,
                         "speed": speed,
+                        "speed_is_avg": speed_is_avg,
                         "stage": status["stage"],
                         "progress": status["progress"],
                         "detail": status["detail"],
@@ -1475,7 +1543,10 @@ def main() -> int:
                                 stats.append(f"ETA {prog['eta']}")
                         if item["speed"] is not None:
                             s = item["speed"]
-                            stats.append(f"{s:.1f} MB/s ({s * 60 / 1000:.2f} GB/min)")
+                            if item.get("speed_is_avg"):
+                                stats.append(f"~{s:.1f} MB/s avg ({s * 60 / 1000:.2f} GB/min)")
+                            else:
+                                stats.append(f"{s:.1f} MB/s ({s * 60 / 1000:.2f} GB/min)")
                         elif item["detail"]:
                             stats.append(item["detail"])
                         else:
