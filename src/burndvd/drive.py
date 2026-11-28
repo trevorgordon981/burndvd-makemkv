@@ -487,9 +487,12 @@ def mark_drive_released(
     """Record that optical reads are done and clear our own wrapper drive claim.
 
     Called right before releasing `disc_slot_lock` so new `burndvd` runs can
-    immediately use the physical drive while `ffmpeg --verify` and NAS transfer
-    finish in the background. Only removes `claim_path` (or `BURNDVD_DRIVE_CLAIM`)
-    when its `state` file matches `state_path` (or `state_path` is unset).
+    immediately use the physical drive while local post-processing, `ffmpeg
+    --verify`, and NAS transfer finish in the background. `ejected` must
+    reflect the actual confirmed eject result (`True` only when eject
+    succeeded, `False` when eject failed or `--no-eject` was set). Only
+    removes `claim_path` (or `BURNDVD_DRIVE_CLAIM`) when its `state` file
+    matches `state_path` (or `state_path` is unset).
     """
     marker = drive_released_marker_path(state_path)
     if marker is not None:
@@ -1449,9 +1452,9 @@ def eject(
     *,
     drutil_drive: int | None = None,
     device_node: str | None = None,
-) -> None:
-    """Eject the disc in the targeted drive with bounded timeouts and diskutil fallback."""
-    eject_disc(args, drutil_drive=drutil_drive, device_node=device_node)
+) -> bool:
+    """Eject the disc in the targeted drive and return True only when confirmed."""
+    return bool(eject_disc(args, drutil_drive=drutil_drive, device_node=device_node))
 
 
 def beep(args, ok: bool) -> None:

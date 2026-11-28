@@ -30,6 +30,7 @@ from burndvd.config import (
     MAX_NONINTERACTIVE_RETRIES,
     MAX_RESPINS,
     NFS_MEDIA_PREFIX,
+    PLAYALL_MIN_TOTAL_S,
     PROBE_COOLDOWN_S,
     RESPIN_AFTER_S,
     SMB_MEDIA_PREFIX,
@@ -99,6 +100,7 @@ from burndvd.receipts import append_disc_receipt
 from burndvd.selection import (
     _alt_playlist_duplicate,
     episode_bonus_split,
+    estimate_playall_episode_count,
     existing_content_collision,
     existing_season_median_dur_s,
     movie_filename,
@@ -1401,9 +1403,17 @@ def rip(
     disc_n: int,
     *,
     season_median_s: float | None = None,
+    on_optical_done=None,
 ):
     """Rip one disc to local staging, optionally falling back to mkvmerge for
-    unencrypted BDs on MakeMKV failure, then publish safely to NAS."""
+    unencrypted BDs on MakeMKV failure, then publish safely to NAS.
+
+    When `on_optical_done` is provided (and `--sync-move` is not active),
+    invokes `on_optical_done()` once all optical extraction (including any
+    optical fallback pass) has finished writing to local staging and TV slot
+    reservations have been updated — BEFORE local play-all splitting,
+    classification, episode claiming, verify, or NAS transfer.
+    """
     preverify_holder: dict = {"pool": None, "transferred": False}
     try:
         ok, payload = _rip_impl(
@@ -1416,6 +1426,7 @@ def rip(
             disc_n,
             preverify_holder,
             season_median_s=season_median_s,
+            on_optical_done=on_optical_done,
         )
         if not ok:
             clear_tv_slot_reservation(os.getpid())
@@ -1440,6 +1451,7 @@ def _rip_impl(
     preverify_holder: dict,
     *,
     season_median_s: float | None = None,
+    on_optical_done=None,
 ):
     if item.type == "tv-season" and getattr(args, "overwrite", False):
         return False, "--overwrite is forbidden for TV in every mode"
@@ -1579,18 +1591,27 @@ def _rip_impl(
         and title_ids
         and not getattr(args, "rerip_review", False)
     ):
-        _res_start = (
-            int(item.episode_start)
-            if item.episode_start and int(item.episode_start) > 0
-            else (scan_season_highest_episode(target_dir, int(item.season)) + 1)
-        )
+        _res_start = starting_ep(item, disc_n, state, target_dir=target_dir)
+        _pre_est = max(len(title_ids), int(item.expected_disc_episodes or 0))
+        if (
+            len(title_ids) == 1
+            and not getattr(args, "no_split_playall", False)
+            and season_median_s is not None
+            and season_median_s > 0
+        ):
+            _t0_meta = (info.get("titles") or {}).get(title_ids[0]) or {}
+            _t0_dur = parse_duration(_t0_meta.get(9, "0:00:00"))
+            if _t0_dur >= PLAYALL_MIN_TOTAL_S:
+                _pre_est = max(
+                    _pre_est, int(round(_t0_dur / float(season_median_s)))
+                )
         write_tv_slot_reservation(
             pid=os.getpid(),
             title=item.title,
             season=int(item.season),
             target_root=str(item.target_root or target_dir.parent),
             episode_start=_res_start,
-            episode_count=len(title_ids),
+            episode_count=_pre_est,
         )
     if skipped_play_all:
         print(
@@ -1924,6 +1945,52 @@ def _rip_impl(
         if not rips:
             shutil.rmtree(staging, ignore_errors=True)
             return False, "no .mkv files in staging despite save-summary success"
+
+    # Optical extraction (MakeMKV and any optical mkvmerge fallback) is now
+    # complete on local SSD. Unless every selected episode title failed
+    # optically, lock in an accurate TV slot reservation (including play-all
+    # split estimates) and release the optical drive BEFORE local splitting,
+    # classification, rename bookkeeping, verify, or NAS copy run.
+    all_episodes_failed_optically = (
+        item.type == "tv-season"
+        and not used_fallback
+        and bool(skipped_bad_title_records)
+        and bool(title_ids)
+        and all(tid in skipped_bad_titles for tid in title_ids)
+    )
+    if not all_episodes_failed_optically:
+        if (
+            item.type == "tv-season"
+            and item.season
+            and not getattr(args, "rerip_review", False)
+        ):
+            _post_opt_start = starting_ep(item, disc_n, state, target_dir=target_dir)
+            _est_playall = estimate_playall_episode_count(
+                args, rips, info=info, season_median_s=season_median_s
+            )
+            _fb_count = 0
+            if used_fallback:
+                _fb_count = (
+                    sum(1 for p in rips if ffprobe_dur_s(str(p)) >= TV_MIN_DUR_S)
+                    or len(rips)
+                )
+            _post_opt_count = max(
+                len(title_ids),
+                int(item.expected_disc_episodes or 0),
+                _est_playall,
+                _fb_count,
+            )
+            if _post_opt_count > 0:
+                write_tv_slot_reservation(
+                    pid=os.getpid(),
+                    title=item.title,
+                    season=int(item.season),
+                    target_root=str(item.target_root or target_dir.parent),
+                    episode_start=_post_opt_start,
+                    episode_count=_post_opt_count,
+                )
+        if on_optical_done is not None and not getattr(args, "sync_move", False):
+            on_optical_done()
 
     if item.type == "tv-season" and not getattr(args, "rerip_review", False):
         with season_dir_lock(target_dir, what="post-rip output decision"):
@@ -2560,6 +2627,7 @@ def _rip_impl(
                     f"all episode titles failed; last error: {skipped_bad_episode_records[-1][1]}",
                 )
             print(f"{C.YLW}  No titles >= {TV_MIN_DUR_S}s — extras-only disc.{C.R}")
+            clear_tv_slot_reservation(os.getpid())
             early_payload: dict = {"elapsed_s": elapsed, "files": finals}
             if used_fallback:
                 early_payload["used_fallback"] = True
@@ -2714,7 +2782,17 @@ def _rip_impl(
                             flush=True,
                         )
                 else:
-                    record_episode_count(item, disc_n, len(proposed), state)
+                    consumed_slots = len(proposed)
+                    record_episode_count(item, disc_n, consumed_slots, state)
+                if item.season and not getattr(args, "rerip_review", False):
+                    write_tv_slot_reservation(
+                        pid=os.getpid(),
+                        title=item.title,
+                        season=int(item.season),
+                        target_root=str(item.target_root or target_dir.parent),
+                        episode_start=start_ep,
+                        episode_count=consumed_slots,
+                    )
             else:
                 try:
                     manual_dir = tv_review_capture_dir(

@@ -949,6 +949,56 @@ def _playall_plan(marks: list[float], total: float):
     return best
 
 
+def estimate_playall_episode_count(
+    args,
+    rips: list[Path],
+    *,
+    info: dict | None = None,
+    season_median_s: float | None = None,
+) -> int:
+    """Estimate the episode count a chaptered play-all rip will split into.
+
+    Uses only fast local metadata (`ffprobe` duration + chapter marks via
+    `_playall_plan`, with a `season_median_s` duration fallback) and never
+    touches the optical drive or invokes `ffmpeg` stream splitting. Returns 0
+    when the disc is not a splittable play-all-only candidate.
+    """
+    if getattr(args, "no_split_playall", False) or not rips:
+        return 0
+
+    def _dur_s(path: Path) -> float:
+        dur = float(ffprobe_dur_s(str(path)) or 0.0)
+        if dur > 0:
+            return dur
+        if isinstance(info, dict):
+            tnum = title_num_from_filename(path.name)
+            if tnum is not None:
+                titles = info.get("titles") or {}
+                tmeta = titles.get(tnum, titles.get(str(tnum))) or {}
+                return float(parse_duration(tmeta.get(9, "0:00:00")))
+        return 0.0
+
+    durs = [(p, _dur_s(p)) for p in rips]
+    longs = [(p, d) for p, d in durs if d >= PLAYALL_MIN_TOTAL_S]
+    if len(longs) != 1:
+        return 0
+    src, total = longs[0]
+    others = [p for p, d in durs if p is not src and d >= TV_MIN_DUR_S]
+    if len(others) >= PLAY_ALL_MIN_PARTS:
+        return 0
+    marks = chapter_marks_s(str(src))
+    if len(marks) >= 3:
+        plan = _playall_plan(marks, total)
+        if plan is not None:
+            _spread, _stride, _edges, lens = plan
+            return len(lens)
+    if season_median_s is not None and season_median_s > 0:
+        est = int(round(total / float(season_median_s)))
+        if est >= 2:
+            return est
+    return 0
+
+
 def split_chaptered_playall(args, rips: list[Path], staging: Path) -> list[Path]:
     """Expand a lone chaptered play-all title into individual episode MKVs in staging."""
     if getattr(args, "no_split_playall", False) or not rips:
