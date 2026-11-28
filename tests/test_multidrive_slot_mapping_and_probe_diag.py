@@ -651,6 +651,60 @@ class TestProbeDiscDiagnosticSurfacing(unittest.TestCase):
         self.assertNotIn("--noscan", seen_cmds[1])
         self.assertEqual(seen_cmds[1][-2:], ["info", "iso:/tmp/sample.iso"])
 
+    def test_probe_disc_extends_stall_window_during_direct_disc_access(self):
+        """Dual-layer DVD-9 scans stay silent after MSG:3007 (direct disc access)
+        past the initial 60s window; probe_disc must extend stall_s instead of
+        prematurely killing the probe."""
+        class _SlowDirectAccessPopen:
+            def __init__(self, lines):
+                self._lines = list(lines)
+                self.killed = False
+                self.returncode = 0
+                self.stdout = self._gen()
+
+            def _gen(self):
+                for line in self._lines:
+                    yield line + "\n"
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        proc = _SlowDirectAccessPopen(
+            [
+                'MSG:3007,0,0,"Using direct disc access mode"',
+                'CINFO:2,0,"NarutoShippuden_BS4_D12"',
+                'TINFO:0,9,0,"1:57:00"',
+                'TINFO:0,11,0,"6200000000"',
+            ]
+        )
+        # Jump 90s between MSG:3007 and CINFO:2 (>60s PROBE_STALL_S, <180s direct-access window).
+        clock_vals = iter([1000.0, 1000.0, 1001.0, 1002.0, 1092.0, 1092.5, 1093.0, 1093.5])
+
+        def fake_time():
+            try:
+                return next(clock_vals)
+            except StopIteration:
+                return 1094.0
+
+        args = SimpleNamespace(makemkvcon="/fake/makemkvcon", device="disc:2")
+        with mock.patch.object(probe, "_optical_mounts", return_value=[]), \
+             mock.patch.object(probe, "_drive_idx_from_args", return_value=2), \
+             mock.patch.object(probe, "resolve_makemkv_device", return_value="disc:2"), \
+             mock.patch.object(probe, "PROBE_STALL_S", 60), \
+             mock.patch.object(probe, "PROBE_DIRECT_ACCESS_STALL_S", 180), \
+             mock.patch.object(probe, "PROBE_HARD_S", 300), \
+             mock.patch.object(probe.time, "time", side_effect=fake_time), \
+             mock.patch.object(probe.subprocess, "Popen", return_value=proc):
+            info = probe.probe_disc(args)
+
+        self.assertFalse(proc.killed)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["cinfo"][2], "NarutoShippuden_BS4_D12")
+
 
 if __name__ == "__main__":
     unittest.main()

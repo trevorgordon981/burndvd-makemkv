@@ -18,6 +18,7 @@ from burndvd.config import (
     EXTRAS_MIN_DUR_S,
     FFPROBE_BIN,
     MOVIE_FEATURE_MIN_S,
+    PROBE_DIRECT_ACCESS_STALL_S,
     PROBE_HARD_S,
     PROBE_STALL_S,
     fmt_dur,
@@ -296,6 +297,9 @@ def probe_disc(args) -> dict | None:
                 last_line_t = now
                 global _LAST_PROBE_ACTIVITY
                 _LAST_PROBE_ACTIVITY = now
+                if "MSG:3007" in line:
+                    if stall_s < PROBE_DIRECT_ACCESS_STALL_S:
+                        stall_s = PROBE_DIRECT_ACCESS_STALL_S
                 if "MSG:3028" in line:
                     titles_added += 1
                     if stall_s < 180:
