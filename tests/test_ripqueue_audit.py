@@ -322,6 +322,21 @@ class AuditFixesTests(unittest.TestCase):
                 ripqueue._create_tv_slot_claim(ripqueue.tv_slot_claim_path(dst))
             self.assertEqual(ripqueue.starting_ep(item, 1, {}, target_dir=nfs_real), 4)
 
+    def test_05b_starting_ep_respects_explicit_gap_fill_when_higher_episodes_exist(self):
+        """Explicit episode_start into an empty gap (e.g. E22 when E01-E21 and E27-E48 exist)
+        must NOT be overridden to highest + 1 (E49)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            season = root / "TV Shows" / "Naruto Shippuden" / "Season 01"
+            season.mkdir(parents=True)
+            for ep in (20, 21, 27, 48):
+                (season / f"Naruto Shippuden - S01E{ep:02d}.mkv").write_bytes(b"x")
+            gap_item = _make_tv_item(season.parent, title="Naruto Shippuden", season=1, episode_start=22)
+            self.assertEqual(ripqueue.starting_ep(gap_item, 1, {}, target_dir=season), 22)
+            # Default/occupied starting slot still advances past highest.
+            dup_item = _make_tv_item(season.parent, title="Naruto Shippuden", season=1, episode_start=20)
+            self.assertEqual(ripqueue.starting_ep(dup_item, 1, {}, target_dir=season), 49)
+
     def test_06_resolve_nas_path_and_await_dir_writable_failover(self):
         with tempfile.TemporaryDirectory() as tmp:
             smb_root = Path(tmp) / "smb-media"

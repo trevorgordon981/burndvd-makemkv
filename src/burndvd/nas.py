@@ -1489,9 +1489,11 @@ def starting_ep(
                     season_dir = alt
         try:
             highest = 0
+            occupied: set[int] = set()
             if season_dir.exists():
                 slots = existing_episode_slots(item, season_dir, include_claims=True)
                 if slots:
+                    occupied.update(slots)
                     highest = max(highest, max(slots))
                 pat = re.compile(rf"S0*{item.season}E(\d+)")
                 for entry in season_dir.iterdir():
@@ -1504,8 +1506,10 @@ def starting_ep(
                         continue
                     m = pat.search(entry.name)
                     if m:
-                        highest = max(highest, int(m.group(1)))
-            if highest >= state_based:
+                        ep_num = int(m.group(1))
+                        occupied.add(ep_num)
+                        highest = max(highest, ep_num)
+            if state_based in occupied:
                 return highest + 1
         except (OSError, RuntimeError):
             pass
