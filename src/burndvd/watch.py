@@ -15,6 +15,7 @@ import hashlib
 import inspect
 import json
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -33,6 +34,7 @@ from typing import Any, Callable, Iterator, Mapping, TextIO
 from burndvd import config as burndvd_config
 from burndvd import metadata as burndvd_metadata
 from burndvd.config import (
+    DISKUTIL_BIN,
     NFS_MEDIA_PREFIX,
     SMB_MEDIA_PREFIX,
     fmt_dur,
@@ -41,6 +43,14 @@ from burndvd.drive import (
     DRIVE_DEVICE_ENV,
     DRIVE_SERIAL_ENV,
     DRUTIL_DRIVE_ENV,
+    _drutil_list_drives,
+    _drutil_status_output,
+    _normalize_device_node,
+    _parse_disk_node_from_status,
+    _status_has_media,
+    active_busy_disc_claims,
+    drive_released_marker_path,
+    is_state_drive_released,
     parse_makemkv_drives,
 )
 from burndvd.metadata import (
@@ -59,6 +69,7 @@ DEFAULT_WATCH_MAKEMKVCON = "/opt/homebrew/bin/makemkvcon"
 DEFAULT_POLL_INTERVAL_S = 5.0
 DEFAULT_SCAN_WAIT_S = 120.0
 USER_CONFIG_DEFAULT_PATH = Path.home() / ".config" / "burndvd" / "config"
+DRIVE_TOPOLOGY_DEFAULT_PATH = Path.home() / ".cache" / "burndvd" / "drive-topology.json"
 
 _WATCHER_REGISTRY_LOCK = threading.Lock()
 _SEASON_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -260,24 +271,599 @@ def slugify_volume(value: str) -> str:
     return slug or "disc"
 
 
-def list_makemkv_drives(
-    makemkvcon: str = DEFAULT_WATCH_MAKEMKVCON,
+def read_drive_released_marker(state_path: str | Path | None) -> dict[str, Any] | None:
+    """Read `<state>.drive_released` JSON metadata if the drive has been released.
+
+    Returns `None` when the state file does not have a drive-released marker.
+    Returns `{}` when the marker exists but cannot be parsed as a JSON object
+    (so drive release is recognized without falsely asserting eject succeeded).
+    """
+    if not is_state_drive_released(state_path):
+        return None
+    marker = drive_released_marker_path(state_path)
+    if marker is None:
+        return None
+    try:
+        raw = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_eject_confirmed(marker: Mapping[str, Any] | None) -> bool:
+    """Return True only when a drive-released marker explicitly confirms `ejected: true`."""
+    return bool(marker is not None and marker.get("ejected") is True)
+
+
+def load_drive_topology(path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load cached optical drive topology (`drutil_to_serial`, `serial_to_slot`, `drutil_to_slot`)."""
+    topo_path = path or DRIVE_TOPOLOGY_DEFAULT_PATH
+    out: dict[str, dict[str, Any]] = {
+        "drutil_to_serial": {},
+        "serial_to_slot": {},
+        "drutil_to_slot": {},
+    }
+    if not topo_path.is_file():
+        return out
+    try:
+        data = json.loads(topo_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    if not isinstance(data, dict):
+        return out
+    d2s = data.get("drutil_to_serial")
+    if isinstance(d2s, dict):
+        for k, v in d2s.items():
+            if str(k).strip() and str(v).strip():
+                out["drutil_to_serial"][str(k).strip()] = str(v).strip()
+    s2slot = data.get("serial_to_slot")
+    if isinstance(s2slot, dict):
+        for k, v in s2slot.items():
+            if str(k).strip() and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                out["serial_to_slot"][str(k).strip().upper()] = int(v)
+    d2slot = data.get("drutil_to_slot")
+    if isinstance(d2slot, dict):
+        for k, v in d2slot.items():
+            if str(k).strip() and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                out["drutil_to_slot"][str(k).strip()] = int(v)
+    return out
+
+
+def _merge_topology_dicts(
+    base: Mapping[str, Any] | None,
+    overlay: Mapping[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {
+        "drutil_to_serial": {},
+        "serial_to_slot": {},
+        "drutil_to_slot": {},
+    }
+    for src in (base, overlay):
+        if not isinstance(src, Mapping):
+            continue
+        for k, v in (src.get("drutil_to_serial") or {}).items():
+            if str(k).strip() and str(v).strip():
+                merged["drutil_to_serial"][str(k).strip()] = str(v).strip()
+        for k, v in (src.get("serial_to_slot") or {}).items():
+            if str(k).strip() and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                merged["serial_to_slot"][str(k).strip().upper()] = int(v)
+        for k, v in (src.get("drutil_to_slot") or {}).items():
+            if str(k).strip() and isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                merged["drutil_to_slot"][str(k).strip()] = int(v)
+    return merged
+
+
+def save_drive_topology(
+    rows: Iterable[Mapping[str, Any]],
     *,
-    timeout_s: float = 20.0,
-) -> list[dict[str, Any]]:
-    """Query MakeMKV `DRV:` rows via `makemkvcon -r info list` (read-only list)."""
+    path: Path | None = None,
+    drutil_by_dev: Mapping[str, int] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Persist observed drive topology (preserving `drutil_to_serial` compatibility with `bin/burndvd`)."""
+    topo_path = path or DRIVE_TOPOLOGY_DEFAULT_PATH
+    topo = load_drive_topology(topo_path)
+    changed = False
+    for row in rows:
+        serial = str(row.get("serial") or "").strip()
+        raw_idx = row.get("index")
+        idx = int(raw_idx) if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and raw_idx >= 0 else None
+        raw_drutil = row.get("drutil_drive")
+        drutil_idx: int | None = None
+        if isinstance(raw_drutil, int) and not isinstance(raw_drutil, bool) and raw_drutil >= 1:
+            drutil_idx = raw_drutil
+        elif drutil_by_dev:
+            norm_dev = _normalize_device_node(str(row.get("device_node") or ""))
+            if norm_dev and norm_dev in drutil_by_dev:
+                drutil_idx = int(drutil_by_dev[norm_dev])
+        if serial and idx is not None:
+            ser_u = serial.upper()
+            if topo["serial_to_slot"].get(ser_u) != idx:
+                topo["serial_to_slot"][ser_u] = idx
+                changed = True
+        if drutil_idx is not None and serial:
+            if topo["drutil_to_serial"].get(str(drutil_idx)) != serial:
+                topo["drutil_to_serial"][str(drutil_idx)] = serial
+                changed = True
+        if drutil_idx is not None and idx is not None:
+            if topo["drutil_to_slot"].get(str(drutil_idx)) != idx:
+                topo["drutil_to_slot"][str(drutil_idx)] = idx
+                changed = True
+    if changed:
+        try:
+            topo_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = topo_path.with_name(f".{topo_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(topo, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(tmp, topo_path)
+        except OSError:
+            pass
+    return topo
+
+
+def _volume_for_device(device_node: str, *, timeout_s: float = 5.0) -> str:
+    """Return optical volume label via read-only `diskutil info /dev/diskN`, or ''."""
+    norm = _normalize_device_node(device_node)
+    if not norm:
+        return ""
     try:
         proc = subprocess.run(
-            [makemkvcon, "-r", "info", "list"],
+            [DISKUTIL_BIN, "info", norm],
             capture_output=True,
             text=True,
             timeout=timeout_s,
         )
     except (subprocess.TimeoutExpired, OSError):
+        return ""
+    for line in (proc.stdout or "").splitlines():
+        if "Volume Name" in line and ":" in line:
+            val = line.split(":", 1)[1].strip()
+            if val and "not applicable" not in val.lower():
+                return val
+    return ""
+
+
+def _probe_free_makemkv_slot(
+    makemkvcon: str,
+    slot_idx: int,
+    *,
+    timeout_s: float = 10.0,
+) -> tuple[str, str, str]:
+    """Probe a single confirmed-free MakeMKV `disc:N` slot without touching busy drives.
+
+    Returns `(status, serial, volume)` where status is `'loaded'`, `'empty'`, or `'unknown'`.
+    Terminates as soon as `CINFO:2` or an empty-tray `MSG:5010` arrives.
+    """
+    if not makemkvcon:
+        return ("unknown", "", "")
+    try:
+        proc = subprocess.Popen(
+            [
+                makemkvcon,
+                "-r",
+                "--noscan",
+                "--cache=128",
+                "--minlength=36000",
+                "info",
+                f"disc:{int(slot_idx)}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError:
+        return ("unknown", "", "")
+
+    line_q: queue.Queue[tuple[str, str]] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            if proc.stdout is not None:
+                for raw in proc.stdout:
+                    line_q.put(("line", raw))
+        finally:
+            line_q.put(("eof", ""))
+
+    threading.Thread(target=_reader, daemon=True).start()
+    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    slot_serial = ""
+    volume = ""
+    saw_mkv_output = False
+    status: str | None = None
+    loaded_grace_deadline: float | None = None
+
+    try:
+        while True:
+            now = time.monotonic()
+            limit = (
+                deadline
+                if loaded_grace_deadline is None
+                else min(deadline, loaded_grace_deadline)
+            )
+            rem = limit - now
+            if rem <= 0:
+                if status is None and saw_mkv_output:
+                    status = "loaded"
+                break
+            try:
+                kind, payload = line_q.get(timeout=min(0.25, rem))
+            except queue.Empty:
+                continue
+            if kind == "eof":
+                break
+            line = payload.strip()
+            if not line:
+                continue
+            if line.startswith(("DRV:", "MSG:", "CINFO:", "TINFO:")):
+                saw_mkv_output = True
+            if line.startswith("DRV:"):
+                parsed_rows = parse_makemkv_drives(line)
+                for row in parsed_rows:
+                    if row["index"] == int(slot_idx) and row.get("serial"):
+                        slot_serial = str(row["serial"]).strip()
+            elif line.startswith("CINFO:"):
+                m = re.match(r'^CINFO:2,\d+,"([^"]*)"', line)
+                if m and m.group(1):
+                    volume = m.group(1).strip()
+                status = "loaded"
+                break
+            elif line.startswith(("MSG:3007", "MSG:3307", "MSG:3006", "MSG:3028")):
+                status = "loaded"
+                if loaded_grace_deadline is None:
+                    loaded_grace_deadline = time.monotonic() + 0.25
+            elif line.startswith("MSG:5010") or re.search(
+                r"TRAY OPEN|MEDIUM NOT PRESENT", line, re.IGNORECASE
+            ):
+                if status != "loaded":
+                    status = "empty"
+                break
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+
+    return (status or "unknown", slot_serial, volume)
+
+
+def _list_drives_nonblocking_fallback(
+    makemkvcon: str,
+    *,
+    busy_slots: set[int],
+    busy_devices: set[str],
+    busy_serials_cf: set[str],
+    busy_drutil_drives: set[int],
+    topology: Mapping[str, Any],
+    probe_slot_timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Inspect idle optical drives via `drutil` + `diskutil` + cached topology without touching busy slots."""
+    drutil_indices = _drutil_list_drives()
+    if not drutil_indices:
         return []
-    if proc.returncode != 0 and not (proc.stdout or "").strip():
-        return []
-    return parse_makemkv_drives(proc.stdout or "")
+
+    drutil_to_serial: dict[str, str] = dict(topology.get("drutil_to_serial") or {})
+    serial_to_slot: dict[str, int] = {
+        str(k).upper(): int(v)
+        for k, v in (topology.get("serial_to_slot") or {}).items()
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    }
+    slot_to_serial: dict[int, str] = {}
+    _slot_serial_counts: dict[int, int] = {}
+    for ser_u, sl in serial_to_slot.items():
+        _slot_serial_counts[sl] = _slot_serial_counts.get(sl, 0) + 1
+    for ser_u, sl in serial_to_slot.items():
+        if _slot_serial_counts.get(sl) == 1:
+            slot_to_serial[sl] = ser_u
+    drutil_to_slot: dict[str, int] = {
+        str(k): int(v)
+        for k, v in (topology.get("drutil_to_slot") or {}).items()
+        if isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    }
+
+    idle_empty: list[dict[str, Any]] = []
+    avail_loaded: list[dict[str, Any]] = []
+
+    for ix in drutil_indices:
+        serial = str(drutil_to_serial.get(str(ix), "")).strip()
+        if ix in busy_drutil_drives or (serial and serial.casefold() in busy_serials_cf):
+            continue
+        status_out = _drutil_status_output(ix)
+        if status_out is None:
+            continue
+        node = _normalize_device_node(_parse_disk_node_from_status(status_out))
+        has_media = _status_has_media(status_out)
+        if node and node in busy_devices:
+            continue
+        if not has_media or not node:
+            mapped_slot = (
+                serial_to_slot.get(serial.upper())
+                if serial
+                else None
+            )
+            if mapped_slot is None:
+                mapped_slot = drutil_to_slot.get(str(ix))
+            if mapped_slot is None or mapped_slot in busy_slots:
+                mapped_slot = max(0, ix - 1)
+            idle_empty.append(
+                {
+                    "index": mapped_slot,
+                    "state": 0,
+                    "flags": 0,
+                    "disc_flags": 0,
+                    "drive_desc": "",
+                    "serial": serial,
+                    "volume": "",
+                    "raw_device": "",
+                    "device_node": None,
+                    "has_media": False,
+                    "drutil_drive": ix,
+                }
+            )
+            continue
+
+        disk_num = int(node.rsplit("disk", 1)[1])
+        vol = _volume_for_device(node)
+        avail_loaded.append(
+            {
+                "disk_num": disk_num,
+                "drutil_drive": ix,
+                "device_node": node,
+                "serial": serial,
+                "volume": vol,
+            }
+        )
+
+    avail_loaded.sort(key=lambda item: (item["disk_num"], item["drutil_drive"]))
+
+    known_slots = list(serial_to_slot.values()) + list(drutil_to_slot.values())
+    total_slots = max(
+        len(drutil_indices),
+        (max(busy_slots) + 1) if busy_slots else 0,
+        (max(known_slots) + 1) if known_slots else 0,
+    )
+    free_slots = [k for k in range(total_slots) if k not in busy_slots]
+
+    if not avail_loaded:
+        return idle_empty
+    if not free_slots or len(avail_loaded) > len(free_slots):
+        # Refuse unsafe fallback when we cannot map loaded drives without risking a busy slot.
+        return idle_empty
+
+    # Fast path 1: Every loaded drive has a unique, confirmed-free cached topology slot and a volume label.
+    topo_paired: list[tuple[dict[str, Any], int, str, str]] = []
+    used_topo_slots: set[int] = set()
+    all_topo_mapped = True
+    for item in avail_loaded:
+        ser = item["serial"]
+        slot = serial_to_slot.get(ser.upper()) if ser else None
+        if slot is None:
+            slot = drutil_to_slot.get(str(item["drutil_drive"]))
+        if (
+            slot is not None
+            and slot in free_slots
+            and slot not in used_topo_slots
+            and item["volume"]
+        ):
+            used_topo_slots.add(slot)
+            topo_paired.append((item, slot, ser, item["volume"]))
+        else:
+            all_topo_mapped = False
+            break
+
+    paired: list[tuple[dict[str, Any], int, str, str]] = []
+    if all_topo_mapped and topo_paired:
+        paired = topo_paired
+    elif len(avail_loaded) == 1 and len(free_slots) == 1:
+        # Fast path 2: Exactly one free slot and one loaded non-busy drive.
+        item = avail_loaded[0]
+        slot = free_slots[0]
+        ser = item["serial"]
+        vol = item["volume"]
+        if not vol and makemkvcon:
+            st, probed_ser, probed_vol = _probe_free_makemkv_slot(
+                makemkvcon, slot, timeout_s=probe_slot_timeout_s
+            )
+            if st != "empty":
+                ser = ser or probed_ser
+                vol = vol or probed_vol
+        paired = [(item, slot, ser, vol)]
+    else:
+        # Targeted probe of FREE slots only — never probes any slot in `busy_slots`.
+        loaded_slots: list[tuple[int, str, str]] = []
+        unknown_slots: list[tuple[int, str, str]] = []
+        empty_slots: list[int] = []
+        for k in free_slots:
+            st, ser, svol = _probe_free_makemkv_slot(
+                makemkvcon, k, timeout_s=probe_slot_timeout_s
+            )
+            if st == "loaded":
+                loaded_slots.append((k, ser, svol))
+                if len(avail_loaded) == 1:
+                    break
+            elif st == "empty":
+                empty_slots.append(k)
+            else:
+                unknown_slots.append((k, ser, svol))
+
+        if loaded_slots:
+            rem_items = list(avail_loaded)
+            rem_slots = list(loaded_slots)
+            # 1. Exact volume match
+            for slot_entry in list(rem_slots):
+                k, ser, svol = slot_entry
+                if not svol:
+                    continue
+                hits = [
+                    it
+                    for it in rem_items
+                    if it["volume"] and it["volume"].casefold() == svol.casefold()
+                ]
+                if len(hits) == 1:
+                    it = hits[0]
+                    paired.append((it, k, it["serial"] or ser, it["volume"] or svol))
+                    rem_items.remove(it)
+                    rem_slots.remove(slot_entry)
+            # 2. Cached drutil -> serial match
+            for slot_entry in list(rem_slots):
+                k, ser, svol = slot_entry
+                if not ser:
+                    continue
+                hits = [
+                    it
+                    for it in rem_items
+                    if drutil_to_serial.get(str(it["drutil_drive"]), "").casefold()
+                    == ser.casefold()
+                ]
+                if len(hits) == 1:
+                    it = hits[0]
+                    paired.append((it, k, it["serial"] or ser, it["volume"] or svol))
+                    rem_items.remove(it)
+                    rem_slots.remove(slot_entry)
+            # 3. Cached drutil -> slot match
+            for slot_entry in list(rem_slots):
+                k, ser, svol = slot_entry
+                hits = [
+                    it
+                    for it in rem_items
+                    if drutil_to_slot.get(str(it["drutil_drive"])) == k
+                ]
+                if len(hits) == 1:
+                    it = hits[0]
+                    paired.append((it, k, it["serial"] or ser, it["volume"] or svol))
+                    rem_items.remove(it)
+                    rem_slots.remove(slot_entry)
+            # 4. Remaining deterministic 1-to-1 pairing across confirmed-loaded slots
+            for it, (k, ser, svol) in zip(rem_items, rem_slots):
+                paired.append((it, k, it["serial"] or ser, it["volume"] or svol))
+        elif len(avail_loaded) == len(free_slots) and not empty_slots:
+            # Probing was unavailable (e.g. MakeMKV binary didn't answer), but counts match exactly.
+            for it, k in zip(avail_loaded, free_slots):
+                paired.append((it, k, it["serial"], it["volume"]))
+
+    rows: list[dict[str, Any]] = list(idle_empty)
+    for item, slot_idx, ser, vol in paired:
+        if slot_idx in busy_slots:
+            continue
+        resolved_serial = ser or slot_to_serial.get(int(slot_idx), "")
+        node = item["device_node"]
+        raw_dev = node.replace("/dev/disk", "/dev/rdisk") if node else ""
+        rows.append(
+            {
+                "index": int(slot_idx),
+                "state": 2,
+                "flags": 0,
+                "disc_flags": 0,
+                "drive_desc": "",
+                "serial": resolved_serial,
+                "volume": vol,
+                "raw_device": raw_dev,
+                "device_node": node,
+                "has_media": True,
+                "drutil_drive": int(item["drutil_drive"]),
+            }
+        )
+    rows.sort(key=lambda r: (int(r.get("index", 0)), drive_identity_key(r)))
+    return rows
+
+
+def list_makemkv_drives(
+    makemkvcon: str = DEFAULT_WATCH_MAKEMKVCON,
+    *,
+    timeout_s: float = 20.0,
+    busy_slots: Iterable[int] = (),
+    busy_devices: Iterable[str] = (),
+    busy_serials: Iterable[str] = (),
+    busy_drutil_drives: Iterable[int] = (),
+    busy_claims: Mapping[int, Mapping[str, Any]] | None = None,
+    topology_path: Path | None = None,
+    known_topology: Mapping[str, Any] | None = None,
+    allow_global_when_busy: bool = False,
+    probe_slot_timeout_s: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Enumerate optical drives without blocking on busy sibling MakeMKV readers.
+
+    When no sibling optical drive is actively ripping, runs `makemkvcon -r info list`
+    and updates the cached topology. When a sibling drive is actively ripping (or when
+    global `info list` fails/times out), falls back safely to non-blocking `drutil` +
+    `diskutil` + cached topology and targeted free-slot probes without ever targeting
+    a busy slot.
+    """
+    claims = active_busy_disc_claims() if busy_claims is None else busy_claims
+    busy_slot_set: set[int] = {int(k) for k in (busy_slots or ())}
+    busy_dev_set: set[str] = set()
+    for d in busy_devices or ():
+        norm = _normalize_device_node(str(d))
+        if norm:
+            busy_dev_set.add(norm)
+    busy_serial_set: set[str] = {
+        str(s).strip().casefold() for s in (busy_serials or ()) if str(s).strip()
+    }
+    busy_drutil_set: set[int] = {
+        int(ix) for ix in (busy_drutil_drives or ()) if int(ix) >= 1
+    }
+    for slot_k, meta in (claims or {}).items():
+        busy_slot_set.add(int(slot_k))
+        if isinstance(meta, Mapping):
+            c_dev = _normalize_device_node(str(meta.get("dev") or ""))
+            if c_dev:
+                busy_dev_set.add(c_dev)
+            c_ser = str(meta.get("serial") or "").strip().casefold()
+            if c_ser:
+                busy_serial_set.add(c_ser)
+
+    topology = _merge_topology_dicts(load_drive_topology(topology_path), known_topology)
+    has_busy_sibling = bool(
+        busy_slot_set or busy_dev_set or busy_serial_set or busy_drutil_set
+    )
+
+    if not has_busy_sibling or allow_global_when_busy:
+        try:
+            proc = subprocess.run(
+                [makemkvcon, "-r", "info", "list"],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+            if proc.returncode == 0 or (proc.stdout or "").strip():
+                rows = parse_makemkv_drives(proc.stdout or "")
+                if rows:
+                    drutil_by_dev: dict[str, int] = {}
+                    for ix in _drutil_list_drives():
+                        st_out = _drutil_status_output(ix)
+                        node = _normalize_device_node(_parse_disk_node_from_status(st_out))
+                        if node:
+                            drutil_by_dev[node] = ix
+                    for row in rows:
+                        norm_node = _normalize_device_node(str(row.get("device_node") or ""))
+                        if norm_node and norm_node in drutil_by_dev:
+                            row["drutil_drive"] = drutil_by_dev[norm_node]
+                    save_drive_topology(
+                        rows, path=topology_path, drutil_by_dev=drutil_by_dev
+                    )
+                    return rows
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return _list_drives_nonblocking_fallback(
+        makemkvcon,
+        busy_slots=busy_slot_set,
+        busy_devices=busy_dev_set,
+        busy_serials_cf=busy_serial_set,
+        busy_drutil_drives=busy_drutil_set,
+        topology=topology,
+        probe_slot_timeout_s=probe_slot_timeout_s,
+    )
 
 
 def resolve_ripqueue_base_cmd(
@@ -491,6 +1077,11 @@ class ActiveRip:
     state_path: Path
     started_at: float
     pending_launch_path: Path | None = None
+    drive_released: bool = False
+    drive_released_at: float | None = None
+    drive_ejected: bool = False
+    tray_ready_confirmed: bool = False
+    release_logged: bool = False
 
 
 @dataclass
@@ -504,6 +1095,7 @@ class CompletedRip:
     returncode: int
     log_path: Path
     elapsed_s: float
+    was_finalizing: bool = False
 
 
 @dataclass
@@ -516,6 +1108,7 @@ class WatchSummary:
     failed: int = 0
     stopped_by_signal: bool = False
     active_at_exit: list[ActiveRip] = field(default_factory=list)
+    finalizing_at_exit: list[ActiveRip] = field(default_factory=list)
     results: list[CompletedRip] = field(default_factory=list)
 
 
@@ -537,9 +1130,6 @@ class BoxSetWatcher:
         out: TextIO | None = None,
     ) -> None:
         self.config = config
-        self._list_drives_fn = list_drives_fn or (
-            lambda: list_makemkv_drives(self.config.makemkvcon)
-        )
         self._spawn_fn = spawn_fn or subprocess.Popen
         self._compute_next_ep_fn = compute_next_ep_fn or compute_next_tv_episode
         self._discover_procs_fn = (
@@ -554,14 +1144,69 @@ class BoxSetWatcher:
         self._out = out if out is not None else sys.stdout
 
         self.active_procs: dict[str, ActiveRip] = {}
+        self.finalizing_procs: list[ActiveRip] = []
         self.handled_discs: dict[str, str] = {}
         self.rejected_discs: dict[str, str] = {}
         self.results: list[CompletedRip] = []
+        self._drive_topology: dict[str, dict[str, Any]] = {
+            "drutil_to_serial": {},
+            "serial_to_slot": {},
+            "drutil_to_slot": {},
+        }
         self._launched_count: int = 0
         self._first_episode_override: int | None = config.episode_start
         self._stop_requested: bool = False
         self._launch_counter: int = 0
         self.watcher_id: str = uuid.uuid4().hex[:8]
+        self._list_drives_fn = list_drives_fn or self._default_list_drives
+
+    def _default_list_drives(self) -> list[dict[str, Any]]:
+        """Enumerate drives while excluding optical slots currently occupied by `active_procs`."""
+        busy_slots = {int(r.disc_index) for r in self.active_procs.values()}
+        busy_devices = {
+            r.device_node for r in self.active_procs.values() if r.device_node
+        }
+        busy_serials = {
+            r.drive_serial for r in self.active_procs.values() if r.drive_serial
+        }
+        busy_drutil = {
+            int(r.drutil_drive)
+            for r in self.active_procs.values()
+            if int(r.drutil_drive) >= 1
+        }
+        return list_makemkv_drives(
+            self.config.makemkvcon,
+            busy_slots=busy_slots,
+            busy_devices=busy_devices,
+            busy_serials=busy_serials,
+            busy_drutil_drives=busy_drutil,
+            known_topology=self._drive_topology,
+        )
+
+    def _record_topology(self, drives: Iterable[Mapping[str, Any]]) -> None:
+        """Update in-memory drive topology from newly observed drive rows."""
+        for row in drives or ():
+            serial = str(row.get("serial") or "").strip()
+            raw_idx = row.get("index")
+            idx = (
+                int(raw_idx)
+                if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and raw_idx >= 0
+                else None
+            )
+            raw_drutil = row.get("drutil_drive")
+            drutil_idx = (
+                int(raw_drutil)
+                if isinstance(raw_drutil, int)
+                and not isinstance(raw_drutil, bool)
+                and raw_drutil >= 1
+                else None
+            )
+            if serial and idx is not None:
+                self._drive_topology["serial_to_slot"][serial.upper()] = idx
+            if drutil_idx is not None and serial:
+                self._drive_topology["drutil_to_serial"][str(drutil_idx)] = serial
+            if drutil_idx is not None and idx is not None:
+                self._drive_topology["drutil_to_slot"][str(drutil_idx)] = idx
 
     def _season_key(self) -> str:
         return _season_coord_key(
@@ -650,16 +1295,93 @@ class BoxSetWatcher:
         """Signal the watcher loop to stop accepting new discs cleanly."""
         self._stop_requested = True
 
+    def release_drives(self) -> list[ActiveRip]:
+        """Move optical-released rips out of `active_procs` into `finalizing_procs`.
+
+        Preserves child process tracking, episode reservations (`_LIVE_WATCHER_RIPS`
+        and pending launch records), and `handled_discs` anti-rerip guard while freeing
+        the optical drive slot immediately for the next disc.
+        """
+        newly_released: list[ActiveRip] = []
+        for drive_key, rip in list(self.active_procs.items()):
+            if rip.proc.poll() is not None:
+                continue
+            marker = read_drive_released_marker(rip.state_path)
+            if marker is None:
+                continue
+            self.active_procs.pop(drive_key)
+            rip.drive_released = True
+            rip.drive_released_at = self._clock_fn()
+            rip.drive_ejected = is_eject_confirmed(marker)
+            self.finalizing_procs.append(rip)
+            newly_released.append(rip)
+        return newly_released
+
+    def _confirm_tray_ready(self, drives: list[dict[str, Any]]) -> None:
+        """Emit confirmed tray-ready notifications vs non-ejected release status.
+
+        Only fires a tray-ready notification when `<state>.drive_released` confirms
+        `ejected: true` AND the latest drive snapshot does not still show the exact
+        same disc sitting loaded in that drive.
+        """
+        drives_by_key = {drive_identity_key(d): d for d in (drives or ())}
+        for rip in self.finalizing_procs:
+            if rip.tray_ready_confirmed:
+                continue
+            row = drives_by_key.get(rip.drive_key)
+            same_disc_still_loaded = False
+            if row is not None:
+                row_node = str(row.get("device_node") or "").strip()
+                row_vol = str(row.get("volume") or "").strip()
+                if (
+                    row.get("state") == 2
+                    and row_node
+                    and (not row_vol or row_vol == rip.volume)
+                ):
+                    same_disc_still_loaded = True
+
+            if (
+                rip.drive_ejected
+                and not same_disc_still_loaded
+                and rip.drive_key not in self.active_procs
+            ):
+                rip.tray_ready_confirmed = True
+                rip.release_logged = True
+                self._emit(
+                    f"Drive {rip.drive_key} TRAY READY "
+                    f"(released {rip.volume}; verifying/copying in background)"
+                )
+                self._safe_notify(
+                    f":cd: *Drive tray ready* — `{self.config.show}` "
+                    f"S{self.config.season:02d} `{rip.volume}` released drive "
+                    f"`{rip.drive_key}` (ejected; insert next disc while verify/NAS "
+                    f"finishes in background)."
+                )
+            elif not rip.release_logged:
+                rip.release_logged = True
+                if not rip.drive_ejected:
+                    self._emit(
+                        f"Drive {rip.drive_key} RELEASED {rip.volume} "
+                        f"(eject not confirmed; remove disc manually — "
+                        f"verifying/copying in background)"
+                    )
+                else:
+                    self._emit(
+                        f"Drive {rip.drive_key} RELEASED {rip.volume} "
+                        f"(disc still detected in tray; tray not yet ready — "
+                        f"verifying/copying in background)"
+                    )
+
     def reap_finished(self) -> list[CompletedRip]:
-        """Reap any finished child processes and emit completion status lines."""
+        """Reap any finished optical-active or background-finalizing child processes."""
         reaped: list[CompletedRip] = []
-        finished_keys: list[tuple[str, int]] = []
+        finished_active: list[tuple[str, int]] = []
         for drive_key, rip in list(self.active_procs.items()):
             rc = rip.proc.poll()
             if rc is not None:
-                finished_keys.append((drive_key, int(rc)))
+                finished_active.append((drive_key, int(rc)))
 
-        for drive_key, rc in finished_keys:
+        for drive_key, rc in finished_active:
             rip = self.active_procs.pop(drive_key)
             self._unregister_live_rip(rip)
             elapsed = max(0.0, self._clock_fn() - rip.started_at)
@@ -673,6 +1395,7 @@ class BoxSetWatcher:
                 returncode=rc,
                 log_path=rip.log_path,
                 elapsed_s=elapsed,
+                was_finalizing=False,
             )
             self.results.append(completed)
             reaped.append(completed)
@@ -694,6 +1417,56 @@ class BoxSetWatcher:
                 )
                 self._safe_notify(
                     f":x: *Watch rip FAILED* — `{self.config.show}` "
+                    f"S{self.config.season:02d} `{rip.volume}` (exit {rc}, "
+                    f"drive `{drive_key}`, log: `{rip.log_path.name}`)."
+                )
+
+        still_finalizing: list[ActiveRip] = []
+        finished_finalizing: list[tuple[ActiveRip, int]] = []
+        for rip in self.finalizing_procs:
+            rc = rip.proc.poll()
+            if rc is not None:
+                finished_finalizing.append((rip, int(rc)))
+            else:
+                still_finalizing.append(rip)
+        self.finalizing_procs = still_finalizing
+
+        for rip, rc in finished_finalizing:
+            drive_key = rip.drive_key
+            self._unregister_live_rip(rip)
+            elapsed = max(0.0, self._clock_fn() - rip.started_at)
+            # Do NOT overwrite handled_discs[drive_key]: the optical drive may already
+            # have accepted a newer disc since this rip released it.
+            completed = CompletedRip(
+                drive_key=drive_key,
+                device_node=rip.device_node,
+                volume=rip.volume,
+                episode_start=rip.episode_start,
+                returncode=rc,
+                log_path=rip.log_path,
+                elapsed_s=elapsed,
+                was_finalizing=True,
+            )
+            self.results.append(completed)
+            reaped.append(completed)
+            if rc == 0:
+                self._emit(
+                    f"Drive {drive_key} PUBLISHED {rip.volume} "
+                    f"(finalization complete, exit 0, {fmt_dur(elapsed)})"
+                )
+                self._safe_notify(
+                    f":white_check_mark: *Watch publication complete* — `{self.config.show}` "
+                    f"S{self.config.season:02d} `{rip.volume}` (E{rip.episode_start}+, "
+                    f"drive `{drive_key}`, verified & published to NAS, {fmt_dur(elapsed)})."
+                )
+            else:
+                self._emit(
+                    f"Drive {drive_key} FINALIZE FAILED {rip.volume} "
+                    f"(exit {rc}, {fmt_dur(elapsed)}, log: {rip.log_path}) — "
+                    f"staged files preserved; check log before retrying"
+                )
+                self._safe_notify(
+                    f":x: *Watch finalization FAILED* — `{self.config.show}` "
                     f"S{self.config.season:02d} `{rip.volume}` (exit {rc}, "
                     f"drive `{drive_key}`, log: `{rip.log_path.name}`)."
                 )
@@ -749,10 +1522,10 @@ class BoxSetWatcher:
         return candidates
 
     def _known_active_processes(self) -> list[dict[str, Any]]:
-        """Build active-process list combining our live children, sibling watchers, and external ripqueue procs."""
+        """Build active-process list combining optical-active, finalizing, sibling, and external procs."""
         procs: list[dict[str, Any]] = []
         seen_pids: set[int] = set()
-        for rip in self.active_procs.values():
+        for rip in (*self.active_procs.values(), *self.finalizing_procs):
             pid = getattr(rip.proc, "pid", None)
             if isinstance(pid, int) and pid > 0 and rip.proc.poll() is None:
                 seen_pids.add(pid)
@@ -882,7 +1655,14 @@ class BoxSetWatcher:
         drive_serial = str(drive_row.get("serial") or "").strip()
         device_node = str(drive_row.get("device_node") or "").strip()
         disc_index = int(drive_row.get("index", 0))
-        drutil_drive = disc_index + 1
+        raw_drutil = drive_row.get("drutil_drive")
+        drutil_drive = (
+            int(raw_drutil)
+            if isinstance(raw_drutil, int)
+            and not isinstance(raw_drutil, bool)
+            and raw_drutil >= 1
+            else disc_index + 1
+        )
         raw_vol = str(drive_row.get("volume") or "").strip()
 
         matched_intent, intent_reason = volume_matches_show_intent(
@@ -903,10 +1683,14 @@ class BoxSetWatcher:
         volume = raw_vol
         skey = self._season_key()
         with _watch_season_lock(self.config.work_dir, skey):
-            # Guard against two independent watchers launching the same physical drive.
+            # Guard against two independent watchers launching the same physical drive
+            # while an optical rip still owns it (released/finalizing rips do not occupy the drive).
             with _WATCHER_REGISTRY_LOCK:
                 already_active_drive = any(
-                    r.drive_key == drive_key and r.proc.poll() is None
+                    r.drive_key == drive_key
+                    and r.proc.poll() is None
+                    and not r.drive_released
+                    and not is_state_drive_released(r.state_path)
                     for r in _LIVE_WATCHER_RIPS.get(skey, [])
                 )
             if already_active_drive:
@@ -1143,9 +1927,14 @@ class BoxSetWatcher:
         return rip
 
     def poll_once(self) -> list[ActiveRip]:
-        """Run one poll-reap-launch tick; return newly launched rips."""
+        """Run one poll-reap-release-launch tick; return newly launched rips."""
         self.reap_finished()
+        self.release_drives()
         drives = self._list_drives_fn()
+        if drives:
+            self._record_topology(drives)
+        self.release_drives()
+        self._confirm_tray_ready(drives)
         if drives:
             self._update_handled_guard(drives)
 
@@ -1171,6 +1960,7 @@ class BoxSetWatcher:
             self.config.max_discs > 0
             and self._launched_count >= self.config.max_discs
             and not self.active_procs
+            and not self.finalizing_procs
         )
 
     def run(self) -> WatchSummary:
@@ -1220,17 +2010,26 @@ class BoxSetWatcher:
 
         if self._stop_requested and not self._reached_max_and_idle():
             stopped_by_signal = True
-            # Final non-blocking reap before reporting active PIDs.
+            # Final non-blocking reap + release check before reporting active PIDs.
             self.reap_finished()
-            if self.active_procs:
+            self.release_drives()
+            all_live = list(self.active_procs.values()) + list(self.finalizing_procs)
+            if all_live:
                 self._emit(
                     f"Stopping watch mode (no new discs will start). "
-                    f"{len(self.active_procs)} active rip(s) left running safely:"
+                    f"{len(all_live)} active rip(s) left running safely "
+                    f"({len(self.active_procs)} optical, {len(self.finalizing_procs)} finalizing):"
                 )
                 for rip in self.active_procs.values():
                     pid_s = getattr(rip.proc, "pid", "?")
                     self._emit(
-                        f"  pid {pid_s}  Drive {rip.drive_key} ({rip.device_node})  "
+                        f"  pid {pid_s}  [optical]     Drive {rip.drive_key} ({rip.device_node})  "
+                        f"{rip.volume} -> E{rip.episode_start}+  log: {rip.log_path}"
+                    )
+                for rip in self.finalizing_procs:
+                    pid_s = getattr(rip.proc, "pid", "?")
+                    self._emit(
+                        f"  pid {pid_s}  [finalizing]  Drive {rip.drive_key} ({rip.device_node})  "
                         f"{rip.volume} -> E{rip.episode_start}+  log: {rip.log_path}"
                     )
             else:
@@ -1250,6 +2049,7 @@ class BoxSetWatcher:
             succeeded=succeeded,
             failed=failed,
             stopped_by_signal=stopped_by_signal,
-            active_at_exit=list(self.active_procs.values()),
+            active_at_exit=list(self.active_procs.values()) + list(self.finalizing_procs),
+            finalizing_at_exit=list(self.finalizing_procs),
             results=list(self.results),
         )
