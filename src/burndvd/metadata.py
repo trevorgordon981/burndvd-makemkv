@@ -762,7 +762,6 @@ def compute_next_tv_episode(
             scan_season_existing_episodes(season_dir, int(season))
         )
         nas_highest = existing_episodes[-1] if existing_episodes else 0
-        next_ep = nas_highest + 1
         reservations: list[dict] = []
         seen_pids: set[int] = set()
         pending_scan_pids: list[int] = []
@@ -813,7 +812,6 @@ def compute_next_tv_episode(
                                 "source": "slot",
                             }
                         )
-                        next_ep = max(next_ep, ep_start + ep_count)
 
         excluded_pids = _self_and_ancestor_pids() if active_processes is None else {os.getpid()}
         excl_state = os.path.realpath(exclude_state_file) if exclude_state_file else ""
@@ -889,7 +887,6 @@ def compute_next_tv_episode(
                         "source": source,
                     }
                 )
-                next_ep = max(next_ep, ep_start + ep_count)
             else:
                 pending_scan_pids.append(pid)
                 pending_plans.append(
@@ -900,9 +897,22 @@ def compute_next_tv_episode(
                     }
                 )
 
+        occupied: set[int] = set(existing_episodes)
+        for r in reservations:
+            occupied.update(range(r["episode_start"], r["episode_end"] + 1))
+        if not occupied:
+            next_ep = 1
+        else:
+            cand = min(occupied)
+            while cand in occupied:
+                cand += 1
+            next_ep = cand
+        gap_fill = bool(nas_highest > 0 and next_ep <= nas_highest)
+
         result = {
             "next_episode": next_ep,
             "nas_highest": nas_highest,
+            "gap_fill": gap_fill,
             "existing_episodes": existing_episodes,
             "reservations": reservations,
             "pending_scan_pids": pending_scan_pids,

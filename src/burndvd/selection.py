@@ -924,6 +924,126 @@ def _intra_episode_shape_ratio(marks: list[float], stride: int) -> float:
     return ratios[len(ratios) // 2]
 
 
+PLAYALL_VAR_SPREAD_TOL_S = 180.0
+PLAYALL_VAR_MAX_CH_DIFF = 2
+PLAYALL_TRAILING_CELL_MAX_S = 30.0
+
+
+def _playall_variable_chapter_plan(marks: list[float], total: float):
+    """Find uneven-chapter episode boundaries (e.g. 7/6/7/7 chapters) via exact DP.
+
+    Fail-closed: requires >=2 chapters per episode, chapter-count spread <=2 across
+    episodes, median intra-episode chapter shape ratio >= PLAYALL_MIN_SHAPE_RATIO,
+    every episode within [PLAYALL_EP_MIN_S, PLAYALL_EP_MAX_S], and tight episode
+    length spread (<= min(PLAYALL_SPREAD_TOL_S, PLAYALL_VAR_SPREAD_TOL_S)).
+    Returns `(spread, 0, edges, lens)` or `None`.
+    """
+    if total < PLAYALL_MIN_TOTAL_S or len(marks) < 4:
+        return None
+    clean: list[float] = []
+    for raw in sorted(float(x) for x in marks):
+        if raw < 0.0 or raw >= total - PLAYALL_TRAILING_CELL_MAX_S:
+            continue
+        if not clean or raw - clean[-1] > 1.0:
+            clean.append(raw)
+    if not clean:
+        return None
+    if clean[0] > 1.0:
+        clean.insert(0, 0.0)
+    else:
+        clean[0] = 0.0
+    pts = clean + [float(total)]
+    k = len(pts) - 1  # number of chapters
+    max_eps = min(12, int(total // PLAYALL_EP_MIN_S))
+    spread_limit = min(PLAYALL_SPREAD_TOL_S, PLAYALL_VAR_SPREAD_TOL_S)
+    best = None  # (spread, sse, edges, lens)
+
+    for n in range(2, max_eps + 1):
+        target = total / n
+        if target < PLAYALL_EP_MIN_S or target > PLAYALL_EP_MAX_S:
+            continue
+        if k < 2 * n:
+            continue
+        # dp[j][idx] = (min_sse, prev_idx) for partitioning pts[0..idx] into j episodes
+        dp: list[dict[int, tuple[float, int]]] = [{0: (0.0, -1)}]
+        for ep_idx in range(1, n + 1):
+            prev_layer = dp[-1]
+            cur_layer: dict[int, tuple[float, int]] = {}
+            rem_eps = n - ep_idx
+            min_end = 2 * ep_idx
+            max_end = k if rem_eps == 0 else k - 2 * rem_eps
+            for prev_i, (prev_cost, _back) in prev_layer.items():
+                lo = max(min_end, prev_i + 2)
+                hi = min(max_end, prev_i + PLAYALL_MAX_STRIDE)
+                if rem_eps == 0:
+                    candidates = (k,) if lo <= k <= hi else ()
+                else:
+                    candidates = range(lo, hi + 1)
+                for cur_i in candidates:
+                    seg_len = pts[cur_i] - pts[prev_i]
+                    if seg_len < PLAYALL_EP_MIN_S or seg_len > PLAYALL_EP_MAX_S:
+                        continue
+                    diff = seg_len - target
+                    if abs(diff) > spread_limit:
+                        continue
+                    cost = prev_cost + diff * diff
+                    old = cur_layer.get(cur_i)
+                    if old is None or cost < old[0]:
+                        cur_layer[cur_i] = (cost, prev_i)
+            if not cur_layer:
+                break
+            dp.append(cur_layer)
+
+        if len(dp) != n + 1 or k not in dp[n]:
+            continue
+
+        # Backtrack chapter indices
+        idxs = [k]
+        cur = k
+        for ep_idx in range(n, 0, -1):
+            _cost, prev_i = dp[ep_idx][cur]
+            idxs.append(prev_i)
+            cur = prev_i
+        idxs.reverse()
+
+        ch_counts = [idxs[i + 1] - idxs[i] for i in range(n)]
+        if max(ch_counts) - min(ch_counts) > PLAYALL_VAR_MAX_CH_DIFF:
+            continue
+
+        edges = [pts[i] for i in idxs]
+        lens = [edges[i + 1] - edges[i] for i in range(n)]
+        spread = max(lens) - min(lens)
+        if spread > spread_limit:
+            continue
+
+        # Require authentic non-uniform intra-episode chapter rhythm (e.g. OP/ED/acts)
+        ratios: list[float] = []
+        for i in range(n):
+            seg_marks = pts[idxs[i] : idxs[i + 1] + 1]
+            gaps = [
+                seg_marks[j + 1] - seg_marks[j]
+                for j in range(len(seg_marks) - 1)
+                if seg_marks[j + 1] - seg_marks[j] > 0
+            ]
+            if len(gaps) >= 2:
+                ratios.append(max(gaps) / min(gaps))
+        if len(ratios) < n:
+            continue
+        ratios.sort()
+        if ratios[len(ratios) // 2] < PLAYALL_MIN_SHAPE_RATIO:
+            continue
+
+        sse = dp[n][k][0]
+        cand = (spread, sse, edges, lens)
+        if best is None or (cand[0], cand[1]) < (best[0], best[1]):
+            best = cand
+
+    if best is None:
+        return None
+    spread, _sse, edges, lens = best
+    return (spread, 0, edges, lens)
+
+
 def _playall_plan(marks: list[float], total: float):
     best = None
     for stride in range(2, PLAYALL_MAX_STRIDE + 1):
@@ -946,7 +1066,9 @@ def _playall_plan(marks: list[float], total: float):
             continue
         if best is None or spread < best[0]:
             best = (spread, stride, edges, lens)
-    return best
+    if best is not None:
+        return best
+    return _playall_variable_chapter_plan(marks, total)
 
 
 def estimate_playall_episode_count(
@@ -1037,9 +1159,10 @@ def split_chaptered_playall(args, rips: list[Path], staging: Path) -> list[Path]
         return rips
     spread, stride, edges, lens = plan
     n = len(lens)
+    stride_desc = f"every {stride}th mark" if stride > 0 else "variable chapter marks"
     print(
         f"{C.B}  Play-all detected: {fmt_dur(total)}, {len(marks)} chapters → "
-        f"{n} episodes at every {stride}th mark "
+        f"{n} episodes at {stride_desc} "
         f"(lengths {min(lens)/60:.1f}–{max(lens)/60:.1f}m).{C.R}",
         flush=True,
     )
@@ -1093,5 +1216,6 @@ def split_chaptered_playall(args, rips: list[Path], staging: Path) -> list[Path]
             flush=True,
         )
 
-    append_log(args, f"PLAYALL_SPLIT {src.name} → {n} episodes at stride {stride}")
+    stride_log = f"stride {stride}" if stride > 0 else "variable chapters"
+    append_log(args, f"PLAYALL_SPLIT {src.name} → {n} episodes ({stride_log})")
     return [q for p in rips for q in (out if p == src else [p])]

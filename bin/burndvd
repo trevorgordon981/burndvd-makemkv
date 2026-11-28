@@ -1345,26 +1345,35 @@ print(d["episode_start"], d["expected_disc_episodes"], d["expected_episodes"], d
 d=json.load(sys.stdin)
 ne=int(d.get("next_episode") or 1)
 nh=int(d.get("nas_highest") or 0)
+gap=bool(d.get("gap_fill"))
 res=d.get("reservations") or []
 parts=[]
-if nh > 0:
+if gap and nh > 0:
+    parts.append(f"first missing gap before NAS highest E{nh:02d}")
+elif nh > 0:
     parts.append(f"NAS ends at E{nh:02d}")
 for r in res:
     parts.append("active rip pid %s reserving %s ep(s): E%02d-E%02d" % (r["pid"], r["episode_count"], r["episode_start"], r["episode_end"]))
-note = " + ".join(parts) if res else ""
+note = " + ".join(parts) if (res or gap) else ""
 print(f"{ne}\t{note}")' 2>/dev/null || printf '1\t\n')
                 if [ -n "${AUTO_EP_NOTE:-}" ]; then
                     printf '\033[32mAuto episode start: %s (%s)\033[0m\n' "$DEFAULT_EP" "$AUTO_EP_NOTE"
                 fi
             elif [ -d "$SCAN_SEASON_DIR" ]; then
-                HIGHEST_EP=$( (find "$SCAN_SEASON_DIR" -maxdepth 1 -type f -size +0 \
+                DEFAULT_EP=$( (find "$SCAN_SEASON_DIR" -maxdepth 1 -type f -size +0 \
                     -name '*.mkv' -print 2>/dev/null \
                     | grep -oE "S0*${SEASON}E[0-9]+" \
                     | grep -oE 'E[0-9]+' | tr -d 'E' \
-                    | sort -n | tail -1) || true )
-                if [ -n "$HIGHEST_EP" ]; then
-                    DEFAULT_EP=$(( 10#$HIGHEST_EP + 1 ))
-                fi
+                    | python3 -c 'import sys
+eps=sorted({int(line.strip()) for line in sys.stdin if line.strip().isdigit() and int(line.strip()) > 0})
+if not eps:
+    print(1)
+else:
+    occ=set(eps)
+    cand=eps[0]
+    while cand in occ:
+        cand += 1
+    print(cand)') || printf '1\n' )
             fi
         fi
 
