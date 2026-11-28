@@ -544,7 +544,7 @@ claim_is_active() {
 BUSY_DEVS=$( { for p in $(pgrep -f makemkvcon 2>/dev/null || true); do lsof -p "$p" 2>/dev/null | grep -oE '/dev/r?disk[0-9]+' || true; done | grep -oE 'disk[0-9]+' | sort -u; } || true )
 
 ENUM_ROWS=$(python3 - "${MAKEMKVCON_BIN:-}" "$DRIVE_CLAIM_DIR" "${BUSY_DEVS:-}" <<'PY'
-import csv, json, os, re, subprocess, sys
+import csv, json, os, queue, re, subprocess, sys, threading, time
 from pathlib import Path
 
 mkv_bin = (sys.argv[1] or "").strip()
@@ -855,7 +855,153 @@ if unmatched_mkv:
         mkv_rows.append((dev, str(idx), ix, serial, dtype, vol, "1" if is_busy else "0"))
 
 SEP = "\x1f"
+topo_path = (Path(claim_dir_arg).parent / "drive-topology.json") if claim_dir_arg else None
+
+def load_drutil_topology():
+    if not topo_path or not topo_path.is_file():
+        return {}
+    try:
+        data = json.loads(topo_path.read_text(encoding="utf-8"))
+        m = data.get("drutil_to_serial")
+        return {str(k): str(v) for k, v in m.items() if k and v} if isinstance(m, dict) else {}
+    except Exception:
+        return {}
+
+def save_drutil_topology(rows):
+    if not topo_path:
+        return
+    mapping = load_drutil_topology()
+    changed = False
+    for _dev, _discN, ix, serial, _dtype, _vol, _busy in rows:
+        if ix and serial and mapping.get(str(ix)) != serial:
+            mapping[str(ix)] = serial
+            changed = True
+    if not changed:
+        return
+    try:
+        topo_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = topo_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"drutil_to_serial": mapping}, indent=2), encoding="utf-8")
+        os.replace(tmp, topo_path)
+    except Exception:
+        pass
+
+def probe_free_slot(slot_idx, timeout_s=15.0):
+    if not mkv_bin:
+        return ("unknown", "", "")
+    try:
+        proc = subprocess.Popen(
+            [mkv_bin, "-r", "--noscan", "--cache=128", "--minlength=36000", "info", f"disc:{slot_idx}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception:
+        return ("unknown", "", "")
+    q = queue.Queue()
+    def _reader():
+        try:
+            for line in proc.stdout:
+                q.put(("line", line))
+        finally:
+            q.put(("eof", ""))
+    threading.Thread(target=_reader, daemon=True).start()
+    deadline = time.monotonic() + timeout_s
+    slot_serial = ""
+    vol = ""
+    saw_mkv_output = False
+    status = None
+    loaded_grace_deadline = None
+    try:
+        while True:
+            now = time.monotonic()
+            limit = deadline if loaded_grace_deadline is None else min(deadline, loaded_grace_deadline)
+            rem = limit - now
+            if rem <= 0:
+                if status is None and saw_mkv_output:
+                    status = "loaded"
+                break
+            try:
+                kind, payload = q.get(timeout=min(0.25, rem))
+            except queue.Empty:
+                continue
+            if kind == "eof":
+                break
+            line = payload.strip()
+            if not line:
+                continue
+            if line.startswith(("DRV:", "MSG:", "CINFO:", "TINFO:")):
+                saw_mkv_output = True
+            if line.startswith("DRV:"):
+                parsed = parse_drv_line(line)
+                if parsed and parsed[0] == slot_idx and parsed[3]:
+                    slot_serial = parsed[3]
+            elif line.startswith("CINFO:"):
+                m = re.match(r'^CINFO:2,\d+,"([^"]*)"', line)
+                if m and m.group(1):
+                    vol = m.group(1).strip()
+                status = "loaded"
+                break
+            elif line.startswith(("MSG:3007", "MSG:3307", "MSG:3006", "MSG:3028")):
+                status = "loaded"
+                if loaded_grace_deadline is None:
+                    loaded_grace_deadline = time.monotonic() + 0.25
+            elif line.startswith("MSG:5010") or re.search(r"TRAY OPEN|MEDIUM NOT PRESENT", line, re.IGNORECASE):
+                if status != "loaded":
+                    status = "empty"
+                break
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+    if status is None:
+        status = "unknown"
+    return (status, slot_serial, vol)
+
+def pair_avail_with_slots(avail_items, slot_entries, drutil_to_serial):
+    rem_items = list(avail_items)
+    rem_slots = list(slot_entries)
+    item_vols = {it[2]: vol_for_dev(it[2]) for it in rem_items}
+    paired = []
+
+    # 1. Exact volume match when CINFO:2 returned a volume label.
+    for slot in list(rem_slots):
+        k, ser, svol = slot
+        if not svol:
+            continue
+        hits = [it for it in rem_items if item_vols.get(it[2], "").casefold() == svol.casefold()]
+        if len(hits) == 1:
+            paired.append((hits[0], slot))
+            rem_items.remove(hits[0])
+            rem_slots.remove(slot)
+
+    # 2. Cached drutil -> hardware serial topology match.
+    for slot in list(rem_slots):
+        k, ser, svol = slot
+        if not ser:
+            continue
+        hits = [it for it in rem_items if drutil_to_serial.get(str(it[3]), "").casefold() == ser.casefold()]
+        if len(hits) == 1:
+            paired.append((hits[0], slot))
+            rem_items.remove(hits[0])
+            rem_slots.remove(slot)
+
+    # 3. Remaining drives paired deterministically across confirmed-loaded slots.
+    for it, slot in zip(rem_items, rem_slots):
+        paired.append((it, slot))
+    paired.sort(key=lambda p: (p[0][0], p[0][1]))
+    return paired
+
 if mkv_rows:
+    save_drutil_topology(mkv_rows)
     for row in mkv_rows:
         print(SEP.join(field.replace(SEP, " ") for field in row))
 else:
@@ -873,26 +1019,59 @@ else:
             print(SEP.join((dev, "", ix, "", dtype, "", "1")))
         else:
             avail_drutil.append(item)
-    if busy_discs:
-        total_slots = max(len(all_drutil_indices), len(drutil_loaded), max(busy_discs) + 1)
-        free_slots = [k for k in range(total_slots) if k not in busy_discs]
-        if not free_slots:
-            sys.stderr.write(
-                "burndvd: MakeMKV drive enumeration unavailable and all detected disc slots "
-                f"({sorted(busy_discs)}) are busy/claimed; refusing unsafe fallback.\n"
-            )
-        elif len(avail_drutil) <= len(free_slots):
+    total_slots = max(
+        len(all_drutil_indices),
+        len(drutil_loaded),
+        (max(busy_discs) + 1) if busy_discs else 0,
+    )
+    free_slots = [k for k in range(total_slots) if k not in busy_discs]
+    if busy_discs and not free_slots:
+        sys.stderr.write(
+            "burndvd: MakeMKV drive enumeration unavailable and all detected disc slots "
+            f"({sorted(busy_discs)}) are busy/claimed; refusing unsafe fallback.\n"
+        )
+    elif len(avail_drutil) > len(free_slots):
+        sys.stderr.write(
+            "burndvd: MakeMKV drive enumeration unavailable while disc slot(s) "
+            f"{sorted(busy_discs)} are busy and {len(avail_drutil)} loaded drive(s) remain "
+            "unattributed; refusing to guess and risk clobbering the active rip.\n"
+        )
+    elif avail_drutil:
+        need_probe = bool(mkv_bin) and (len(free_slots) > len(avail_drutil) or len(avail_drutil) >= 2)
+        if need_probe:
+            loaded_slots = []
+            empty_slots = []
+            unknown_slots = []
+            for k in free_slots:
+                st, ser, svol = probe_free_slot(k)
+                if st == "loaded":
+                    loaded_slots.append((k, ser, svol))
+                    if len(avail_drutil) == 1:
+                        break
+                elif st == "empty":
+                    empty_slots.append(k)
+                else:
+                    unknown_slots.append((k, ser, svol))
+            if loaded_slots:
+                drutil_to_serial = load_drutil_topology()
+                for (_, _, dev, ix, dtype), (slot_idx, ser, svol) in pair_avail_with_slots(
+                    avail_drutil, loaded_slots, drutil_to_serial
+                ):
+                    print(SEP.join((dev, str(slot_idx), ix, ser, dtype, svol, "0")))
+            elif empty_slots and not unknown_slots:
+                pass
+            elif len(avail_drutil) == len(free_slots):
+                for slot_idx, (_, _, dev, ix, dtype) in zip(free_slots, avail_drutil):
+                    print(SEP.join((dev, str(slot_idx), ix, "", dtype, "", "0")))
+            else:
+                sys.stderr.write(
+                    "burndvd: MakeMKV drive enumeration unavailable and free disc slot(s) "
+                    f"{free_slots} could not be probed to locate the {len(avail_drutil)} loaded drive(s); "
+                    "refusing to guess an empty slot.\n"
+                )
+        else:
             for slot_idx, (_, _, dev, ix, dtype) in zip(free_slots, avail_drutil):
                 print(SEP.join((dev, str(slot_idx), ix, "", dtype, "", "0")))
-        else:
-            sys.stderr.write(
-                "burndvd: MakeMKV drive enumeration unavailable while disc slot(s) "
-                f"{sorted(busy_discs)} are busy and {len(avail_drutil)} loaded drive(s) remain "
-                "unattributed; refusing to guess and risk clobbering the active rip.\n"
-            )
-    else:
-        for rank, (_, _, dev, ix, dtype) in enumerate(avail_drutil):
-            print(SEP.join((dev, str(rank), ix, "", dtype, "", "0")))
 PY
 )
 

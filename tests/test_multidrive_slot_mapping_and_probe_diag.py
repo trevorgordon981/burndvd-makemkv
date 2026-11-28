@@ -532,6 +532,299 @@ exit 0
             self.assertFalse(capture.exists(), "ripqueue must not be launched when all slots are busy")
             self.assertIn("refusing unsafe fallback", res.stderr)
 
+    def test_wrapper_3drive_fallback_skips_empty_disc1_and_finds_full_disc2(self):
+        """Exact live 3-drive repro: disc:0 (/dev/disk6, drutil 3) is ripping BS4_D11,
+        disc:1 (drutil 2) is EMPTY, disc:2 (/dev/disk5, drutil 1) has BS4_D12.
+        When makemkvcon info list fails, wrapper probes free slots [1, 2] with --noscan,
+        skips empty disc:1 (MSG:5010), finds full disc:2 (MSG:3007), and launches on disc:2."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claim_dir = root / ".cache" / "burndvd" / "drive-claims"
+            busy_claim = claim_dir / "serial-MOEQ41G4438.claim"
+            busy_claim.mkdir(parents=True)
+            sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+            try:
+                (busy_claim / "pid").write_text(str(sleeper.pid), encoding="utf-8")
+                (busy_claim / "dev").write_text("/dev/disk6", encoding="utf-8")
+                (busy_claim / "disc").write_text("0", encoding="utf-8")
+                (busy_claim / "state").write_text(str(root / "d11.state.json"), encoding="utf-8")
+
+                drutil_3 = """#!/bin/bash
+if [ "$1" = "list" ]; then
+    echo "   Vendor   Product           Rev   Bus       SupportLevel"
+    echo "1  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "2  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "3  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    exit 0
+fi
+if [ "$1" = "status" ] && [ "$2" = "-drive" ]; then
+    case "$3" in
+        1) echo "Type: DVD-ROM   Name: /dev/disk5" ;;
+        2) echo "Type: No Media Inserted" ;;
+        3) echo "Type: DVD-ROM   Name: /dev/disk6" ;;
+    esac
+    exit 0
+fi
+exit 0
+"""
+                diskutil_3 = """#!/bin/bash
+case "$2" in
+    /dev/disk5) echo "   Volume Name:               NarutoShippuden_BS4_D12" ;;
+    /dev/disk6) echo "   Volume Name:               NarutoShippuden_BS4_D11" ;;
+esac
+exit 0
+"""
+                # info list fails (simulating timeout while disc:0 rips);
+                # --noscan info disc:1 returns empty (MSG:5010);
+                # --noscan info disc:2 returns loaded (DRV:2 + MSG:3007).
+                mkv_3 = """#!/bin/bash
+case "$*" in
+    *"info list"*)
+        exit 1
+        ;;
+    *"info disc:1"*)
+        echo 'DRV:0,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MOEQ41G4438","",""'
+        echo 'DRV:1,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MOBP8JD4640","",""'
+        echo 'DRV:2,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MO8Q4283637","",""'
+        echo 'MSG:5010,0,0,"Failed to open disc","Failed to open disc"'
+        exit 0
+        ;;
+    *"info disc:2"*)
+        echo 'DRV:0,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MOEQ41G4438","",""'
+        echo 'DRV:1,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MOBP8JD4640","",""'
+        echo 'DRV:2,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MO8Q4283637","",""'
+        echo 'MSG:3007,0,0,"Using direct disc access mode","Using direct disc access mode"'
+        sleep 2
+        exit 0
+        ;;
+esac
+exit 1
+"""
+                ps_3 = f"""#!/bin/bash
+if [ "$1" = "-Ao" ]; then
+    echo "  {sleeper.pid} python3 /u/ripqueue.py --state {root / 'd11.state.json'} --device disc:0"
+    echo "  55555 makemkvcon -r mkv disc:0 0 /tmp/stage0"
+    exit 0
+fi
+exit 0
+"""
+                env, capture = _build_wrapper_env(
+                    root,
+                    makemkv_script=mkv_3,
+                    drutil_script=drutil_3,
+                    diskutil_script=diskutil_3,
+                    ps_script=ps_3,
+                )
+                res = subprocess.run(
+                    [str(WRAPPER)],
+                    input="Naruto Shippuden\ntv-season\nDVD\n1\n49\n",
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(res.returncode, 0, f"stdout={res.stdout}\nstderr={res.stderr}")
+                self.assertNotIn("Multiple drives have discs inserted", res.stdout)
+                cap = json.loads(capture.read_text(encoding="utf-8"))
+                self.assertEqual(cap["BURNDVD_DRIVE_DEVICE"], "/dev/disk5")
+                self.assertEqual(cap["BURNDVD_DRIVE_SERIAL"], "MO8Q4283637")
+                self.assertEqual(cap["BURNDVD_DRUTIL_DRIVE"], "1")
+                dev_idx = cap["argv"].index("--device") + 1
+                self.assertEqual(cap["argv"][dev_idx], "disc:2")
+            finally:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_wrapper_3drive_fallback_prompts_choice_when_multiple_free_drives_full(self):
+        """When disc:0 is busy and BOTH disc:1 and disc:2 have discs inserted while
+        makemkvcon info list fails, wrapper MUST present the multi-drive selection menu
+        and bind the chosen drive to its exact disc:K slot using cached topology."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_dir = root / ".cache" / "burndvd"
+            claim_dir = cache_dir / "drive-claims"
+            busy_claim = claim_dir / "serial-MOEQ41G4438.claim"
+            busy_claim.mkdir(parents=True)
+            # Pre-seed drive-topology.json as populated by an earlier info list run.
+            (cache_dir / "drive-topology.json").write_text(
+                json.dumps(
+                    {
+                        "drutil_to_serial": {
+                            "1": "MO8Q4283637",
+                            "2": "MOBP8JD4640",
+                            "3": "MOEQ41G4438",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+            try:
+                (busy_claim / "pid").write_text(str(sleeper.pid), encoding="utf-8")
+                (busy_claim / "dev").write_text("/dev/disk6", encoding="utf-8")
+                (busy_claim / "disc").write_text("0", encoding="utf-8")
+                (busy_claim / "state").write_text(str(root / "d11.state.json"), encoding="utf-8")
+
+                drutil_3 = """#!/bin/bash
+if [ "$1" = "list" ]; then
+    echo "   Vendor   Product           Rev   Bus       SupportLevel"
+    echo "1  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "2  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "3  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    exit 0
+fi
+if [ "$1" = "status" ] && [ "$2" = "-drive" ]; then
+    case "$3" in
+        1) echo "Type: DVD-ROM   Name: /dev/disk5" ;;
+        2) echo "Type: DVD-ROM   Name: /dev/disk7" ;;
+        3) echo "Type: DVD-ROM   Name: /dev/disk6" ;;
+    esac
+    exit 0
+fi
+exit 0
+"""
+                diskutil_3 = """#!/bin/bash
+case "$2" in
+    /dev/disk5) echo "   Volume Name:               NarutoShippuden_BS4_D12" ;;
+    /dev/disk6) echo "   Volume Name:               NarutoShippuden_BS4_D11" ;;
+    /dev/disk7) echo "   Volume Name:               NarutoShippuden_BS2_D6" ;;
+esac
+exit 0
+"""
+                mkv_3 = """#!/bin/bash
+case "$*" in
+    *"info list"*)
+        exit 1
+        ;;
+    *"info disc:1"*)
+        echo 'DRV:1,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MOBP8JD4640","",""'
+        echo 'MSG:3007,0,0,"Using direct disc access mode","Using direct disc access mode"'
+        sleep 2
+        exit 0
+        ;;
+    *"info disc:2"*)
+        echo 'DRV:2,0,999,0,"BD-RE HL-DT-ST BD-RE BU40N 1.03 MO8Q4283637","",""'
+        echo 'MSG:3007,0,0,"Using direct disc access mode","Using direct disc access mode"'
+        sleep 2
+        exit 0
+        ;;
+esac
+exit 1
+"""
+                ps_3 = f"""#!/bin/bash
+if [ "$1" = "-Ao" ]; then
+    echo "  {sleeper.pid} python3 /u/ripqueue.py --state {root / 'd11.state.json'} --device disc:0"
+    echo "  55555 makemkvcon -r mkv disc:0 0 /tmp/stage0"
+    exit 0
+fi
+exit 0
+"""
+                env, capture = _build_wrapper_env(
+                    root,
+                    makemkv_script=mkv_3,
+                    drutil_script=drutil_3,
+                    diskutil_script=diskutil_3,
+                    ps_script=ps_3,
+                )
+                # User chooses [2] (/dev/disk7 = MOBP8JD4640 = disc:1 = BS2_D6).
+                res = subprocess.run(
+                    [str(WRAPPER)],
+                    input="2\nNaruto Shippuden\ntv-season\nDVD\n1\n22\n",
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertEqual(res.returncode, 0, f"stdout={res.stdout}\nstderr={res.stderr}")
+                self.assertIn("Multiple drives have discs inserted:", res.stdout)
+                self.assertIn("NarutoShippuden_BS4_D12", res.stdout)
+                self.assertIn("NarutoShippuden_BS2_D6", res.stdout)
+                cap = json.loads(capture.read_text(encoding="utf-8"))
+                self.assertEqual(cap["BURNDVD_DRIVE_DEVICE"], "/dev/disk7")
+                self.assertEqual(cap["BURNDVD_DRIVE_SERIAL"], "MOBP8JD4640")
+                self.assertEqual(cap["BURNDVD_DRUTIL_DRIVE"], "2")
+                dev_idx = cap["argv"].index("--device") + 1
+                self.assertEqual(cap["argv"][dev_idx], "disc:1")
+            finally:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
+    def test_wrapper_3drive_fallback_refuses_when_all_free_slots_empty(self):
+        """If every free disc:K slot reports MSG:5010 empty, never launch ripqueue on an empty slot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claim_dir = root / ".cache" / "burndvd" / "drive-claims"
+            busy_claim = claim_dir / "serial-MOEQ41G4438.claim"
+            busy_claim.mkdir(parents=True)
+            sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
+            try:
+                (busy_claim / "pid").write_text(str(sleeper.pid), encoding="utf-8")
+                (busy_claim / "dev").write_text("/dev/disk6", encoding="utf-8")
+                (busy_claim / "disc").write_text("0", encoding="utf-8")
+                (busy_claim / "state").write_text(str(root / "d11.state.json"), encoding="utf-8")
+
+                drutil_3 = """#!/bin/bash
+if [ "$1" = "list" ]; then
+    echo "   Vendor   Product           Rev   Bus       SupportLevel"
+    echo "1  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "2  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    echo "3  HL-DT-ST BD-RE BU40N       1.03  USB       Unsupported"
+    exit 0
+fi
+if [ "$1" = "status" ] && [ "$2" = "-drive" ]; then
+    case "$3" in
+        1) echo "Type: DVD-ROM   Name: /dev/disk5" ;;
+        2) echo "Type: No Media Inserted" ;;
+        3) echo "Type: DVD-ROM   Name: /dev/disk6" ;;
+    esac
+    exit 0
+fi
+exit 0
+"""
+                diskutil_3 = """#!/bin/bash
+echo "   Volume Name:               NarutoShippuden_BS4_D12"
+exit 0
+"""
+                mkv_empty = """#!/bin/bash
+case "$*" in
+    *"info list"*) exit 1 ;;
+    *"info disc:"*)
+        echo 'MSG:5010,0,0,"Failed to open disc","Failed to open disc"'
+        exit 0
+        ;;
+esac
+exit 1
+"""
+                ps_3 = f"""#!/bin/bash
+if [ "$1" = "-Ao" ]; then
+    echo "  {sleeper.pid} python3 /u/ripqueue.py --state {root / 'd11.state.json'} --device disc:0"
+    echo "  55555 makemkvcon -r mkv disc:0 0 /tmp/stage0"
+    exit 0
+fi
+exit 0
+"""
+                env, capture = _build_wrapper_env(
+                    root,
+                    makemkv_script=mkv_empty,
+                    drutil_script=drutil_3,
+                    diskutil_script=diskutil_3,
+                    ps_script=ps_3,
+                )
+                res = subprocess.run(
+                    [str(WRAPPER)],
+                    input="",
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                self.assertNotEqual(res.returncode, 0)
+                self.assertFalse(capture.exists())
+                self.assertIn("no available drive", res.stderr)
+            finally:
+                sleeper.terminate()
+                sleeper.wait(timeout=5)
+
 
 class TestProbeDiscDiagnosticSurfacing(unittest.TestCase):
     def test_probe_disc_surfaces_msg2003_tray_open_and_msg5010_instead_of_silent_swallow(self):
