@@ -31,6 +31,7 @@ from burndvd.drive import (
     append_log,
     disc_present,
     disc_slot_lock,
+    invalidate_resolved_device_cache,
     resolve_makemkv_device,
     unmount_blocking_volume,
 )
@@ -222,7 +223,7 @@ def titles_from_info(info: dict) -> list[TitleInfo]:
     return result
 
 
-def probe_disc(args) -> dict | None:
+def probe_disc(args, *, force_refresh: bool = False) -> dict | None:
     """Run `makemkvcon -r --minlength=... info` with stall watchdog and unmount recovery."""
     target_drive_idx = _drive_idx_from_args(args)
     want_drv_idx = target_drive_idx if target_drive_idx is not None else 0
@@ -369,8 +370,13 @@ def probe_disc(args) -> dict | None:
         return (cinfo, titles, msgs), msg_codes, rdisk, proc, lines, resolved_device
 
     try:
-        resolved_device = resolve_makemkv_device(args)
+        resolved_device = (
+            resolve_makemkv_device(args, force_refresh=True)
+            if force_refresh
+            else resolve_makemkv_device(args)
+        )
     except DriveSlotConflictError as exc:
+        invalidate_resolved_device_cache()
         print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
         append_log(args, f"PROBE_REFUSED  {exc}")
         return None
@@ -384,9 +390,11 @@ def probe_disc(args) -> dict | None:
             )
             if (result is None or not result[1]) and _optical_mounts():
                 if unmount_blocking_volume(rdisk, drive_idx=target_drive_idx):
+                    invalidate_resolved_device_cache()
                     try:
-                        retry_device = resolve_makemkv_device(args)
+                        retry_device = resolve_makemkv_device(args, force_refresh=True)
                     except DriveSlotConflictError as exc:
+                        invalidate_resolved_device_cache()
                         print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
                         append_log(args, f"PROBE_REFUSED  {exc}")
                         return None
@@ -397,10 +405,12 @@ def probe_disc(args) -> dict | None:
                             _exec_probe(retry_device)
                         )
             if result is None:
+                invalidate_resolved_device_cache()
                 return None
             cinfo, titles, msgs = result
             if titles:
                 return {"cinfo": cinfo, "titles": titles, "msgs": msgs}
+            invalidate_resolved_device_cache()
             if msgs_indicate_aacs_lock(msgs):
                 return {"error": "AACS_LOCKED", "msgs": msgs}
             diag_codes = (codes or set()) & {3042, 2003, 5010}
@@ -423,6 +433,7 @@ def probe_disc(args) -> dict | None:
                 }
             return None
     except DriveSlotConflictError as exc:
+        invalidate_resolved_device_cache()
         print(f"  {C.RED}probe refused: {exc}{C.R}", flush=True)
         append_log(args, f"PROBE_REFUSED  {exc}")
         raise

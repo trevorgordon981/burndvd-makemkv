@@ -45,6 +45,7 @@ from burndvd.drive import (
     beep,
     disc_present,
     disc_slot_lock,
+    invalidate_resolved_device_cache,
     resolve_makemkv_device,
     respin_drive,
 )
@@ -1656,12 +1657,19 @@ def _rip_impl(
             target_payload["_preverify_pool"] = preverify_pool
             preverify_holder["transferred"] = True
 
+    force_device_refresh = False
     for sel_idx, selector in enumerate(selectors, 1):
         sel_start = time.time()
         before_mkvs = set(staging.glob("*.mkv"))
         try:
-            resolved_device = resolve_makemkv_device(args)
+            resolved_device = (
+                resolve_makemkv_device(args, force_refresh=True)
+                if force_device_refresh
+                else resolve_makemkv_device(args)
+            )
+            force_device_refresh = False
         except DriveSlotConflictError as exc:
+            invalidate_resolved_device_cache()
             print(f"{C.RED}rip refused: {exc}{C.R}", flush=True)
             append_log(args, f"RIP_REFUSED  {exc}")
             return False, str(exc)
@@ -1795,6 +1803,7 @@ def _rip_impl(
                             proc.kill()
                             proc.wait()
         except DriveSlotConflictError as exc:
+            invalidate_resolved_device_cache()
             print(f"{C.RED}rip refused: {exc}{C.R}", flush=True)
             append_log(args, f"RIP_REFUSED  {exc}")
             raise
@@ -1829,6 +1838,8 @@ def _rip_impl(
                         f"{failed} failed (partial)"
                     )
         if fail_reason is not None:
+            invalidate_resolved_device_cache()
+            force_device_refresh = True
             if allow_skip_bad_titles and not _is_fatal_drive_loss(fail_reason):
                 failed_tid = int(selector) if str(selector).isdigit() else None
                 for cand_mkv in set(staging.glob("*.mkv")) - before_mkvs:
@@ -2994,6 +3005,7 @@ def wait_for_disc(args, state: dict):
     poll_stdin = not getattr(args, "non_interactive", False)
     fail_since = None
     respins = 0
+    force_probe_refresh = False
     while True:
         if poll_stdin:
             import select
@@ -3004,7 +3016,12 @@ def wait_for_disc(args, state: dict):
                 return ("cmd", menu(state, args))
         else:
             time.sleep(2.0)
-        info = probe_disc(args)
+        info = (
+            probe_disc(args, force_refresh=True)
+            if force_probe_refresh
+            else probe_disc(args)
+        )
+        force_probe_refresh = False
         if info:
             return ("disc", info)
         now = time.time()
@@ -3019,6 +3036,7 @@ def wait_for_disc(args, state: dict):
                 fail_since = now
             if now - fail_since >= RESPIN_AFTER_S and respins < MAX_RESPINS:
                 respin_drive(args)
+                force_probe_refresh = True
                 respins += 1
                 fail_since = None
                 continue

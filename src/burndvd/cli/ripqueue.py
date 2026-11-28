@@ -35,6 +35,7 @@ from burndvd.drive import (
     disc_slot_lock,
     drive_released_marker_path,
     eject,
+    invalidate_resolved_device_cache,
     mark_drive_released,
     resolve_makemkv_device,
     slot_lock_scope,
@@ -845,6 +846,7 @@ def _run_queue_session(
                 disc_args, item, info, title_ids, target, state, disc_n
             )
         if not ok:
+            invalidate_resolved_device_cache()
             print(f"{C.RED}Rip failed: {result}{C.R}")
             append_log(args, f"FAIL  {item.title} disc{disc_n}  {result}")
             beep(args, ok=False)
@@ -1082,6 +1084,7 @@ def _run_queue_session(
                 (item.title, disc_n, result["elapsed_s"], list(result["files"]))
             )
             if has_more_items:
+                invalidate_resolved_device_cache()
                 if not get_finalize_errors():
                     eject(args)
             else:
@@ -1120,6 +1123,7 @@ def _run_queue_session(
                         )
                     on_complete_cb(result)
                     if has_more_items:
+                        invalidate_resolved_device_cache()
                         append_log(
                             args,
                             f"OK    {item.title} disc{disc_n}  "

@@ -52,6 +52,8 @@ class ResolvedMakemkvDevice(str):
 
     device_node: str | None
     serial: str | None
+    verified: bool
+    requested_device: str | None
 
     def __new__(
         cls,
@@ -59,10 +61,14 @@ class ResolvedMakemkvDevice(str):
         *,
         device_node: str | None = None,
         serial: str | None = None,
+        verified: bool = False,
+        requested_device: str | None = None,
     ):
         obj = super().__new__(cls, device)
         obj.device_node = _normalize_device_node(device_node)
         obj.serial = _normalize_drive_serial(serial)
+        obj.verified = bool(verified)
+        obj.requested_device = requested_device if isinstance(requested_device, str) and requested_device else None
         return obj
 
 
@@ -74,12 +80,19 @@ def _normalize_drive_serial(serial: str | None) -> str | None:
     return cleaned.upper() if cleaned else None
 
 
-def _resolved_device_from_row(row: dict) -> ResolvedMakemkvDevice:
+def _resolved_device_from_row(
+    row: dict,
+    *,
+    verified: bool = False,
+    requested_device: str | None = None,
+) -> ResolvedMakemkvDevice:
     """Build a `ResolvedMakemkvDevice` carrying slot, normalized node, and normalized serial."""
     return ResolvedMakemkvDevice(
         f"disc:{row['index']}",
         device_node=row.get("device_node"),
         serial=row.get("serial"),
+        verified=verified,
+        requested_device=requested_device,
     )
 
 
@@ -95,16 +108,271 @@ def _disc_lock_dir(lock_dir: Path | None = None) -> Path:
 _HELD_SLOT_LOCKS_VAR: contextvars.ContextVar[dict[Path, list] | None] = (
     contextvars.ContextVar("burndvd_held_slot_locks", default=None)
 )
+_SESSION_DRIVE_CACHE_VAR: contextvars.ContextVar[dict[tuple, dict] | None] = (
+    contextvars.ContextVar("burndvd_session_drive_cache", default=None)
+)
 
 
 @contextlib.contextmanager
 def slot_lock_scope():
-    """Isolate re-entrant `disc_slot_lock` ownership to a new logical session scope."""
-    token = _HELD_SLOT_LOCKS_VAR.set({})
+    """Isolate re-entrant `disc_slot_lock` ownership and verified binding cache to a session."""
+    lock_token = _HELD_SLOT_LOCKS_VAR.set({})
+    cache_token = _SESSION_DRIVE_CACHE_VAR.set({})
     try:
         yield
     finally:
-        _HELD_SLOT_LOCKS_VAR.reset(token)
+        _SESSION_DRIVE_CACHE_VAR.reset(cache_token)
+        _HELD_SLOT_LOCKS_VAR.reset(lock_token)
+
+
+def invalidate_resolved_device_cache(
+    *,
+    slot: str | None = None,
+    lock_keys: set[Path] | frozenset[Path] | list[Path] | tuple[Path, ...] | None = None,
+    device_node: str | None = None,
+    drive_serial: str | None = None,
+) -> None:
+    """Invalidate cached verified MakeMKV drive bindings in the current lock scope."""
+    cache = _SESSION_DRIVE_CACHE_VAR.get()
+    if not cache:
+        return
+    if (
+        slot is None
+        and lock_keys is None
+        and device_node is None
+        and drive_serial is None
+    ):
+        cache.clear()
+        return
+
+    norm_node = _normalize_device_node(device_node)
+    norm_serial = _normalize_drive_serial(drive_serial)
+    key_set = {Path(k).resolve() for k in lock_keys} if lock_keys is not None else None
+    to_remove = []
+    for cache_key, entry in list(cache.items()):
+        resolved = entry.get("resolved")
+        entry_locks = entry.get("lock_keys") or frozenset()
+        matched = False
+        if slot is not None and (
+            str(resolved) == slot or entry.get("requested_device") == slot
+        ):
+            matched = True
+        if key_set is not None and bool(entry_locks & key_set):
+            matched = True
+        if norm_node is not None and (
+            entry.get("exp_node") == norm_node
+            or getattr(resolved, "device_node", None) == norm_node
+        ):
+            matched = True
+        if norm_serial is not None and (
+            entry.get("exp_serial") == norm_serial
+            or getattr(resolved, "serial", None) == norm_serial
+        ):
+            matched = True
+        if matched:
+            to_remove.append(cache_key)
+    for cache_key in to_remove:
+        cache.pop(cache_key, None)
+
+
+def _required_held_lock_keys(
+    resolved: ResolvedMakemkvDevice,
+    *,
+    exp_node: str | None,
+    exp_serial: str | None,
+    lock_dir: Path,
+) -> frozenset[Path] | None:
+    """Return canonical lock paths that must be held to trust/cache `resolved`, or None."""
+    idx = _disc_selector_index(str(resolved))
+    if idx is None:
+        return None
+    keys: set[Path] = {(lock_dir / f"disc-{idx}.lock").resolve()}
+    if exp_node:
+        dev_slug = exp_node.removeprefix("/dev/")
+        keys.add((lock_dir / f"dev-{dev_slug}.lock").resolve())
+        if resolved.device_node and resolved.device_node != exp_node:
+            res_slug = resolved.device_node.removeprefix("/dev/")
+            keys.add((lock_dir / f"dev-{res_slug}.lock").resolve())
+    if exp_serial:
+        serial_slug = _sanitize_lock_slug(exp_serial)
+        if serial_slug:
+            keys.add((lock_dir / f"serial-{serial_slug}.lock").resolve())
+    return frozenset(keys)
+
+
+def _lock_keys_actively_held(lock_keys: frozenset[Path]) -> bool:
+    """Return True iff every lock path in `lock_keys` is currently held in this scope."""
+    if not lock_keys:
+        return False
+    held = _HELD_SLOT_LOCKS_VAR.get()
+    if not held:
+        return False
+    for key in lock_keys:
+        entry = held.get(key)
+        if entry is None or entry[1] <= 0:
+            return False
+    return True
+
+
+def _store_cached_resolved_device(
+    cache_key: tuple,
+    resolved: ResolvedMakemkvDevice,
+    *,
+    requested_device: str,
+    exp_node: str | None,
+    exp_serial: str | None,
+    lock_dir: Path,
+    lock_keys: frozenset[Path] | None = None,
+    preserve_existing_locks: bool = False,
+) -> bool:
+    """Cache a positively verified `ResolvedMakemkvDevice` when its lock is actively held."""
+    if not isinstance(resolved, ResolvedMakemkvDevice) or not resolved.verified:
+        return False
+    cache = _SESSION_DRIVE_CACHE_VAR.get()
+    if cache is None:
+        return False
+    required = _required_held_lock_keys(
+        resolved, exp_node=exp_node, exp_serial=exp_serial, lock_dir=lock_dir
+    )
+    if required is None:
+        return False
+    effective_keys = frozenset(lock_keys | required) if lock_keys else required
+    if not _lock_keys_actively_held(effective_keys):
+        return False
+    if preserve_existing_locks:
+        existing = cache.get(cache_key)
+        if (
+            existing is not None
+            and existing.get("resolved") == resolved
+            and getattr(existing.get("resolved"), "device_node", None) == resolved.device_node
+            and getattr(existing.get("resolved"), "serial", None) == resolved.serial
+            and _lock_keys_actively_held(existing.get("lock_keys") or frozenset())
+        ):
+            return True
+    cache[cache_key] = {
+        "requested_device": requested_device,
+        "exp_node": exp_node,
+        "exp_serial": exp_serial,
+        "resolved": resolved,
+        "lock_keys": effective_keys,
+    }
+    return True
+
+
+def _has_foreign_slot_claim(
+    slot_idx: int,
+    *,
+    exclude_device_node: str | None = None,
+    exclude_serial: str | None = None,
+    exclude_state: str | None = None,
+    exclude_pid: int | None = None,
+    claim_dir: Path | None = None,
+) -> bool:
+    """Fast filesystem-only check for a live foreign drive-claim conflicting with `slot_idx`."""
+    cdir = claim_dir or (Path.home() / ".cache" / "burndvd" / "drive-claims")
+    if not cdir.is_dir():
+        return False
+    norm_excl_node = _normalize_device_node(exclude_device_node)
+    excl_serial_cf = (exclude_serial or "").strip().casefold() or None
+    norm_excl_state = os.path.normpath(exclude_state) if exclude_state else None
+    self_pids = {os.getpid()}
+    ppid = os.getppid()
+    if ppid > 1:
+        self_pids.add(ppid)
+    if exclude_pid is not None:
+        self_pids.add(exclude_pid)
+
+    try:
+        entries = sorted(cdir.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.is_dir() or not entry.name.endswith(".claim"):
+            continue
+        pid_txt = _read_claim_text(entry / "pid")
+        c_pid = int(pid_txt) if pid_txt.isdigit() else None
+        if c_pid is None or not _pid_is_alive(c_pid):
+            continue
+        c_state = _read_claim_text(entry / "state")
+        if c_state and is_state_drive_released(c_state):
+            continue
+        c_dev = _normalize_device_node(_read_claim_text(entry / "dev"))
+        c_serial = _read_claim_text(entry / "serial")
+        c_disc = _parse_disc_idx_text(_read_claim_text(entry / "disc"))
+
+        stem = entry.name[: -len(".claim")]
+        if stem.startswith("dev-") and c_dev is None:
+            c_dev = _normalize_device_node(stem[len("dev-") :])
+        elif stem.startswith("serial-") and not c_serial:
+            c_serial = stem[len("serial-") :].strip()
+        elif stem.startswith("disc-") and c_disc is None:
+            c_disc = _parse_disc_idx_text(stem[len("disc-") :])
+
+        is_self = False
+        if (
+            norm_excl_state
+            and c_state
+            and os.path.normpath(c_state) == norm_excl_state
+        ):
+            is_self = True
+        if c_pid in self_pids:
+            is_self = True
+        if norm_excl_node and c_dev and c_dev == norm_excl_node:
+            is_self = True
+        if excl_serial_cf and c_serial and c_serial.casefold() == excl_serial_cf:
+            is_self = True
+        if is_self:
+            continue
+
+        if c_disc == slot_idx and c_disc != _DUMMY_KEYCHECK_DISC_IDX:
+            return True
+    return False
+
+
+def _lookup_cached_resolved_device(
+    args,
+    cache_key: tuple,
+    *,
+    exp_node: str | None,
+    exp_serial: str | None,
+    lock_dir: Path,
+) -> ResolvedMakemkvDevice | None:
+    """Return a cached verified `ResolvedMakemkvDevice` iff locks are held and conflict-free."""
+    cache = _SESSION_DRIVE_CACHE_VAR.get()
+    if not cache:
+        return None
+    entry = cache.get(cache_key)
+    if entry is None:
+        return None
+    resolved = entry.get("resolved")
+    if not isinstance(resolved, ResolvedMakemkvDevice) or not resolved.verified:
+        cache.pop(cache_key, None)
+        return None
+    resolved_idx = _disc_selector_index(str(resolved))
+    if resolved_idx is None:
+        cache.pop(cache_key, None)
+        return None
+    required = _required_held_lock_keys(
+        resolved, exp_node=exp_node, exp_serial=exp_serial, lock_dir=lock_dir
+    )
+    entry_locks = entry.get("lock_keys") or frozenset()
+    if (
+        required is None
+        or not _lock_keys_actively_held(required)
+        or not _lock_keys_actively_held(entry_locks)
+    ):
+        cache.pop(cache_key, None)
+        return None
+    if _has_foreign_slot_claim(
+        resolved_idx,
+        exclude_device_node=exp_node or resolved.device_node,
+        exclude_serial=exp_serial or resolved.serial,
+        exclude_state=getattr(args, "state", None) if not isinstance(args, str) else None,
+        exclude_pid=os.getpid(),
+    ):
+        cache.pop(cache_key, None)
+        return None
+    return resolved
 
 
 def _sanitize_lock_slug(raw: str) -> str:
@@ -179,6 +447,10 @@ def disc_slot_lock(
     if held is None:
         held = {}
         _HELD_SLOT_LOCKS_VAR.set(held)
+    cache = _SESSION_DRIVE_CACHE_VAR.get()
+    if cache is None:
+        cache = {}
+        _SESSION_DRIVE_CACHE_VAR.set(cache)
 
     seen_keys: set[Path] = set()
     ordered_specs: list[tuple[Path, str, Path]] = []
@@ -204,6 +476,10 @@ def disc_slot_lock(
                     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     locked = True
                 except BlockingIOError as exc:
+                    invalidate_resolved_device_cache(
+                        slot=str(device_spec),
+                        lock_keys=[k for k, _, _ in ordered_specs],
+                    )
                     fh.seek(0)
                     holder = fh.read().strip() or "another active rip process"
                     raise DriveSlotConflictError(
@@ -223,8 +499,48 @@ def disc_slot_lock(
                 raise
             held[key] = [fh, 1]
             acquired.append(key)
+        if (
+            isinstance(device_spec, ResolvedMakemkvDevice)
+            and device_spec.verified
+            and (exp_dev is not None or exp_serial is not None)
+            and not (exp_serial and res_serial and exp_serial != res_serial)
+        ):
+            makemkvcon = (
+                getattr(target, "makemkvcon", None)
+                if target is not None and not isinstance(target, str)
+                else None
+            ) or DEFAULT_MAKEMKVCON
+            resolved_lock_dir = base.resolve()
+            acquired_keys = frozenset(key for key, _, _ in ordered_specs)
+            seed_devices = [str(device_spec)]
+            target_dev = _extract_device_spec(target)
+            if (
+                device_spec.requested_device
+                and device_spec.requested_device not in seed_devices
+                and (not target_dev or target_dev == device_spec.requested_device)
+            ):
+                seed_devices.append(device_spec.requested_device)
+            for req_dev in seed_devices:
+                cache_key = (
+                    req_dev,
+                    exp_dev,
+                    exp_serial,
+                    makemkvcon,
+                    resolved_lock_dir,
+                )
+                _store_cached_resolved_device(
+                    cache_key,
+                    device_spec,
+                    requested_device=req_dev,
+                    exp_node=exp_dev,
+                    exp_serial=exp_serial,
+                    lock_dir=resolved_lock_dir,
+                    lock_keys=acquired_keys,
+                    preserve_existing_locks=True,
+                )
         yield slot_lock_path
     finally:
+        released_keys: list[Path] = []
         for key in reversed(acquired):
             entry = held.get(key)
             if entry is None:
@@ -232,6 +548,7 @@ def disc_slot_lock(
             entry[1] -= 1
             if entry[1] <= 0:
                 held.pop(key, None)
+                released_keys.append(key)
                 fh = entry[0]
                 try:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
@@ -241,6 +558,8 @@ def disc_slot_lock(
                     fh.close()
                 except OSError:
                     pass
+        if released_keys:
+            invalidate_resolved_device_cache(lock_keys=released_keys)
 
 
 def append_log(args, line: str) -> None:
@@ -491,6 +810,7 @@ def mark_drive_released(
     finish in the background. Only removes `claim_path` (or `BURNDVD_DRIVE_CLAIM`)
     when its `state` file matches `state_path` (or `state_path` is unset).
     """
+    invalidate_resolved_device_cache()
     marker = drive_released_marker_path(state_path)
     if marker is not None:
         payload = json.dumps(
@@ -679,13 +999,21 @@ def active_busy_disc_claims(
     return busy
 
 
-def resolve_makemkv_device(args) -> str:
+def resolve_makemkv_device(args, *, force_refresh: bool = False) -> str:
     """Resolve a `disc:N` selector to the current MakeMKV index for a pinned physical drive.
 
     When `BURNDVD_DRIVE_DEVICE` / `args.drive_device` or `BURNDVD_DRIVE_SERIAL` /
     `args.drive_serial` is explicitly set and `args.device` is a `disc:N` selector,
     queries `[makemkvcon, "-r", "info", "list"]` and matches by normalized `/dev/diskN`
     (preferred) or by hardware serial with media loaded.
+
+    When a physical drive binding (`ResolvedMakemkvDevice`) has been positively
+    verified AND its `disc_slot_lock` is actively held inside the current logical
+    `slot_lock_scope()`, reuses that verified binding without re-running the
+    15-second global `makemkvcon -r info list` scan unless `force_refresh=True`,
+    the requested device/pins differ, the lock is no longer held, or another
+    process/claim conflicts with the slot. Unverified fallback resolutions are
+    never cached.
 
     Handles reverse BSD-to-MakeMKV slot ordering (e.g. `/dev/rdisk6` -> `disc:0`,
     `/dev/rdisk5` -> `disc:1`) directly from MakeMKV `DRV:` rows. When falling back
@@ -699,11 +1027,31 @@ def resolve_makemkv_device(args) -> str:
         return device
 
     _, exp_node = _explicit_drive_target(args)
-    exp_serial = _explicit_drive_serial(args)
+    exp_serial = _normalize_drive_serial(_explicit_drive_serial(args))
     if exp_node is None and exp_serial is None:
         return device
 
     makemkvcon = getattr(args, "makemkvcon", None) or DEFAULT_MAKEMKVCON
+    lock_dir = _disc_lock_dir().resolve()
+    cache_key = (device, exp_node, exp_serial, makemkvcon, lock_dir)
+
+    if force_refresh:
+        invalidate_resolved_device_cache(
+            slot=device,
+            device_node=exp_node,
+            drive_serial=exp_serial,
+        )
+    else:
+        cached = _lookup_cached_resolved_device(
+            args,
+            cache_key,
+            exp_node=exp_node,
+            exp_serial=exp_serial,
+            lock_dir=lock_dir,
+        )
+        if cached is not None:
+            return cached
+
     drives: list[dict] = []
     try:
         r = subprocess.run(
@@ -728,10 +1076,56 @@ def resolve_makemkv_device(args) -> str:
                     and d["serial"].casefold() == exp_serial.casefold()
                 ]
                 if exact:
-                    return _resolved_device_from_row(exact[0])
+                    chosen = exact[0]
+                    resolved = _resolved_device_from_row(
+                        chosen,
+                        verified=bool(chosen.get("has_media")),
+                        requested_device=device,
+                    )
+                    if resolved.verified:
+                        _store_cached_resolved_device(
+                            cache_key,
+                            resolved,
+                            requested_device=device,
+                            exp_node=exp_node,
+                            exp_serial=exp_serial,
+                            lock_dir=lock_dir,
+                        )
+                    else:
+                        invalidate_resolved_device_cache(
+                            slot=device,
+                            device_node=exp_node,
+                            drive_serial=exp_serial,
+                        )
+                    return resolved
             loaded = [d for d in node_matches if d["has_media"]]
             chosen = loaded[0] if loaded else node_matches[0]
-            return _resolved_device_from_row(chosen)
+            serial_ok = (
+                exp_serial is None
+                or not chosen.get("serial")
+                or chosen["serial"].casefold() == exp_serial.casefold()
+            )
+            resolved = _resolved_device_from_row(
+                chosen,
+                verified=bool(chosen.get("has_media") and serial_ok),
+                requested_device=device,
+            )
+            if resolved.verified:
+                _store_cached_resolved_device(
+                    cache_key,
+                    resolved,
+                    requested_device=device,
+                    exp_node=exp_node,
+                    exp_serial=exp_serial,
+                    lock_dir=lock_dir,
+                )
+            else:
+                invalidate_resolved_device_cache(
+                    slot=device,
+                    device_node=exp_node,
+                    drive_serial=exp_serial,
+                )
+            return resolved
 
     if drives and exp_serial is not None:
         serial_matches = [
@@ -742,9 +1136,28 @@ def resolve_makemkv_device(args) -> str:
             and d["has_media"]
         ]
         if serial_matches:
-            return _resolved_device_from_row(serial_matches[0])
+            resolved = _resolved_device_from_row(
+                serial_matches[0],
+                verified=True,
+                requested_device=device,
+            )
+            _store_cached_resolved_device(
+                cache_key,
+                resolved,
+                requested_device=device,
+                exp_node=exp_node,
+                exp_serial=exp_serial,
+                lock_dir=lock_dir,
+            )
+            return resolved
 
-    # Fallback safety: check active drive-claims and running ripqueue/makemkvcon
+    # Fallback safety: NEVER cache unverified/fallback resolutions.
+    invalidate_resolved_device_cache(
+        slot=device,
+        device_node=exp_node,
+        drive_serial=exp_serial,
+    )
+    # Check active drive-claims and running ripqueue/makemkvcon
     # processes so we NEVER hand a busy/foreign disc:K to a different physical drive.
     busy = active_busy_disc_claims(
         exclude_device_node=exp_node,
@@ -775,16 +1188,16 @@ def resolve_makemkv_device(args) -> str:
             None,
         )
         if matching_orig is not None:
-            return _resolved_device_from_row(matching_orig)
+            return _resolved_device_from_row(matching_orig, verified=False)
         return device
 
     if present_drives:
         candidates = [d for d in present_drives if d["index"] not in foreign_indices]
         loaded_candidates = [d for d in candidates if d["has_media"]]
         if len(loaded_candidates) == 1:
-            return _resolved_device_from_row(loaded_candidates[0])
+            return _resolved_device_from_row(loaded_candidates[0], verified=False)
         if len(candidates) == 1 and exp_node is not None:
-            return _resolved_device_from_row(candidates[0])
+            return _resolved_device_from_row(candidates[0], verified=False)
     else:
         drutil_drives = _drutil_list_drives()
         total_slots = max(
@@ -804,6 +1217,11 @@ def resolve_makemkv_device(args) -> str:
         or "another drive"
     )
     target_desc = exp_node or exp_serial or "pinned drive"
+    invalidate_resolved_device_cache(
+        slot=device,
+        device_node=exp_node,
+        drive_serial=exp_serial,
+    )
     raise DriveSlotConflictError(
         f"refusing to assign busy/foreign MakeMKV slot {device} "
         f"(owned by {holder_desc}) to {target_desc}"
@@ -1238,6 +1656,7 @@ def respin_drive(
     tray via `drutil tray close`; on those drives we unmount and cool down only
     without ejecting. Returns True if a tray cycle ran, False if cooldown-only.
     """
+    invalidate_resolved_device_cache()
     exp_drive, exp_node = _explicit_drive_target(
         args, drutil_drive=drutil_drive, device_node=device_node
     )
@@ -1401,6 +1820,7 @@ def eject_disc(
     if args is not None and getattr(args, "no_eject", False):
         return False
 
+    invalidate_resolved_device_cache()
     target = device if device is not None else args
     exp_drive, exp_node = _explicit_drive_target(
         target, drutil_drive=drutil_drive, device_node=device_node
