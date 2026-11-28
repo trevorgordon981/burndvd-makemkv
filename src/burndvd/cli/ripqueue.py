@@ -420,8 +420,7 @@ def _run_queue_session(
         if should_eject and not args.no_eject and not early_ejected.is_set():
             early_ejected.set()
             needs_final_eject = False
-            eject(args)
-            did_eject = True
+            did_eject = bool(eject(args))
         else:
             needs_final_eject = False
         mark_drive_released(
@@ -838,16 +837,67 @@ def _run_queue_session(
         cur_item_idx = state["current_index"]
         cur_disc_idx = state["disc_index_in_item"]
         pre_rip_ep_counts = copy.deepcopy(state.get("disc_episode_counts", {}))
+        will_have_more_items = (
+            (queue_disc_n < item.discs)
+            or (cur_item_idx + 1 < len(state["queue"]))
+        )
+        optical_done_for_disc = False
+        ejected_for_disc = False
+
+        def _on_optical_done() -> None:
+            nonlocal optical_done_for_disc, ejected_for_disc
+            if optical_done_for_disc:
+                return
+            optical_done_for_disc = True
+            if not will_have_more_items:
+                _release_optical_drive(should_eject=True)
+                ejected_for_disc = True
+            elif not get_finalize_errors() and not args.no_eject:
+                eject(args)
+                ejected_for_disc = True
+
         if item.type == "double-feature":
             ok, result = rip_double_feature(disc_args, item, info, state, disc_n)
-        else:
+        elif disc_args.sync_move:
             ok, result = rip(
                 disc_args, item, info, title_ids, target, state, disc_n
+            )
+        else:
+            ok, result = rip(
+                disc_args,
+                item,
+                info,
+                title_ids,
+                target,
+                state,
+                disc_n,
+                on_optical_done=_on_optical_done,
             )
         if not ok:
             print(f"{C.RED}Rip failed: {result}{C.R}")
             append_log(args, f"FAIL  {item.title} disc{disc_n}  {result}")
             beep(args, ok=False)
+
+            if optical_done_for_disc:
+                append_log(
+                    args,
+                    f"POST_OPTICAL_FAIL  {item.title} disc{disc_n}  "
+                    f"refusing optical reread after drive release ({result})",
+                )
+                print(
+                    f"{C.RED}Downstream post-optical step failed after optical "
+                    f"extraction completed; refusing to re-read disc.{C.R}",
+                    file=sys.stderr,
+                )
+                if args.non_interactive and args.on_fail == "skip" and will_have_more_items:
+                    with state_lock:
+                        state["current_index"] += 1
+                        state["disc_index_in_item"] = 0
+                    _sync_committed_on_skip()
+                    continue
+                _persist_committed_state()
+                join_finalizers()
+                sys.exit(2)
 
             byte = stall_byte(result)
             recent = state.setdefault("recent_stall_bytes", {})
@@ -1082,7 +1132,7 @@ def _run_queue_session(
                 (item.title, disc_n, result["elapsed_s"], list(result["files"]))
             )
             if has_more_items:
-                if not get_finalize_errors():
+                if not get_finalize_errors() and not ejected_for_disc:
                     eject(args)
             else:
                 _release_optical_drive(should_eject=True)
