@@ -55,9 +55,11 @@ flowchart LR
 
 ### Clean Install (Development & Tests)
 
+> **Requires Python >= 3.11.** Use `python3.11` (or newer) explicitly when creating the virtual environment so stock macOS Python 3.9 does not fail installation.
+
 ```sh
-# Create an isolated virtual environment and install burndvd with dev/test tooling
-python3 -m venv .venv
+# Create an isolated Python 3.11+ virtual environment and install burndvd with dev/test tooling
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
@@ -111,6 +113,18 @@ pytest -v
 # Focused crash-recovery & DVD-1..DVD-7 regression suite
 pytest -v tests/test_dvd_regressions.py tests/test_publish_order_v203.py
 ```
+
+## Measured Results
+
+Verified in an isolated Python 3.11.14 virtual environment (`pip install -e ".[dev]"`) with zero optical hardware attached, and mirrored on GitHub Actions CI:
+
+| Verification Check | Environment | Result | Wall Time |
+| --- | --- | --- | --- |
+| Zero-hardware synthetic demo (`python examples/synthetic_demo.py`) | macOS, Python 3.11.14 | Pass (`exit 0`) | `0.28s` |
+| Full regression suite (`pytest`) | macOS, Python 3.11.14 | `322 passed, 6 skipped, 0 failed` | `66.42s` |
+| GitHub Actions CI (`CI` workflow: shell syntax, CLI smoke checks, `pytest -v`, synthetic demo) | `macos-latest`, Python 3.12 | Pass (`322 passed, 6 skipped` in `74.09s`; total job `2m06s`) | `2m06s` |
+
+The 6 skipped tests are hardware/environment-conditional cases (e.g., optional macOS OCR or live host-only checks) skipped automatically when those optional components are absent.
 
 ## CLI Reference
 
