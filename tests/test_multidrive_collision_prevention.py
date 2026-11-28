@@ -646,10 +646,15 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
                 nonlocal enum_calls
                 if cmd[0] != str(fake_mkv):
                     return real_run(cmd, *a, **kw)
-                slot = 1 if enum_calls >= 2 else 0
+                slot = 1 if enum_calls >= 1 else 0
                 enum_calls += 1
                 row = f'DRV:{slot},2,999,12,"FAKE","SAMPLE_MOVIE","/dev/rdisk6"\n'
                 return SimpleNamespace(returncode=0, stdout=row, stderr="")
+
+            def _probe_then_invalidate(a, s):
+                info = probe.probe_disc(a)
+                drive.invalidate_resolved_device_cache()
+                return ("ok", info)
 
             def fake_popen(cmd, *a, **kw):
                 if not cmd or cmd[0] != str(fake_mkv):
@@ -687,7 +692,7 @@ class MultiDriveCollisionPreventionTests(unittest.TestCase):
                      mock.patch.object(
                          ripqueue,
                          "wait_for_disc",
-                         side_effect=lambda a, s: ("ok", probe.probe_disc(a)),
+                         side_effect=_probe_then_invalidate,
                      ), \
                      mock.patch.object(ripqueue, "resolve_nas_path", side_effect=lambda p, **_: p), \
                      mock.patch.object(ripper, "resolve_nas_path", side_effect=lambda p, **_: p), \
